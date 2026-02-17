@@ -1,0 +1,120 @@
+name: Smoke Windows RunDiagStrict
+
+on:
+  workflow_dispatch:
+    inputs:
+      pipeline_root:
+        description: "Absolute pipeline root path override (optional). If empty, use checked-out repo path."
+        required: false
+        default: ""
+      pipeline_ref:
+        description: "Ref for kaneko-ai/jarvis-ml-pipeline checkout"
+        required: false
+        default: "main"
+
+jobs:
+  smoke-windows-rundiagstrict:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout desktop repository
+        uses: actions/checkout@v4
+
+      - name: Checkout pipeline repository
+        uses: actions/checkout@v4
+        with:
+          repository: kaneko-ai/jarvis-ml-pipeline
+          ref: ${{ inputs.pipeline_ref }}
+          path: jarvis-ml-pipeline
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Prepare pipeline Python environment
+        shell: powershell
+        run: |
+          Set-Location "$env:GITHUB_WORKSPACE\jarvis-ml-pipeline"
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install --upgrade pip
+          .\.venv\Scripts\python.exe -m pip install -e .
+
+      - name: Resolve pipeline root
+        id: resolve_pipeline
+        shell: powershell
+        run: |
+          if ([string]::IsNullOrWhiteSpace("${{ inputs.pipeline_root }}")) {
+            $resolved = "$env:GITHUB_WORKSPACE\jarvis-ml-pipeline"
+          } else {
+            $resolved = "${{ inputs.pipeline_root }}"
+          }
+          if (-not (Test-Path $resolved)) {
+            throw "Pipeline root not found: $resolved"
+          }
+          "PIPELINE_ROOT=$resolved" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "PIPELINE_ROOT=$resolved"
+
+      - name: Run smoke with RunDiagStrict
+        shell: powershell
+        run: |
+          Set-Location "$env:GITHUB_WORKSPACE"
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\smoke_tauri_e2e.ps1 -RunDiagStrict -PipelineRoot "$env:PIPELINE_ROOT"
+
+      - name: Collect latest run artifacts
+        if: always()
+        shell: powershell
+        run: |
+          Set-Location "$env:GITHUB_WORKSPACE"
+          $artifactRoot = Join-Path $env:GITHUB_WORKSPACE "_ci_artifacts"
+          $latestOut = Join-Path $artifactRoot "latest_run"
+          New-Item -ItemType Directory -Path $latestOut -Force | Out-Null
+
+          $runsRoot = Join-Path $env:PIPELINE_ROOT "logs\runs"
+          if (Test-Path $runsRoot) {
+            $latestRun = Get-ChildItem -Path $runsRoot -Directory -ErrorAction SilentlyContinue |
+              Sort-Object LastWriteTime -Descending |
+              Select-Object -First 1
+            if ($latestRun) {
+              $inputJson = Join-Path $latestRun.FullName "input.json"
+              $resultJson = Join-Path $latestRun.FullName "result.json"
+              $treeMd = Join-Path $latestRun.FullName "paper_graph\tree\tree.md"
+
+              if (Test-Path $inputJson) { Copy-Item $inputJson (Join-Path $latestOut "input.json") -Force }
+              if (Test-Path $resultJson) { Copy-Item $resultJson (Join-Path $latestOut "result.json") -Force }
+              if (Test-Path $treeMd) { Copy-Item $treeMd (Join-Path $latestOut "tree.md") -Force }
+            }
+          }
+
+      - name: Upload diagnostics report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diag-report
+          path: diag_report.md
+          if-no-files-found: warn
+
+      - name: Upload latest run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-latest-run
+          path: _ci_artifacts/latest_run/**
+          if-no-files-found: warn
