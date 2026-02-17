@@ -125,6 +125,24 @@ What it verifies:
 - pipeline CLI can generate a new run directory
 - required files exist (`input.json`, `result.json`, `paper_graph/tree/tree.md`)
 
+## Clean-machine verification checklist
+
+- Checklist: `scripts/clean_machine_checklist.md`
+- Goal: installer artifact ベースで、別PC/別ユーザーでも同じ One True Path を再現する。
+
+## Diagnostics
+
+Generate machine + config + latest run artifact diagnostics:
+
+```powershell
+cd C:\Users\kaneko yu\Documents\jarvis-work\jarvis-desktop-repo
+powershell -ExecutionPolicy Bypass -File .\scripts\collect_diag.ps1 -PipelineRoot "C:\Users\kaneko yu\Documents\jarvis-work\jarvis-ml-pipeline"
+```
+
+Output:
+- `diag_report.md` (desktop root)
+- Includes OS/tool versions, sanitized config, latest run dir, and artifact existence checks.
+
 ## Security: open_run_folder restrictions
 
 `open_run_folder` accepts only canonical directories under:

@@ -111,6 +111,15 @@ export default function App() {
     }
   }
 
+  async function onCreateConfigTemplate() {
+    try {
+      await invoke("create_config_if_missing");
+      await loadRuntimeConfig(true);
+    } catch (e) {
+      alert(String(e));
+    }
+  }
+
   const showRetryButton = status === "needs_retry" && !!lastRunRequest;
 
   return (
@@ -136,12 +145,25 @@ export default function App() {
         <div style={{ fontSize: 12, opacity: 0.9 }}>
           out_dir: <code>{runtimeCfg?.out_dir ?? "-"}</code>
         </div>
+        <div style={{ fontSize: 12, marginTop: 4 }}>
+          Config validation:{" "}
+          <strong style={{ color: runtimeCfg?.ok ? "#1f6f3f" : "#a33" }}>
+            {runtimeCfg?.ok ? "ok" : "error"}
+          </strong>
+          {runtimeCfg?.status ? <span style={{ marginLeft: 8 }}>status={runtimeCfg.status}</span> : null}
+        </div>
         <div style={{ marginTop: 8, display: "flex", gap: 8 }}>
           <button
             onClick={onOpenConfigLocation}
             style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
           >
             Open config file location
+          </button>
+          <button
+            onClick={onCreateConfigTemplate}
+            style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+          >
+            Create config template
           </button>
           <button
             onClick={() => loadRuntimeConfig(true)}

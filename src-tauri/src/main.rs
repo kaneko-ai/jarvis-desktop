@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::{fs, io::Write};
 
 #[derive(Serialize)]
 struct RunResult {
@@ -263,26 +264,115 @@ fn env_optional_string(name: &str) -> Option<String> {
         .and_then(|v| non_empty_opt(Some(v.as_str())))
 }
 
-fn env_optional_u64(name: &str) -> Option<u64> {
-    std::env::var(name).ok()?.trim().parse::<u64>().ok()
+fn env_optional_u64_strict(name: &str) -> Result<Option<u64>, String> {
+    match std::env::var(name) {
+        Ok(v) => {
+            let t = v.trim();
+            if t.is_empty() {
+                Ok(None)
+            } else {
+                t.parse::<u64>()
+                    .map(Some)
+                    .map_err(|_| format!("Invalid numeric value in env {name}: `{t}`"))
+            }
+        }
+        Err(_) => Ok(None),
+    }
 }
 
-fn env_optional_u32(name: &str) -> Option<u32> {
-    std::env::var(name).ok()?.trim().parse::<u32>().ok()
+fn env_optional_u32_strict(name: &str) -> Result<Option<u32>, String> {
+    match std::env::var(name) {
+        Ok(v) => {
+            let t = v.trim();
+            if t.is_empty() {
+                Ok(None)
+            } else {
+                t.parse::<u32>()
+                    .map(Some)
+                    .map_err(|_| format!("Invalid numeric value in env {name}: `{t}`"))
+            }
+        }
+        Err(_) => Ok(None),
+    }
 }
 
-fn env_optional_f64(name: &str) -> Option<f64> {
-    std::env::var(name).ok()?.trim().parse::<f64>().ok()
+fn env_optional_f64_strict(name: &str) -> Result<Option<f64>, String> {
+    match std::env::var(name) {
+        Ok(v) => {
+            let t = v.trim();
+            if t.is_empty() {
+                Ok(None)
+            } else {
+                t.parse::<f64>()
+                    .map(Some)
+                    .map_err(|_| format!("Invalid numeric value in env {name}: `{t}`"))
+            }
+        }
+        Err(_) => Ok(None),
+    }
 }
 
-fn load_env_config() -> EnvConfig {
-    EnvConfig {
+fn load_env_config() -> Result<EnvConfig, String> {
+    Ok(EnvConfig {
         pipeline_root: env_optional_string("JARVIS_PIPELINE_ROOT"),
         pipeline_out_dir: env_optional_string("JARVIS_PIPELINE_OUT_DIR"),
         s2_api_key: env_optional_string("S2_API_KEY"),
-        s2_min_interval_ms: env_optional_u64("S2_MIN_INTERVAL_MS"),
-        s2_max_retries: env_optional_u32("S2_MAX_RETRIES"),
-        s2_backoff_base_sec: env_optional_f64("S2_BACKOFF_BASE_SEC"),
+        s2_min_interval_ms: env_optional_u64_strict("S2_MIN_INTERVAL_MS")?,
+        s2_max_retries: env_optional_u32_strict("S2_MAX_RETRIES")?,
+        s2_backoff_base_sec: env_optional_f64_strict("S2_BACKOFF_BASE_SEC")?,
+    })
+}
+
+fn parse_u64_field_from_json(value: Option<&serde_json::Value>, key: &str) -> Result<Option<u64>, String> {
+    match value {
+        None => Ok(None),
+        Some(v) if v.is_null() => Ok(None),
+        Some(serde_json::Value::Number(n)) => n
+            .as_u64()
+            .ok_or_else(|| format!("Invalid {key}: must be a non-negative integer"))
+            .map(Some),
+        Some(serde_json::Value::String(s)) => {
+            let t = s.trim();
+            if t.is_empty() {
+                Ok(None)
+            } else {
+                t.parse::<u64>()
+                    .map(Some)
+                    .map_err(|_| format!("Invalid {key}: `{t}` is not a valid integer"))
+            }
+        }
+        Some(_) => Err(format!("Invalid {key}: must be number or numeric string")),
+    }
+}
+
+fn parse_u32_field_from_json(value: Option<&serde_json::Value>, key: &str) -> Result<Option<u32>, String> {
+    match parse_u64_field_from_json(value, key)? {
+        None => Ok(None),
+        Some(v) => u32::try_from(v)
+            .map(Some)
+            .map_err(|_| format!("Invalid {key}: value out of u32 range")),
+    }
+}
+
+fn parse_f64_field_from_json(value: Option<&serde_json::Value>, key: &str) -> Result<Option<f64>, String> {
+    match value {
+        None => Ok(None),
+        Some(v) if v.is_null() => Ok(None),
+        Some(serde_json::Value::Number(n)) => n
+            .as_f64()
+            .ok_or_else(|| format!("Invalid {key}: must be a valid number"))
+            .map(Some),
+        Some(serde_json::Value::String(s)) => {
+            let t = s.trim();
+            if t.is_empty() {
+                Ok(None)
+            } else {
+                t.parse::<f64>()
+                    .map(Some)
+                    .map_err(|_| format!("Invalid {key}: `{t}` is not a valid number"))
+            }
+        }
+        Some(_) => Err(format!("Invalid {key}: must be number or numeric string")),
     }
 }
 
@@ -290,10 +380,31 @@ fn read_desktop_config_file(path: &Path) -> Result<Option<DesktopConfigFile>, St
     if !path.exists() {
         return Ok(None);
     }
+
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read config file {}: {e}", path.display()))?;
-    let cfg = serde_json::from_str::<DesktopConfigFile>(&text)
+    let value = serde_json::from_str::<serde_json::Value>(&text)
         .map_err(|e| format!("Invalid config JSON at {}: {e}", path.display()))?;
+
+    let obj = value
+        .as_object()
+        .ok_or_else(|| format!("Invalid config JSON at {}: root must be an object", path.display()))?;
+
+    let cfg = DesktopConfigFile {
+        JARVIS_PIPELINE_ROOT: obj
+            .get("JARVIS_PIPELINE_ROOT")
+            .and_then(|v| v.as_str().map(|s| s.to_string())),
+        JARVIS_PIPELINE_OUT_DIR: obj
+            .get("JARVIS_PIPELINE_OUT_DIR")
+            .and_then(|v| v.as_str().map(|s| s.to_string())),
+        S2_API_KEY: obj
+            .get("S2_API_KEY")
+            .and_then(|v| v.as_str().map(|s| s.to_string())),
+        S2_MIN_INTERVAL_MS: parse_u64_field_from_json(obj.get("S2_MIN_INTERVAL_MS"), "S2_MIN_INTERVAL_MS")?,
+        S2_MAX_RETRIES: parse_u32_field_from_json(obj.get("S2_MAX_RETRIES"), "S2_MAX_RETRIES")?,
+        S2_BACKOFF_BASE_SEC: parse_f64_field_from_json(obj.get("S2_BACKOFF_BASE_SEC"), "S2_BACKOFF_BASE_SEC")?,
+    };
+
     Ok(Some(cfg))
 }
 
@@ -307,11 +418,29 @@ fn validate_pipeline_root(source: &str, path: &Path) -> Result<PathBuf, String> 
   ))
 }
 
+fn validate_out_dir_writable(path: &Path) -> Result<PathBuf, String> {
+    fs::create_dir_all(path).map_err(|e| {
+        format!(
+            "out_dir is not writable (create_dir_all failed): {}: {e}",
+            path.display()
+        )
+    })?;
+
+    let canonical = canonical_or_self(path);
+    let probe = canonical.join(".jarvis_desktop_write_probe.tmp");
+    let mut f = fs::File::create(&probe)
+        .map_err(|e| format!("out_dir is not writable (create probe failed): {}: {e}", canonical.display()))?;
+    f.write_all(b"ok")
+        .map_err(|e| format!("out_dir is not writable (write probe failed): {}: {e}", canonical.display()))?;
+    let _ = fs::remove_file(&probe);
+    Ok(canonical)
+}
+
 fn resolve_runtime_config(repo_root: &Path) -> Result<RuntimeConfig, String> {
     let cfg_path = config_file_path();
     let file_cfg_opt = read_desktop_config_file(&cfg_path)?;
     let file_cfg = file_cfg_opt.clone().unwrap_or_default();
-    let env_cfg = load_env_config();
+    let env_cfg = load_env_config()?;
 
     let autodetect_candidate =
         find_pipeline_root_autodetect(repo_root).map(|p| p.to_string_lossy().to_string());
@@ -346,6 +475,7 @@ fn resolve_runtime_config(repo_root: &Path) -> Result<RuntimeConfig, String> {
 
     let out_candidate = PathBuf::from(selected_out_dir);
     let out_abs = absolutize(&out_candidate, &pipeline_root);
+    let out_abs = validate_out_dir_writable(&out_abs)?;
 
     let s2_api_key = non_empty_opt(file_cfg.S2_API_KEY.as_deref()).or(env_cfg.s2_api_key);
     let s2_min_interval_ms = file_cfg.S2_MIN_INTERVAL_MS.or(env_cfg.s2_min_interval_ms);
@@ -356,7 +486,7 @@ fn resolve_runtime_config(repo_root: &Path) -> Result<RuntimeConfig, String> {
         config_file_path: cfg_path,
         config_file_loaded: file_cfg_opt.is_some(),
         pipeline_root,
-        out_base_dir: canonical_or_self(&out_abs),
+        out_base_dir: out_abs,
         s2_api_key,
         s2_min_interval_ms,
         s2_max_retries,
@@ -897,6 +1027,13 @@ fn open_config_file_location() -> Result<String, String> {
     Ok(path.to_string_lossy().to_string())
 }
 
+#[tauri::command]
+fn create_config_if_missing() -> Result<String, String> {
+    let path = config_file_path();
+    ensure_config_file_template(&path)?;
+    Ok(path.to_string_lossy().to_string())
+}
+
 fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
@@ -904,7 +1041,8 @@ fn main() {
             open_run_folder,
             get_runtime_config,
             reload_runtime_config,
-            open_config_file_location
+            open_config_file_location,
+            create_config_if_missing
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
