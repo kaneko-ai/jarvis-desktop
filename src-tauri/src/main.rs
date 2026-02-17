@@ -67,6 +67,25 @@ struct RuntimeConfigView {
     s2_backoff_base_sec: Option<f64>,
 }
 
+#[derive(Serialize)]
+struct RunListItem {
+    run_id: String,
+    status: String,
+    created_at_epoch_ms: u64,
+    paper_id: String,
+    run_dir: String,
+}
+
+#[derive(Serialize)]
+struct RunArtifactView {
+    run_id: String,
+    artifact: String,
+    path: String,
+    exists: bool,
+    content: String,
+    parse_status: String,
+}
+
 fn normalize_paper_id(raw: &str) -> Result<String, String> {
     let mut s = raw.trim().to_string();
     if s.is_empty() {
@@ -728,6 +747,223 @@ fn missing_dependency(run_id: String, message: String) -> RunResult {
     }
 }
 
+fn validate_run_id_component(run_id: &str) -> Result<String, String> {
+    let trimmed = run_id.trim();
+    if trimmed.is_empty() {
+        return Err("run_id is empty".to_string());
+    }
+    if trimmed == "." || trimmed == ".." {
+        return Err("run_id is invalid".to_string());
+    }
+    if trimmed.contains(['\\', '/']) {
+        return Err("run_id must not contain path separators".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+fn parse_status_from_result(path: &Path) -> String {
+    let text = match fs::read_to_string(path) {
+        Ok(v) => v,
+        Err(_) => return "unknown".to_string(),
+    };
+    let value: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(_) => return "unknown".to_string(),
+    };
+
+    if let Some(v) = value.get("status").and_then(|v| v.as_str()) {
+        let t = v.trim();
+        if !t.is_empty() {
+            return t.to_string();
+        }
+    }
+
+    if let Some(ok) = value.get("ok").and_then(|v| v.as_bool()) {
+        if ok {
+            return "ok".to_string();
+        }
+        return "error".to_string();
+    }
+
+    "unknown".to_string()
+}
+
+fn parse_paper_id_from_input(path: &Path) -> String {
+    let text = match fs::read_to_string(path) {
+        Ok(v) => v,
+        Err(_) => return "unknown".to_string(),
+    };
+    let value: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(_) => return "unknown".to_string(),
+    };
+
+    if let Some(v) = value.get("paper_id").and_then(|v| v.as_str()) {
+        let t = v.trim();
+        if !t.is_empty() {
+            return t.to_string();
+        }
+    }
+    if let Some(v) = value.get("id").and_then(|v| v.as_str()) {
+        let t = v.trim();
+        if !t.is_empty() {
+            return t.to_string();
+        }
+    }
+    if let Some(v) = value
+        .get("request")
+        .and_then(|v| v.get("paper_id"))
+        .and_then(|v| v.as_str())
+    {
+        let t = v.trim();
+        if !t.is_empty() {
+            return t.to_string();
+        }
+    }
+
+    "unknown".to_string()
+}
+
+fn modified_epoch_ms(path: &Path) -> u64 {
+    match fs::metadata(path)
+        .and_then(|m| m.modified())
+        .and_then(|t| t.duration_since(UNIX_EPOCH).map_err(std::io::Error::other))
+    {
+        Ok(d) => d.as_millis().min(u128::from(u64::MAX)) as u64,
+        Err(_) => 0,
+    }
+}
+
+fn resolve_run_dir_from_id(runtime: &RuntimeConfig, run_id: &str) -> Result<PathBuf, String> {
+    let run_component = validate_run_id_component(run_id)?;
+    let candidate = runtime.out_base_dir.join(&run_component);
+    if !candidate.exists() {
+        return Err(format!("run directory does not exist: {}", candidate.display()));
+    }
+    if !candidate.is_dir() {
+        return Err(format!("run path is not a directory: {}", candidate.display()));
+    }
+    let canonical = candidate
+        .canonicalize()
+        .map_err(|e| format!("failed to canonicalize run directory {}: {e}", candidate.display()))?;
+    if !canonical.starts_with(&runtime.out_base_dir) {
+        return Err(format!(
+            "run directory is outside out_dir: {}",
+            canonical.display()
+        ));
+    }
+    Ok(canonical)
+}
+
+#[tauri::command]
+fn list_runs() -> Result<Vec<RunListItem>, String> {
+    let root = repo_root();
+    let runtime = resolve_runtime_config(&root)?;
+
+    let mut entries: Vec<(PathBuf, u64)> = Vec::new();
+    for entry in fs::read_dir(&runtime.out_base_dir)
+        .map_err(|e| format!("failed to read out_dir {}: {e}", runtime.out_base_dir.display()))?
+    {
+        let entry = match entry {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let ts = modified_epoch_ms(&path);
+        entries.push((path, ts));
+    }
+
+    entries.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let mut rows = Vec::with_capacity(entries.len());
+    for (run_dir, ts) in entries {
+        let run_id = run_dir
+            .file_name()
+            .map(|v| v.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let status = parse_status_from_result(&run_dir.join("result.json"));
+        let paper_id = parse_paper_id_from_input(&run_dir.join("input.json"));
+        rows.push(RunListItem {
+            run_id,
+            status,
+            created_at_epoch_ms: ts,
+            paper_id,
+            run_dir: run_dir.to_string_lossy().to_string(),
+        });
+    }
+
+    Ok(rows)
+}
+
+#[tauri::command]
+fn read_run_artifact(run_id: String, artifact: String) -> Result<RunArtifactView, String> {
+    let root = repo_root();
+    let runtime = resolve_runtime_config(&root)?;
+    let run_id = validate_run_id_component(&run_id)?;
+    let run_dir = resolve_run_dir_from_id(&runtime, &run_id)?;
+
+    let (artifact_key, rel_path, is_json) = match artifact.as_str() {
+        "tree_md" => ("tree_md", PathBuf::from("paper_graph").join("tree").join("tree.md"), false),
+        "result_json" => ("result_json", PathBuf::from("result.json"), true),
+        "input_json" => ("input_json", PathBuf::from("input.json"), true),
+        "stdout_log" => ("stdout_log", PathBuf::from("stdout.log"), false),
+        "stderr_log" => ("stderr_log", PathBuf::from("stderr.log"), false),
+        _ => return Err(format!("unsupported artifact: {artifact}")),
+    };
+
+    let target = run_dir.join(rel_path);
+    if !target.exists() {
+        return Ok(RunArtifactView {
+            run_id,
+            artifact: artifact_key.to_string(),
+            path: target.to_string_lossy().to_string(),
+            exists: false,
+            content: "missing".to_string(),
+            parse_status: "missing".to_string(),
+        });
+    }
+
+    let raw = fs::read_to_string(&target)
+        .map_err(|e| format!("failed to read artifact {}: {e}", target.display()))?;
+
+    if is_json {
+        match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(v) => {
+                let pretty = serde_json::to_string_pretty(&v)
+                    .map_err(|e| format!("failed to pretty print json {}: {e}", target.display()))?;
+                Ok(RunArtifactView {
+                    run_id,
+                    artifact: artifact_key.to_string(),
+                    path: target.to_string_lossy().to_string(),
+                    exists: true,
+                    content: pretty,
+                    parse_status: "ok".to_string(),
+                })
+            }
+            Err(_) => Ok(RunArtifactView {
+                run_id,
+                artifact: artifact_key.to_string(),
+                path: target.to_string_lossy().to_string(),
+                exists: true,
+                content: raw,
+                parse_status: "raw".to_string(),
+            }),
+        }
+    } else {
+        Ok(RunArtifactView {
+            run_id,
+            artifact: artifact_key.to_string(),
+            path: target.to_string_lossy().to_string(),
+            exists: true,
+            content: raw,
+            parse_status: "ok".to_string(),
+        })
+    }
+}
+
 #[tauri::command]
 fn run_papers_tree(paper_id: String, depth: u8, max_per_level: u32) -> RunResult {
     let run_id = make_run_id();
@@ -1039,6 +1275,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             run_papers_tree,
             open_run_folder,
+            list_runs,
+            read_run_artifact,
             get_runtime_config,
             reload_runtime_config,
             open_config_file_location,

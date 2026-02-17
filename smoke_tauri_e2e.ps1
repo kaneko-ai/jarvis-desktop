@@ -215,7 +215,16 @@ try {
     throw "No new run directory detected under $resolvedOutDir`n$lastOutputText"
   }
 
-  Write-Host "[6/8] verify required artifacts in $runDir"
+  Write-Host "[6/9] verify run listing includes created run_id"
+  $runIdFromDir = Split-Path $runDir -Leaf
+  $listedRunIds = Get-ChildItem -Path $resolvedOutDir -Directory -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -ExpandProperty Name
+  if (-not ($listedRunIds -contains $runIdFromDir)) {
+    throw "run listing does not include created run_id: $runIdFromDir"
+  }
+
+  Write-Host "[7/9] verify required artifacts in $runDir"
   $required = @(
     "input.json",
     "result.json",
@@ -236,10 +245,10 @@ try {
     TauriStderrLog = $stderrLog
   }
 
-  Write-Host "[7/8] pipeline artifact verification passed"
+  Write-Host "[8/9] pipeline artifact verification passed"
   
     if ($RunDiag) {
-      Write-Host "[8/8] optional diagnostics: collect_diag.ps1"
+      Write-Host "[9/9] optional diagnostics: collect_diag.ps1"
       $diagScript = Join-Path $desktopRoot "scripts\collect_diag.ps1"
       if (Test-Path $diagScript) {
         $diagPath = Join-Path $desktopRoot "diag_report.md"
@@ -276,7 +285,7 @@ try {
         }
       }
     } else {
-      Write-Host "[8/8] smoke completed successfully"
+      Write-Host "[9/9] smoke completed successfully"
     }
   $script:exitCode = 0
 }
