@@ -379,9 +379,8 @@ $($errLines -join "`r`n")
   )
 
   Write-Host "Diagnostic report generated: $outPathResolved"
-  if ($diagnostic.status -eq "ok") {
-    [Environment]::Exit(0)
-  } else {
-    [Environment]::Exit(1)
+  if ($diagnostic.status -ne "ok") {
+    throw "collect_diag completed with errors. See report: $outPathResolved"
   }
+  $global:LASTEXITCODE = 0
 }
