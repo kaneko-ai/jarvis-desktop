@@ -1,7 +1,8 @@
 param(
   [string]$PipelineRoot = "..\..\jarvis-ml-pipeline",
   [string]$OutDir = "",
-  [int]$StartupWaitSec = 20
+  [int]$StartupWaitSec = 20,
+  [switch]$RunDiag
 )
 
 $ErrorActionPreference = "Stop"
@@ -235,7 +236,31 @@ try {
   }
 
   Write-Host "[7/8] pipeline artifact verification passed"
-  Write-Host "[8/8] smoke completed successfully"
+  
+    if ($RunDiag) {
+      Write-Host "[8/8] optional diagnostics: collect_diag.ps1"
+      $diagScript = Join-Path $desktopRoot "scripts\collect_diag.ps1"
+      if (Test-Path $diagScript) {
+        $diagPath = Join-Path $desktopRoot "diag_report.md"
+        $prevErrorAction = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try {
+          & $diagScript -PipelineRoot $resolvedPipeline -OutPath $diagPath
+          $diagExit = $LASTEXITCODE
+        } finally {
+          $ErrorActionPreference = $prevErrorAction
+        }
+        if ($diagExit -ne 0 -or -not (Test-Path $diagPath)) {
+          Write-Host "WARNING: diagnostics failed or report missing (exit=$diagExit)" -ForegroundColor Yellow
+        } else {
+          Write-Host "Diagnostics report generated: $diagPath"
+        }
+      } else {
+        Write-Host "WARNING: diagnostics script not found: $diagScript" -ForegroundColor Yellow
+      }
+    } else {
+      Write-Host "[8/8] smoke completed successfully"
+    }
   $script:exitCode = 0
 }
 catch {
