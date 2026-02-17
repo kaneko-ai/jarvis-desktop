@@ -86,110 +86,301 @@ struct RunArtifactView {
     parse_status: String,
 }
 
-fn normalize_paper_id(raw: &str) -> Result<String, String> {
-    let mut s = raw.trim().to_string();
-    if s.is_empty() {
-        return Err("paper_id is empty".to_string());
-    }
+#[derive(Serialize, Clone)]
+struct NormalizedIdentifier {
+    kind: String,
+    canonical: String,
+    display: String,
+    warnings: Vec<String>,
+    errors: Vec<String>,
+}
 
+#[derive(Serialize)]
+struct PreflightCheckItem {
+    name: String,
+    ok: bool,
+    detail: String,
+    fix_hint: String,
+}
+
+#[derive(Serialize)]
+struct PreflightResult {
+    ok: bool,
+    checks: Vec<PreflightCheckItem>,
+}
+
+fn split_url_tail(raw: &str) -> String {
+    raw.split(&['?', '#'][..]).next().unwrap_or("").trim().to_string()
+}
+
+fn normalize_identifier_internal(input: &str) -> NormalizedIdentifier {
+    let mut warnings = Vec::new();
+    let mut errors = Vec::new();
+
+    let mut s = input.trim().to_string();
     s = s.trim_matches('"').trim_matches('\'').trim().to_string();
     s = s.replace('\u{3000}', " ");
     s = s.trim().to_string();
+
     if s.is_empty() {
-        return Err("paper_id is empty after trim".to_string());
+        errors.push("identifier is empty".to_string());
+        return NormalizedIdentifier {
+            kind: "unknown".to_string(),
+            canonical: "".to_string(),
+            display: "".to_string(),
+            warnings,
+            errors,
+        };
     }
 
     let lower = s.to_lowercase();
 
-    if lower.contains("arxiv.org/abs/") {
-        if let Some(idx) = lower.find("arxiv.org/abs/") {
-            let tail = &s[(idx + "arxiv.org/abs/".len())..];
-            let id = tail.split(&['?', '#'][..]).next().unwrap_or("").trim();
-            let id = id.trim_end_matches('/');
-            if id.is_empty() {
-                return Err("failed to parse arxiv id from url".to_string());
-            }
-            return Ok(format!("arxiv:{id}"));
-        }
-    }
-    if lower.contains("arxiv.org/pdf/") {
-        if let Some(idx) = lower.find("arxiv.org/pdf/") {
-            let tail = &s[(idx + "arxiv.org/pdf/".len())..];
-            let id = tail
-                .split(&['?', '#'][..])
-                .next()
-                .unwrap_or("")
-                .trim()
-                .trim_end_matches(".pdf")
-                .trim_end_matches('/');
-            if id.is_empty() {
-                return Err("failed to parse arxiv id from pdf url".to_string());
-            }
-            return Ok(format!("arxiv:{id}"));
+    if lower.contains("doi.org/") {
+        let idx = lower.find("doi.org/").unwrap_or(0);
+        let tail = split_url_tail(&s[(idx + "doi.org/".len())..]);
+        let doi = tail.trim_end_matches('/').trim().to_lowercase();
+        if doi.is_empty() {
+            errors.push("failed to parse DOI from URL".to_string());
+        } else {
+            warnings.push("DOI extracted from URL".to_string());
+            return NormalizedIdentifier {
+                kind: "doi".to_string(),
+                canonical: doi.clone(),
+                display: format!("doi:{doi}"),
+                warnings,
+                errors,
+            };
         }
     }
 
-    if lower.contains("doi.org/") {
-        if let Some(idx) = lower.find("doi.org/") {
-            let tail = &s[(idx + "doi.org/".len())..];
-            let doi = tail.split(&['?', '#'][..]).next().unwrap_or("").trim();
-            let doi = doi.trim_end_matches('/');
-            if doi.is_empty() {
-                return Err("failed to parse doi from doi.org url".to_string());
-            }
-            return Ok(format!("doi:{doi}"));
+    if lower.starts_with("doi:") {
+        let doi = s[4..].trim().to_lowercase();
+        if doi.is_empty() {
+            errors.push("DOI prefix exists but body is empty".to_string());
+        } else {
+            return NormalizedIdentifier {
+                kind: "doi".to_string(),
+                canonical: doi.clone(),
+                display: format!("doi:{doi}"),
+                warnings,
+                errors,
+            };
         }
     }
-    if lower.contains("dx.doi.org/") {
-        if let Some(idx) = lower.find("dx.doi.org/") {
-            let tail = &s[(idx + "dx.doi.org/".len())..];
-            let doi = tail.split(&['?', '#'][..]).next().unwrap_or("").trim();
-            let doi = doi.trim_end_matches('/');
-            if doi.is_empty() {
-                return Err("failed to parse doi from dx.doi.org url".to_string());
+
+    if s.starts_with("10.") && s.contains('/') {
+        let doi = s.replace(' ', "").to_lowercase();
+        return NormalizedIdentifier {
+            kind: "doi".to_string(),
+            canonical: doi.clone(),
+            display: format!("doi:{doi}"),
+            warnings,
+            errors,
+        };
+    }
+
+    if lower.contains("pubmed.ncbi.nlm.nih.gov/") {
+        if let Some(idx) = lower.find("pubmed.ncbi.nlm.nih.gov/") {
+            let tail = split_url_tail(&s[(idx + "pubmed.ncbi.nlm.nih.gov/".len())..]);
+            let pmid = tail.trim_end_matches('/').trim();
+            if !pmid.is_empty() && pmid.chars().all(|c| c.is_ascii_digit()) {
+                warnings.push("PMID extracted from PubMed URL".to_string());
+                return NormalizedIdentifier {
+                    kind: "pmid".to_string(),
+                    canonical: format!("pmid:{pmid}"),
+                    display: format!("pmid:{pmid}"),
+                    warnings,
+                    errors,
+                };
             }
-            return Ok(format!("doi:{doi}"));
         }
+        errors.push("failed to parse PMID from PubMed URL".to_string());
+    }
+
+    if lower.starts_with("pmid:") {
+        let body = s[5..].trim();
+        if body.is_empty() || !body.chars().all(|c| c.is_ascii_digit()) {
+            errors.push("pmid must be digits".to_string());
+        } else {
+            return NormalizedIdentifier {
+                kind: "pmid".to_string(),
+                canonical: format!("pmid:{body}"),
+                display: format!("pmid:{body}"),
+                warnings,
+                errors,
+            };
+        }
+    }
+
+    if s.chars().all(|c| c.is_ascii_digit()) {
+        return NormalizedIdentifier {
+            kind: "pmid".to_string(),
+            canonical: format!("pmid:{s}"),
+            display: format!("pmid:{s}"),
+            warnings,
+            errors,
+        };
+    }
+
+    if lower.contains("arxiv.org/abs/") {
+        if let Some(idx) = lower.find("arxiv.org/abs/") {
+            let tail = split_url_tail(&s[(idx + "arxiv.org/abs/".len())..]);
+            let id = tail.trim_end_matches('/').trim();
+            if !id.is_empty() {
+                warnings.push("arXiv id extracted from URL".to_string());
+                return NormalizedIdentifier {
+                    kind: "arxiv".to_string(),
+                    canonical: format!("arxiv:{id}"),
+                    display: format!("arxiv:{id}"),
+                    warnings,
+                    errors,
+                };
+            }
+        }
+        errors.push("failed to parse arXiv id from URL".to_string());
+    }
+
+    if lower.contains("arxiv.org/pdf/") {
+        if let Some(idx) = lower.find("arxiv.org/pdf/") {
+            let tail = split_url_tail(&s[(idx + "arxiv.org/pdf/".len())..]);
+            let id = tail.trim_end_matches(".pdf").trim_end_matches('/').trim();
+            if !id.is_empty() {
+                warnings.push("arXiv id extracted from PDF URL".to_string());
+                return NormalizedIdentifier {
+                    kind: "arxiv".to_string(),
+                    canonical: format!("arxiv:{id}"),
+                    display: format!("arxiv:{id}"),
+                    warnings,
+                    errors,
+                };
+            }
+        }
+        errors.push("failed to parse arXiv id from PDF URL".to_string());
+    }
+
+    if lower.starts_with("arxiv:") {
+        let body = s[6..].trim();
+        if body.is_empty() {
+            errors.push("arxiv prefix exists but body is empty".to_string());
+        } else {
+            return NormalizedIdentifier {
+                kind: "arxiv".to_string(),
+                canonical: format!("arxiv:{body}"),
+                display: format!("arxiv:{body}"),
+                warnings,
+                errors,
+            };
+        }
+    }
+
+    if s.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '/' || c == '-')
+        && (s.contains('.') || s.contains('/'))
+    {
+        return NormalizedIdentifier {
+            kind: "arxiv".to_string(),
+            canonical: format!("arxiv:{s}"),
+            display: format!("arxiv:{s}"),
+            warnings,
+            errors,
+        };
     }
 
     if lower.contains("semanticscholar.org/paper/") {
         let parts: Vec<&str> = s.split('/').filter(|p| !p.is_empty()).collect();
         if let Some(last) = parts.last() {
-            let cand = last.split(&['?', '#'][..]).next().unwrap_or("").trim();
-            if !cand.is_empty() {
-                return Ok(format!("s2:{cand}"));
+            let id = split_url_tail(last);
+            if !id.is_empty() {
+                warnings.push("S2 id extracted from URL".to_string());
+                return NormalizedIdentifier {
+                    kind: "s2".to_string(),
+                    canonical: format!("S2PaperId:{id}"),
+                    display: format!("S2PaperId:{id}"),
+                    warnings,
+                    errors,
+                };
             }
         }
-        return Err("failed to parse semantic scholar paper id from url".to_string());
+        errors.push("failed to parse Semantic Scholar id from URL".to_string());
     }
 
-    for p in ["arxiv:", "doi:", "pmid:", "s2:"] {
-        if lower.starts_with(p) {
-            let body = s[p.len()..].trim().replace(' ', "");
-            if body.is_empty() {
-                return Err(format!("paper_id has prefix {p} but empty body"));
+    if lower.starts_with("corpusid:") {
+        let body = s[9..].trim();
+        if body.is_empty() {
+            errors.push("CorpusId prefix exists but body is empty".to_string());
+        } else {
+            return NormalizedIdentifier {
+                kind: "s2".to_string(),
+                canonical: format!("CorpusId:{body}"),
+                display: format!("CorpusId:{body}"),
+                warnings,
+                errors,
+            };
+        }
+    }
+
+    if lower.starts_with("s2paperid:") {
+        let body = s[10..].trim();
+        if body.is_empty() {
+            errors.push("S2PaperId prefix exists but body is empty".to_string());
+        } else {
+            return NormalizedIdentifier {
+                kind: "s2".to_string(),
+                canonical: format!("S2PaperId:{body}"),
+                display: format!("S2PaperId:{body}"),
+                warnings,
+                errors,
+            };
+        }
+    }
+
+    if lower.starts_with("s2:") {
+        let body = s[3..].trim();
+        if body.is_empty() {
+            errors.push("s2 prefix exists but body is empty".to_string());
+        } else {
+            return NormalizedIdentifier {
+                kind: "s2".to_string(),
+                canonical: format!("S2PaperId:{body}"),
+                display: format!("S2PaperId:{body}"),
+                warnings,
+                errors,
+            };
+        }
+    }
+
+    errors.push("unknown identifier format".to_string());
+    NormalizedIdentifier {
+        kind: "unknown".to_string(),
+        canonical: s,
+        display: "unknown".to_string(),
+        warnings,
+        errors,
+    }
+}
+
+fn to_pipeline_identifier(normalized: &NormalizedIdentifier) -> Result<String, String> {
+    if !normalized.errors.is_empty() {
+        return Err(normalized.errors.join("; "));
+    }
+    match normalized.kind.as_str() {
+        "doi" => Ok(format!("doi:{}", normalized.canonical)),
+        "pmid" | "arxiv" => Ok(normalized.canonical.clone()),
+        "s2" => {
+            if let Some(body) = normalized.canonical.strip_prefix("CorpusId:") {
+                return Ok(format!("s2:CorpusId:{body}"));
             }
-            return Ok(format!("{p}{body}"));
+            if let Some(body) = normalized.canonical.strip_prefix("S2PaperId:") {
+                return Ok(format!("s2:S2PaperId:{body}"));
+            }
+            Ok(format!("s2:{}", normalized.canonical))
         }
+        _ => Err("unknown identifier kind".to_string()),
     }
+}
 
-    if s.starts_with("10.") && s.contains('/') {
-        let doi = s.replace(' ', "");
-        if doi.is_empty() {
-            return Err("doi inference failed".to_string());
-        }
-        return Ok(format!("doi:{doi}"));
-    }
-
-    if !s.contains('.') && s.chars().all(|c| c.is_ascii_digit()) {
-        return Ok(format!("pmid:{s}"));
-    }
-
-    if s.chars().all(|c| c.is_ascii_digit() || c == '.') && s.contains('.') {
-        return Ok(format!("arxiv:{s}"));
-    }
-
-    Ok(s)
+fn normalize_paper_id(raw: &str) -> Result<String, String> {
+    let normalized = normalize_identifier_internal(raw);
+    to_pipeline_identifier(&normalized)
 }
 
 fn make_run_id() -> String {
@@ -544,6 +735,186 @@ fn runtime_config_view_from_result(result: Result<RuntimeConfig, String>) -> Run
     }
 }
 
+fn preflight_item(name: &str, ok: bool, detail: String, fix_hint: &str) -> PreflightCheckItem {
+    PreflightCheckItem {
+        name: name.to_string(),
+        ok,
+        detail,
+        fix_hint: fix_hint.to_string(),
+    }
+}
+
+fn run_preflight_checks() -> PreflightResult {
+    let root = repo_root();
+    let cfg_path = config_file_path();
+
+    let mut checks = Vec::new();
+
+    let file_cfg_res = read_desktop_config_file(&cfg_path);
+    let file_cfg = match file_cfg_res {
+        Ok(v) => v.unwrap_or_default(),
+        Err(e) => {
+            checks.push(preflight_item(
+                "config_file",
+                false,
+                e,
+                "Fix JSON format in config file or recreate template from app.",
+            ));
+            DesktopConfigFile::default()
+        }
+    };
+
+    let env_cfg_res = load_env_config();
+    let env_cfg = match env_cfg_res {
+        Ok(v) => v,
+        Err(e) => {
+            checks.push(preflight_item(
+                "environment",
+                false,
+                e,
+                "Remove invalid numeric env values (S2_*).",
+            ));
+            EnvConfig::default()
+        }
+    };
+
+    let autodetect_candidate =
+        find_pipeline_root_autodetect(&root).map(|p| p.to_string_lossy().to_string());
+    let selected_root = first_from_precedence(
+        file_cfg.JARVIS_PIPELINE_ROOT.as_deref(),
+        env_cfg.pipeline_root.as_deref(),
+        autodetect_candidate.as_deref(),
+    );
+
+    let mut pipeline_root_valid: Option<PathBuf> = None;
+    match selected_root {
+        None => checks.push(preflight_item(
+            "pipeline_root",
+            false,
+            format!(
+                "Pipeline root is not resolved. config path: {}",
+                cfg_path.display()
+            ),
+            "Set JARVIS_PIPELINE_ROOT in config or environment.",
+        )),
+        Some(root_text) => {
+            let candidate = PathBuf::from(&root_text);
+            if !candidate.exists() {
+                checks.push(preflight_item(
+                    "pipeline_root",
+                    false,
+                    format!("Pipeline root does not exist: {}", candidate.display()),
+                    "Set existing pipeline root path.",
+                ));
+            } else {
+                match validate_pipeline_root("resolved", &candidate) {
+                    Ok(p) => {
+                        checks.push(preflight_item(
+                            "pipeline_root",
+                            true,
+                            format!("Resolved: {}", p.display()),
+                            "",
+                        ));
+                        pipeline_root_valid = Some(p);
+                    }
+                    Err(e) => checks.push(preflight_item(
+                        "pipeline_root",
+                        false,
+                        e,
+                        "Ensure pipeline root has pyproject.toml, jarvis_cli.py, jarvis_core/.",
+                    )),
+                }
+            }
+        }
+    }
+
+    if let Some(ref pipeline_root) = pipeline_root_valid {
+        let selected_out_dir = first_from_precedence(
+            file_cfg.JARVIS_PIPELINE_OUT_DIR.as_deref(),
+            env_cfg.pipeline_out_dir.as_deref(),
+            Some("logs/runs"),
+        )
+        .unwrap_or_else(|| "logs/runs".to_string());
+        let out_abs = absolutize(&PathBuf::from(selected_out_dir), pipeline_root);
+        match validate_out_dir_writable(&out_abs) {
+            Ok(canonical) => checks.push(preflight_item(
+                "out_dir",
+                true,
+                format!("Writable: {}", canonical.display()),
+                "",
+            )),
+            Err(e) => checks.push(preflight_item(
+                "out_dir",
+                false,
+                e,
+                "Fix JARVIS_PIPELINE_OUT_DIR or directory permissions.",
+            )),
+        }
+
+        let (python_cmd, warnings) = choose_python(&root, pipeline_root);
+        match check_python_runnable(&python_cmd, pipeline_root) {
+            Ok(_) => {
+                let mut detail = format!("python executable: {python_cmd}");
+                if !warnings.is_empty() {
+                    detail = format!("{detail}; {}", warnings.join(" | "));
+                }
+                checks.push(preflight_item("python", true, detail, ""));
+            }
+            Err(e) => checks.push(preflight_item(
+                "python",
+                false,
+                e,
+                "Prepare python venv under src-tauri/.venv or pipeline/.venv.",
+            )),
+        }
+
+        let mut marker_missing = Vec::new();
+        for marker in ["pyproject.toml", "jarvis_cli.py", "jarvis_core"] {
+            let exists = pipeline_root.join(marker).exists();
+            if !exists {
+                marker_missing.push(marker.to_string());
+            }
+        }
+        if marker_missing.is_empty() {
+            checks.push(preflight_item(
+                "pipeline_markers",
+                true,
+                format!("markers OK at {}", pipeline_root.display()),
+                "",
+            ));
+        } else {
+            checks.push(preflight_item(
+                "pipeline_markers",
+                false,
+                format!("missing markers: {}", marker_missing.join(", ")),
+                "Point pipeline_root to a valid jarvis-ml-pipeline checkout.",
+            ));
+        }
+    } else {
+        checks.push(preflight_item(
+            "out_dir",
+            false,
+            "pipeline_root unresolved; out_dir check skipped".to_string(),
+            "Fix pipeline_root first.",
+        ));
+        checks.push(preflight_item(
+            "python",
+            false,
+            "pipeline_root unresolved; python check skipped".to_string(),
+            "Fix pipeline_root first.",
+        ));
+        checks.push(preflight_item(
+            "pipeline_markers",
+            false,
+            "pipeline_root unresolved; marker check skipped".to_string(),
+            "Fix pipeline_root first.",
+        ));
+    }
+
+    let ok = checks.iter().all(|c| c.ok);
+    PreflightResult { ok, checks }
+}
+
 fn ensure_config_file_template(path: &Path) -> Result<(), String> {
     if path.exists() {
         return Ok(());
@@ -755,7 +1126,7 @@ fn validate_run_id_component(run_id: &str) -> Result<String, String> {
     if trimmed == "." || trimmed == ".." {
         return Err("run_id is invalid".to_string());
     }
-    if trimmed.contains(['\\', '/']) {
+    if trimmed.contains('\\') || trimmed.contains('/') {
         return Err("run_id must not contain path separators".to_string());
     }
     Ok(trimmed.to_string())
@@ -1245,6 +1616,16 @@ fn get_runtime_config() -> RuntimeConfigView {
 }
 
 #[tauri::command]
+fn normalize_identifier(input: String) -> NormalizedIdentifier {
+    normalize_identifier_internal(&input)
+}
+
+#[tauri::command]
+fn preflight_check() -> PreflightResult {
+    run_preflight_checks()
+}
+
+#[tauri::command]
 fn reload_runtime_config() -> RuntimeConfigView {
     get_runtime_config()
 }
@@ -1277,6 +1658,8 @@ fn main() {
             open_run_folder,
             list_runs,
             read_run_artifact,
+            normalize_identifier,
+            preflight_check,
             get_runtime_config,
             reload_runtime_config,
             open_config_file_location,
@@ -1321,5 +1704,70 @@ mod tests {
         let msg = build_status_message("needs_retry", "", raw, sec);
         assert!(msg.to_lowercase().contains("retry after"));
         assert!(msg.contains("12."));
+    }
+
+    #[test]
+    fn normalize_identifier_doi_variants() {
+        let from_url = normalize_identifier_internal("https://doi.org/10.1234/AbCd");
+        assert_eq!(from_url.kind, "doi");
+        assert_eq!(from_url.canonical, "10.1234/abcd");
+
+        let from_prefix = normalize_identifier_internal("doi:10.5555/XYZ");
+        assert_eq!(from_prefix.kind, "doi");
+        assert_eq!(from_prefix.canonical, "10.5555/xyz");
+
+        let from_raw = normalize_identifier_internal("10.1000/182");
+        assert_eq!(from_raw.kind, "doi");
+        assert_eq!(from_raw.canonical, "10.1000/182");
+    }
+
+    #[test]
+    fn normalize_identifier_pmid_variants() {
+        let from_url = normalize_identifier_internal("https://pubmed.ncbi.nlm.nih.gov/12345678/");
+        assert_eq!(from_url.kind, "pmid");
+        assert_eq!(from_url.canonical, "pmid:12345678");
+
+        let from_prefix = normalize_identifier_internal("pmid:87654321");
+        assert_eq!(from_prefix.kind, "pmid");
+        assert_eq!(from_prefix.canonical, "pmid:87654321");
+
+        let from_raw = normalize_identifier_internal("24681357");
+        assert_eq!(from_raw.kind, "pmid");
+        assert_eq!(from_raw.canonical, "pmid:24681357");
+    }
+
+    #[test]
+    fn normalize_identifier_arxiv_variants() {
+        let from_url = normalize_identifier_internal("https://arxiv.org/abs/2301.01234");
+        assert_eq!(from_url.kind, "arxiv");
+        assert_eq!(from_url.canonical, "arxiv:2301.01234");
+
+        let from_prefix = normalize_identifier_internal("arxiv:1706.03762");
+        assert_eq!(from_prefix.kind, "arxiv");
+        assert_eq!(from_prefix.canonical, "arxiv:1706.03762");
+
+        let from_raw = normalize_identifier_internal("2301.01234");
+        assert_eq!(from_raw.kind, "arxiv");
+        assert_eq!(from_raw.canonical, "arxiv:2301.01234");
+    }
+
+    #[test]
+    fn normalize_identifier_s2_variants() {
+        let from_url = normalize_identifier_internal(
+            "https://www.semanticscholar.org/paper/Attention-Is-All-You-Need/204e3073870fae3d05bcbc2f6a8e263d9b72e776",
+        );
+        assert_eq!(from_url.kind, "s2");
+        assert!(from_url.canonical.starts_with("S2PaperId:"));
+
+        let from_corpus = normalize_identifier_internal("CorpusId:12345");
+        assert_eq!(from_corpus.kind, "s2");
+        assert_eq!(from_corpus.canonical, "CorpusId:12345");
+    }
+
+    #[test]
+    fn normalize_identifier_invalid_string() {
+        let invalid = normalize_identifier_internal("not-an-id???");
+        assert_eq!(invalid.kind, "unknown");
+        assert!(!invalid.errors.is_empty());
     }
 }

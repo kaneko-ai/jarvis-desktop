@@ -100,6 +100,11 @@ export default function App() {
   const [runtimeCfg, setRuntimeCfg] = useState(null);
   const [cfgLoading, setCfgLoading] = useState(false);
   const [cfgError, setCfgError] = useState("");
+  const [normalized, setNormalized] = useState(null);
+  const [normalizeLoading, setNormalizeLoading] = useState(false);
+  const [preflight, setPreflight] = useState(null);
+  const [preflightLoading, setPreflightLoading] = useState(false);
+  const [preflightError, setPreflightError] = useState("");
   const [runs, setRuns] = useState([]);
   const [runsLoading, setRunsLoading] = useState(false);
   const [runsError, setRunsError] = useState("");
@@ -130,6 +135,20 @@ export default function App() {
       setRuntimeCfg(null);
     } finally {
       setCfgLoading(false);
+    }
+  }
+
+  async function loadPreflight() {
+    setPreflightLoading(true);
+    setPreflightError("");
+    try {
+      const res = await invoke("preflight_check");
+      setPreflight(res);
+    } catch (e) {
+      setPreflight(null);
+      setPreflightError(String(e));
+    } finally {
+      setPreflightLoading(false);
     }
   }
 
@@ -175,8 +194,31 @@ export default function App() {
 
   useEffect(() => {
     loadRuntimeConfig(false);
+    loadPreflight();
     loadRuns();
   }, []);
+
+  useEffect(() => {
+    const timer = setTimeout(async () => {
+      setNormalizeLoading(true);
+      try {
+        const res = await invoke("normalize_identifier", { input: paperId });
+        setNormalized(res);
+      } catch (e) {
+        setNormalized({
+          kind: "unknown",
+          canonical: "",
+          display: "unknown",
+          warnings: [],
+          errors: [String(e)],
+        });
+      } finally {
+        setNormalizeLoading(false);
+      }
+    }, 220);
+
+    return () => clearTimeout(timer);
+  }, [paperId]);
 
   useEffect(() => {
     loadArtifact(selectedRunId, selectedArtifact);
@@ -220,7 +262,8 @@ export default function App() {
   }
 
   async function onRunTree() {
-    await runTree({ paperId, depth, maxPerLevel });
+    const idForRun = normalized?.canonical?.trim() ? normalized.canonical : paperId;
+    await runTree({ paperId: idForRun, depth, maxPerLevel });
   }
 
   async function onRetry() {
@@ -259,11 +302,18 @@ export default function App() {
     try {
       await invoke("create_config_if_missing");
       await loadRuntimeConfig(true);
+      await loadPreflight();
       await loadRuns();
     } catch (e) {
       alert(String(e));
     }
   }
+
+  const normalizeErrors = Array.isArray(normalized?.errors) ? normalized.errors : [];
+  const normalizeWarnings = Array.isArray(normalized?.warnings) ? normalized.warnings : [];
+  const canRunByNormalization = normalizeErrors.length === 0 && !!normalized?.canonical;
+  const canRunByPreflight = preflight?.ok === true;
+  const runDisabled = running || !canRunByNormalization || !canRunByPreflight;
 
   const showRetryButton = status === "needs_retry" && !!lastRunRequest;
   const selectedRun = runs.find((r) => r.run_id === selectedRunId) ?? null;
@@ -316,11 +366,21 @@ export default function App() {
             Create config template
           </button>
           <button
-            onClick={() => loadRuntimeConfig(true)}
+            onClick={async () => {
+              await loadRuntimeConfig(true);
+              await loadPreflight();
+            }}
             disabled={cfgLoading}
             style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
           >
             {cfgLoading ? "Reloading..." : "Reload config"}
+          </button>
+          <button
+            onClick={loadPreflight}
+            disabled={preflightLoading}
+            style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+          >
+            {preflightLoading ? "Preflight..." : "Run preflight"}
           </button>
         </div>
         {cfgError ? (
@@ -365,10 +425,60 @@ export default function App() {
         </label>
       </div>
 
+      <div
+        style={{
+          border: "1px solid #d2d2d2",
+          borderRadius: 10,
+          padding: 10,
+          marginTop: 10,
+          background: "#fafafa",
+        }}
+      >
+        <div style={{ fontWeight: 600, marginBottom: 6 }}>Identifier preview</div>
+        <div style={{ fontSize: 12 }}>Detected: <code>{normalizeLoading ? "resolving..." : normalized?.kind ?? "unknown"}</code></div>
+        <div style={{ fontSize: 12, marginTop: 4 }}>Canonical: <code>{normalized?.canonical ?? "-"}</code></div>
+        {normalizeWarnings.length > 0 ? (
+          <div style={{ marginTop: 6, color: "#8a4200", fontSize: 12 }}>
+            warnings: {normalizeWarnings.join(" | ")}
+          </div>
+        ) : null}
+        {normalizeErrors.length > 0 ? (
+          <div style={{ marginTop: 6, color: "#a33", fontSize: 12 }}>
+            errors: {normalizeErrors.join(" | ")}
+          </div>
+        ) : null}
+      </div>
+
+      <div
+        style={{
+          border: "1px solid #d2d2d2",
+          borderRadius: 10,
+          padding: 10,
+          marginTop: 10,
+          background: "#fafafa",
+        }}
+      >
+        <div style={{ fontWeight: 600, marginBottom: 6 }}>
+          Preflight: <span style={{ color: preflight?.ok ? "#1f6f3f" : "#a33" }}>{preflight?.ok ? "OK" : "NG"}</span>
+        </div>
+        {preflightError ? <div style={{ color: "#a33", fontSize: 12 }}>{preflightError}</div> : null}
+        {Array.isArray(preflight?.checks)
+          ? preflight.checks.map((item) => (
+              <details key={item.name} style={{ marginBottom: 6 }}>
+                <summary style={{ fontSize: 12, cursor: "pointer" }}>
+                  {item.name}: {item.ok ? "ok" : "ng"}
+                </summary>
+                <div style={{ fontSize: 12, marginTop: 4 }}>detail: <code>{item.detail}</code></div>
+                {!item.ok ? <div style={{ fontSize: 12, color: "#a33" }}>fix_hint: {item.fix_hint}</div> : null}
+              </details>
+            ))
+          : null}
+      </div>
+
       <div style={{ display: "flex", gap: 10, marginTop: 14 }}>
         <button
           onClick={onRunTree}
-          disabled={running || !paperId}
+          disabled={runDisabled}
           style={{ padding: "10px 14px", borderRadius: 10, border: "1px solid #333" }}
         >
           {running ? "Running..." : "Run papers tree"}
