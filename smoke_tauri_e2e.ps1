@@ -2,7 +2,8 @@ param(
   [string]$PipelineRoot = "..\..\jarvis-ml-pipeline",
   [string]$OutDir = "",
   [int]$StartupWaitSec = 20,
-  [switch]$RunDiag
+  [switch]$RunDiag,
+  [switch]$RunDiagStrict
 )
 
 $ErrorActionPreference = "Stop"
@@ -245,18 +246,33 @@ try {
         $prevErrorAction = $ErrorActionPreference
         $ErrorActionPreference = "Continue"
         try {
-          & $diagScript -PipelineRoot $resolvedPipeline -OutPath $diagPath
+          $diagArgs = @(
+            "-NoProfile",
+            "-ExecutionPolicy", "Bypass",
+            "-File", $diagScript,
+            "-PipelineRoot", $resolvedPipeline,
+            "-OutPath", $diagPath
+          )
+          & powershell.exe @diagArgs
           $diagExit = $LASTEXITCODE
         } finally {
           $ErrorActionPreference = $prevErrorAction
         }
         if ($diagExit -ne 0 -or -not (Test-Path $diagPath)) {
-          Write-Host "WARNING: diagnostics failed or report missing (exit=$diagExit)" -ForegroundColor Yellow
+          $diagMsg = "diagnostics failed or report missing (exit=$diagExit)"
+          Write-Host "WARNING: $diagMsg" -ForegroundColor Yellow
+          if ($RunDiagStrict) {
+            throw "RunDiagStrict: $diagMsg"
+          }
         } else {
           Write-Host "Diagnostics report generated: $diagPath"
         }
       } else {
-        Write-Host "WARNING: diagnostics script not found: $diagScript" -ForegroundColor Yellow
+        $diagMsg = "diagnostics script not found: $diagScript"
+        Write-Host "WARNING: $diagMsg" -ForegroundColor Yellow
+        if ($RunDiagStrict) {
+          throw "RunDiagStrict: $diagMsg"
+        }
       }
     } else {
       Write-Host "[8/8] smoke completed successfully"
