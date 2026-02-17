@@ -140,7 +140,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\collect_diag.ps1 -
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\collect_diag.ps1 -OutPath .\diag_report.md -PipelineRoot "C:\Users\kaneko yu\Documents\jarvis-work\jarvis-ml-pipeline"
 ```
 
-Note: VS Code 上の `http://vscodecontentref/...` のようなリンク文字列はコピペせず、必ず実ファイルパス（`.\scripts\collect_diag.ps1`）を使う。
+Note: VS Code 上でリンク化表示される文字列はコピペせず、必ず実ファイルパス（`.\scripts\collect_diag.ps1`）を使う。
 
 Output:
 - `repo root\diag_report.md`（例: `C:\Users\kaneko yu\Documents\jarvis-work\jarvis-desktop-repo\diag_report.md`）

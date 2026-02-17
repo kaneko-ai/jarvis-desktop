@@ -243,6 +243,7 @@ try {
       $diagScript = Join-Path $desktopRoot "scripts\collect_diag.ps1"
       if (Test-Path $diagScript) {
         $diagPath = Join-Path $desktopRoot "diag_report.md"
+        Write-Host ("Diagnostic command: powershell.exe -NoProfile -ExecutionPolicy Bypass -File " + $diagScript + " -PipelineRoot " + $resolvedPipeline + " -OutPath " + $diagPath)
         $prevErrorAction = $ErrorActionPreference
         $ErrorActionPreference = "Continue"
         try {

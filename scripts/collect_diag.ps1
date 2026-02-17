@@ -13,7 +13,7 @@ function Sanitize-PathCandidate {
   param([string]$Raw)
   if ([string]::IsNullOrWhiteSpace($Raw)) { return $null }
   $t = $Raw.Trim().Trim('"').Trim("'")
-  if ($t -match '^(?i)https?://vscodecontentref/') { return $null }
+  if ($t -match '^(?i)https?://') { return $null }
   return $t
 }
 
