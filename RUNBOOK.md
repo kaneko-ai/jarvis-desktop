@@ -137,12 +137,13 @@ Generate machine + config + latest run artifact diagnostics:
 ```powershell
 cd C:\Users\kaneko yu\Documents\jarvis-work\jarvis-desktop-repo
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\collect_diag.ps1 -PipelineRoot "C:\Users\kaneko yu\Documents\jarvis-work\jarvis-ml-pipeline"
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\collect_diag.ps1 -OutPath .\diag_report.md -PipelineRoot "C:\Users\kaneko yu\Documents\jarvis-work\jarvis-ml-pipeline"
 ```
 
 Note: VS Code 上の `http://vscodecontentref/...` のようなリンク文字列はコピペせず、必ず実ファイルパス（`.\scripts\collect_diag.ps1`）を使う。
 
 Output:
-- `diag_report.md` (desktop root)
+- `repo root\diag_report.md`（例: `C:\Users\kaneko yu\Documents\jarvis-work\jarvis-desktop-repo\diag_report.md`）
 - Includes OS/tool versions, sanitized config, latest run dir, and artifact existence checks.
 
 ## Security: open_run_folder restrictions
