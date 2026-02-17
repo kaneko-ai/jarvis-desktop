@@ -372,11 +372,11 @@ $($noteLines -join "`r`n")
 $($errLines -join "`r`n")
 "@
 
-  [System.IO.File]::WriteAllText(
-    $outPathResolved,
-    $report,
-    (New-Object System.Text.UTF8Encoding($false))
-  )
+  if ($PSVersionTable.PSVersion.Major -ge 6) {
+    $report | Out-File -FilePath $outPathResolved -Encoding utf8NoBOM
+  } else {
+    $report | Out-File -FilePath $outPathResolved -Encoding utf8
+  }
 
   Write-Host "Diagnostic report generated: $outPathResolved"
   if ($diagnostic.status -ne "ok") {
