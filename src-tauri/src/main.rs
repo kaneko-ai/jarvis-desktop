@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod shortcut;
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -79,6 +81,15 @@ struct RuntimeConfigView {
     s2_min_interval_ms: Option<u64>,
     s2_max_retries: Option<u32>,
     s2_backoff_base_sec: Option<f64>,
+}
+
+#[derive(Serialize)]
+struct DesktopShortcutResult {
+    ok: bool,
+    dry_run: bool,
+    link_path: Option<String>,
+    target_path: Option<String>,
+    error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1998,6 +2009,53 @@ fn append_audit_auto_retry(out_dir: &Path, entry: &AuditAutoRetryEntry) -> Resul
         .map_err(|e| format!("failed to append audit log {}: {e}", path.display()))?;
     file.write_all(b"\n")
         .map_err(|e| format!("failed to append newline to audit log {}: {e}", path.display()))
+}
+
+fn append_audit_shortcut_event(
+    out_dir: &Path,
+    link_path: &str,
+    target_path: &str,
+    result: &str,
+    error: Option<&str>,
+) -> Result<(), String> {
+    let path = audit_jsonl_path(out_dir);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create audit directory {}: {e}", parent.display()))?;
+    }
+
+    let entry = serde_json::json!({
+        "ts": Utc::now().to_rfc3339(),
+        "event": "shortcut_created",
+        "link_path": link_path,
+        "target_path": target_path,
+        "result": result,
+        "error": error,
+    });
+    let line = serde_json::to_string(&entry)
+        .map_err(|e| format!("failed to serialize audit entry: {e}"))?;
+
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| format!("failed to open audit log {}: {e}", path.display()))?;
+    file.write_all(line.as_bytes())
+        .map_err(|e| format!("failed to append audit log {}: {e}", path.display()))?;
+    file.write_all(b"\n")
+        .map_err(|e| format!("failed to append newline to audit log {}: {e}", path.display()))
+}
+
+fn try_append_shortcut_audit(link_path: &str, target_path: &str, result: &str, error: Option<&str>) {
+    if let Ok((runtime, _)) = runtime_and_jobs_path() {
+        let _ = append_audit_shortcut_event(
+            &runtime.out_base_dir,
+            link_path,
+            target_path,
+            result,
+            error,
+        );
+    }
 }
 
 fn compute_next_retry_at_ms(
@@ -6812,6 +6870,152 @@ fn open_audit_log() -> Result<String, String> {
 }
 
 #[tauri::command]
+fn create_desktop_shortcut(dry_run: Option<bool>) -> DesktopShortcutResult {
+    #[cfg(target_os = "windows")]
+    {
+        let target_path = match std::env::current_exe() {
+            Ok(path) => path,
+            Err(e) => {
+                return DesktopShortcutResult {
+                    ok: false,
+                    dry_run: false,
+                    link_path: None,
+                    target_path: None,
+                    error: Some(format!("failed to resolve current executable path: {e}")),
+                }
+            }
+        };
+
+        let user_profile = match std::env::var("USERPROFILE") {
+            Ok(v) if !v.trim().is_empty() => v,
+            _ => {
+                return DesktopShortcutResult {
+                    ok: false,
+                    dry_run: false,
+                    link_path: None,
+                    target_path: Some(target_path.to_string_lossy().to_string()),
+                    error: Some("USERPROFILE is not available; cannot locate Desktop".to_string()),
+                }
+            }
+        };
+
+        let desktop_dir = PathBuf::from(user_profile).join("Desktop");
+        if !desktop_dir.exists() {
+            return DesktopShortcutResult {
+                ok: false,
+                dry_run: false,
+                link_path: Some(desktop_dir.join("jarvis-desktop.lnk").to_string_lossy().to_string()),
+                target_path: Some(target_path.to_string_lossy().to_string()),
+                error: Some(format!("Desktop folder not found: {}", desktop_dir.display())),
+            };
+        }
+
+        let link_path = desktop_dir.join("jarvis-desktop.lnk");
+        let is_dry_run = dry_run.unwrap_or(false);
+
+        let link_text = link_path.to_string_lossy().to_string();
+        let target_text = target_path.to_string_lossy().to_string();
+
+        if is_dry_run {
+            try_append_shortcut_audit(&link_text, &target_text, "dry_run", None);
+            return DesktopShortcutResult {
+                ok: true,
+                dry_run: true,
+                link_path: Some(link_text),
+                target_path: Some(target_text),
+                error: None,
+            };
+        }
+
+        let script = shortcut::build_shortcut_ps_script(&target_path, &link_path, &target_path);
+        let output = Command::new("powershell")
+            .arg("-NoProfile")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-Command")
+            .arg(script)
+            .output();
+
+        match output {
+            Ok(out) if out.status.success() => {
+                try_append_shortcut_audit(&link_text, &target_text, "ok", None);
+                DesktopShortcutResult {
+                    ok: true,
+                    dry_run: false,
+                    link_path: Some(link_text),
+                    target_path: Some(target_text),
+                    error: None,
+                }
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let detail = if !stderr.is_empty() { stderr } else { stdout };
+                let message = format!(
+                    "failed to create shortcut (powershell exit={}): {}",
+                    out.status.code().unwrap_or(-1),
+                    detail
+                );
+                try_append_shortcut_audit(&link_text, &target_text, "error", Some(&message));
+                DesktopShortcutResult {
+                    ok: false,
+                    dry_run: false,
+                    link_path: Some(link_text),
+                    target_path: Some(target_text),
+                    error: Some(message),
+                }
+            }
+            Err(e) => {
+                let message = format!("failed to launch PowerShell for shortcut creation: {e}");
+                try_append_shortcut_audit(&link_text, &target_text, "error", Some(&message));
+                DesktopShortcutResult {
+                    ok: false,
+                    dry_run: false,
+                    link_path: Some(link_text),
+                    target_path: Some(target_text),
+                    error: Some(message),
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        DesktopShortcutResult {
+            ok: false,
+            dry_run: false,
+            link_path: None,
+            target_path: None,
+            error: Some("unsupported: desktop shortcut creation is only available on Windows".to_string()),
+        }
+    }
+}
+
+#[tauri::command]
+fn open_desktop_folder() -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let user_profile = std::env::var("USERPROFILE")
+            .map_err(|_| "USERPROFILE is not available; cannot locate Desktop".to_string())?;
+        let desktop_dir = PathBuf::from(user_profile).join("Desktop");
+        if !desktop_dir.exists() {
+            return Err(format!("Desktop folder not found: {}", desktop_dir.display()));
+        }
+
+        Command::new("explorer")
+            .arg(&desktop_dir)
+            .spawn()
+            .map_err(|e| format!("failed to open Desktop folder: {e}"))?;
+        Ok(desktop_dir.to_string_lossy().to_string())
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err("unsupported: open_desktop_folder is only available on Windows".to_string())
+    }
+}
+
+#[tauri::command]
 fn tick_auto_retry() -> Result<AutoRetryTickResult, String> {
     let (runtime, _) = runtime_and_jobs_path()?;
     let settings = load_settings(&runtime.out_base_dir)?;
@@ -7221,6 +7425,8 @@ fn main() {
             retry_pipeline_step,
             get_settings,
             update_settings,
+            create_desktop_shortcut,
+            open_desktop_folder,
             open_audit_log,
             tick_auto_retry,
             clear_finished_jobs,
