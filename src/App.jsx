@@ -120,6 +120,20 @@ export default function App() {
   const [jobsLoading, setJobsLoading] = useState(false);
   const [jobsError, setJobsError] = useState("");
   const [selectedJobId, setSelectedJobId] = useState("");
+  const [libraryRows, setLibraryRows] = useState([]);
+  const [libraryLoading, setLibraryLoading] = useState(false);
+  const [libraryError, setLibraryError] = useState("");
+  const [libraryStats, setLibraryStats] = useState(null);
+  const [selectedPaperKey, setSelectedPaperKey] = useState("");
+  const [libraryDetail, setLibraryDetail] = useState(null);
+  const [libraryFilters, setLibraryFilters] = useState({
+    query: "",
+    status: "",
+    kind: "",
+    tag: "",
+  });
+  const [tagInput, setTagInput] = useState("");
+  const [libraryReindexInfo, setLibraryReindexInfo] = useState(null);
 
   const combined = useMemo(() => {
     const parts = [];
@@ -237,12 +251,105 @@ export default function App() {
     }
   }
 
+  async function loadLibraryRows(nextFilters = libraryFilters) {
+    setLibraryLoading(true);
+    setLibraryError("");
+    try {
+      const payload = {};
+      for (const [k, v] of Object.entries(nextFilters)) {
+        if (String(v ?? "").trim() !== "") {
+          payload[k] = v;
+        }
+      }
+      const rows = await invoke("library_list", {
+        filters: payload,
+      });
+      const list = Array.isArray(rows) ? rows : [];
+      setLibraryRows(list);
+      setSelectedPaperKey((prev) => {
+        if (prev && list.some((r) => r.paper_key === prev)) return prev;
+        return list[0]?.paper_key ?? "";
+      });
+    } catch (e) {
+      setLibraryRows([]);
+      setLibraryError(String(e));
+    } finally {
+      setLibraryLoading(false);
+    }
+  }
+
+  async function loadLibraryStats() {
+    try {
+      const stats = await invoke("library_stats");
+      setLibraryStats(stats);
+    } catch {
+      setLibraryStats(null);
+    }
+  }
+
+  async function loadLibraryDetail(paperKey) {
+    if (!paperKey) {
+      setLibraryDetail(null);
+      return;
+    }
+    try {
+      const rec = await invoke("library_get", { paperKey });
+      setLibraryDetail(rec);
+      setTagInput(Array.isArray(rec?.tags) ? rec.tags.join(", ") : "");
+    } catch (e) {
+      setLibraryDetail(null);
+      setLibraryError(String(e));
+    }
+  }
+
+  async function onLibraryReindex() {
+    setLibraryLoading(true);
+    setLibraryError("");
+    try {
+      const info = await invoke("library_reindex", { full: true });
+      setLibraryReindexInfo(info);
+      await loadLibraryRows(libraryFilters);
+      await loadLibraryStats();
+    } catch (e) {
+      setLibraryError(String(e));
+    } finally {
+      setLibraryLoading(false);
+    }
+  }
+
+  async function onSaveTags() {
+    if (!selectedPaperKey) return;
+    const tags = tagInput
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    try {
+      const updated = await invoke("library_set_tags", {
+        paperKey: selectedPaperKey,
+        tags,
+      });
+      setLibraryDetail(updated);
+      await loadLibraryRows(libraryFilters);
+      await loadLibraryStats();
+    } catch (e) {
+      setLibraryError(String(e));
+    }
+  }
+
+  async function onOpenRunFromLibrary(runIdFromLibrary) {
+    if (!runIdFromLibrary) return;
+    await loadRuns();
+    setSelectedRunId(runIdFromLibrary);
+  }
+
   useEffect(() => {
     loadRuntimeConfig(false);
     loadPreflight();
     loadTemplates();
     loadRuns();
     loadJobs();
+    loadLibraryRows();
+    loadLibraryStats();
   }, []);
 
   useEffect(() => {
@@ -251,6 +358,10 @@ export default function App() {
     }, 1500);
     return () => clearInterval(timer);
   }, []);
+
+  useEffect(() => {
+    loadLibraryDetail(selectedPaperKey);
+  }, [selectedPaperKey]);
 
   const selectedTemplate = templates.find((t) => t.id === selectedTemplateId) ?? null;
 
@@ -768,6 +879,140 @@ export default function App() {
               Open run detail
             </button>
           </div>
+        </div>
+      </div>
+
+      <hr style={{ margin: "18px 0" }} />
+
+      <h3 style={{ marginBottom: 8 }}>Library</h3>
+      <div style={{ display: "flex", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
+        <input
+          placeholder="query (canonical/title)"
+          value={libraryFilters.query}
+          onChange={(e) => setLibraryFilters((prev) => ({ ...prev, query: e.target.value }))}
+          style={{ padding: 8, borderRadius: 6, border: "1px solid #ccc", minWidth: 220 }}
+        />
+        <select
+          value={libraryFilters.status}
+          onChange={(e) => setLibraryFilters((prev) => ({ ...prev, status: e.target.value }))}
+          style={{ padding: 8, borderRadius: 6, border: "1px solid #ccc" }}
+        >
+          <option value="">status: all</option>
+          <option value="succeeded">succeeded</option>
+          <option value="failed">failed</option>
+          <option value="needs_retry">needs_retry</option>
+          <option value="running">running</option>
+          <option value="unknown">unknown</option>
+        </select>
+        <select
+          value={libraryFilters.kind}
+          onChange={(e) => setLibraryFilters((prev) => ({ ...prev, kind: e.target.value }))}
+          style={{ padding: 8, borderRadius: 6, border: "1px solid #ccc" }}
+        >
+          <option value="">kind: all</option>
+          <option value="doi">doi</option>
+          <option value="pmid">pmid</option>
+          <option value="arxiv">arxiv</option>
+          <option value="s2">s2</option>
+          <option value="unknown">unknown</option>
+        </select>
+        <input
+          placeholder="tag"
+          value={libraryFilters.tag}
+          onChange={(e) => setLibraryFilters((prev) => ({ ...prev, tag: e.target.value }))}
+          style={{ padding: 8, borderRadius: 6, border: "1px solid #ccc", width: 140 }}
+        />
+        <button
+          onClick={() => loadLibraryRows(libraryFilters)}
+          disabled={libraryLoading}
+          style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+        >
+          {libraryLoading ? "Loading..." : "Apply filters"}
+        </button>
+        <button
+          onClick={onLibraryReindex}
+          disabled={libraryLoading}
+          style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+        >
+          Reindex
+        </button>
+      </div>
+
+      {libraryError ? <div style={{ color: "#a33", fontSize: 12, marginBottom: 8 }}>{libraryError}</div> : null}
+      {libraryStats ? (
+        <div style={{ fontSize: 12, marginBottom: 8, opacity: 0.9 }}>
+          papers={libraryStats.total_papers} runs={libraryStats.total_runs}
+          {libraryReindexInfo ? ` | indexed_at=${libraryReindexInfo.updated_at}` : ""}
+        </div>
+      ) : null}
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 2fr", gap: 12, marginBottom: 12 }}>
+        <div style={{ border: "1px solid #ddd", borderRadius: 8, maxHeight: 260, overflow: "auto" }}>
+          {libraryRows.length === 0 ? (
+            <div style={{ padding: 10, fontSize: 12, opacity: 0.8 }}>No library rows.</div>
+          ) : (
+            libraryRows.map((row) => (
+              <button
+                key={row.paper_key}
+                onClick={() => setSelectedPaperKey(row.paper_key)}
+                style={{
+                  width: "100%",
+                  textAlign: "left",
+                  padding: 10,
+                  border: "none",
+                  borderBottom: "1px solid #eee",
+                  background: row.paper_key === selectedPaperKey ? "#eef5ff" : "white",
+                  cursor: "pointer",
+                }}
+              >
+                <div style={{ fontSize: 12, fontWeight: 600 }}>{row.canonical_id ?? row.paper_key}</div>
+                <div style={{ fontSize: 11 }}>status={row.last_status} kind={row.source_kind ?? "unknown"}</div>
+                <div style={{ fontSize: 11, opacity: 0.8 }}>last_run={row.last_run_id ?? "-"}</div>
+                <div style={{ fontSize: 11, opacity: 0.75 }}>tags={(row.tags ?? []).join(", ") || "-"}</div>
+              </button>
+            ))
+          )}
+        </div>
+
+        <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: 10 }}>
+          <div style={{ fontSize: 12, marginBottom: 4 }}>paper_key: <code>{libraryDetail?.paper_key ?? "-"}</code></div>
+          <div style={{ fontSize: 12, marginBottom: 4 }}>canonical_id: <code>{libraryDetail?.canonical_id ?? "-"}</code></div>
+          <div style={{ fontSize: 12, marginBottom: 4 }}>last_status: <code>{libraryDetail?.last_status ?? "-"}</code></div>
+          <div style={{ fontSize: 12, marginBottom: 8 }}>last_run_id: <code>{libraryDetail?.last_run_id ?? "-"}</code></div>
+          <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+            <input
+              value={tagInput}
+              onChange={(e) => setTagInput(e.target.value)}
+              placeholder="tags comma-separated"
+              style={{ flex: 1, padding: 8, borderRadius: 6, border: "1px solid #ccc" }}
+            />
+            <button
+              onClick={onSaveTags}
+              disabled={!selectedPaperKey}
+              style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+            >
+              Save tags
+            </button>
+          </div>
+
+          <details open>
+            <summary style={{ fontSize: 12, cursor: "pointer" }}>Run history</summary>
+            <div style={{ marginTop: 8, display: "grid", gap: 6 }}>
+              {(libraryDetail?.runs ?? []).map((r) => (
+                <div key={r.run_id} style={{ border: "1px solid #eee", borderRadius: 6, padding: 8 }}>
+                  <div style={{ fontSize: 12 }}>run_id=<code>{r.run_id}</code> status=<code>{r.status}</code></div>
+                  <div style={{ fontSize: 11, opacity: 0.8 }}>template={r.template_id ?? "-"}</div>
+                  <div style={{ fontSize: 11, opacity: 0.8 }}>updated_at={r.updated_at}</div>
+                  <button
+                    onClick={() => onOpenRunFromLibrary(r.run_id)}
+                    style={{ marginTop: 6, padding: "6px 10px", borderRadius: 6, border: "1px solid #333" }}
+                  >
+                    Open run detail
+                  </button>
+                </div>
+              ))}
+            </div>
+          </details>
         </div>
       </div>
 

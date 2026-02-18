@@ -9,6 +9,7 @@ use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{fs, io::Write};
+use chrono::{DateTime, Utc};
 
 #[derive(Serialize)]
 struct RunResult {
@@ -151,6 +152,73 @@ struct JobRuntimeState {
 #[derive(Serialize, Deserialize)]
 struct JobFilePayload {
     jobs: Vec<JobRecord>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct LibraryRunEntry {
+    run_id: String,
+    template_id: Option<String>,
+    status: String,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct LibraryRecord {
+    paper_key: String,
+    canonical_id: Option<String>,
+    title: Option<String>,
+    year: Option<i32>,
+    source_kind: Option<String>,
+    tags: Vec<String>,
+    runs: Vec<LibraryRunEntry>,
+    last_run_id: Option<String>,
+    last_status: String,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Serialize)]
+struct LibraryReindexResult {
+    count_records: usize,
+    count_runs: usize,
+    updated_at: String,
+}
+
+#[derive(Serialize)]
+struct LibraryRecordSummary {
+    paper_key: String,
+    canonical_id: Option<String>,
+    title: Option<String>,
+    source_kind: Option<String>,
+    last_status: String,
+    last_run_id: Option<String>,
+    updated_at: String,
+    tags: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct LibraryStats {
+    total_papers: usize,
+    total_runs: usize,
+    status_counts: serde_json::Value,
+    kind_counts: serde_json::Value,
+}
+
+#[derive(Deserialize, Default)]
+struct LibraryListFilter {
+    query: Option<String>,
+    status: Option<String>,
+    kind: Option<String>,
+    tag: Option<String>,
+    year_from: Option<i32>,
+    year_to: Option<i32>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct LibraryMeta {
+    index_version: u32,
+    updated_at: String,
 }
 
 static JOB_RUNTIME: OnceLock<Arc<Mutex<JobRuntimeState>>> = OnceLock::new();
@@ -594,6 +662,362 @@ fn now_epoch_ms_string() -> String {
 
 fn jobs_file_path(out_dir: &Path) -> PathBuf {
     out_dir.join(".jarvis-desktop").join("jobs.json")
+}
+
+fn library_jsonl_path(out_dir: &Path) -> PathBuf {
+    out_dir.join(".jarvis-desktop").join("library.jsonl")
+}
+
+fn library_meta_path(out_dir: &Path) -> PathBuf {
+    out_dir.join(".jarvis-desktop").join("library_meta.json")
+}
+
+fn to_iso_from_system_time(st: SystemTime) -> String {
+    let dt: DateTime<Utc> = st.into();
+    dt.to_rfc3339()
+}
+
+fn canonical_kind(canonical_id: Option<&str>) -> Option<String> {
+    let c = canonical_id?.to_lowercase();
+    if c.starts_with("doi:") || c.starts_with("10.") {
+        Some("doi".to_string())
+    } else if c.starts_with("pmid:") {
+        Some("pmid".to_string())
+    } else if c.starts_with("arxiv:") {
+        Some("arxiv".to_string())
+    } else if c.starts_with("s2:") || c.starts_with("corpusid:") || c.starts_with("s2paperid:") {
+        Some("s2".to_string())
+    } else {
+        Some("unknown".to_string())
+    }
+}
+
+fn read_library_records(out_dir: &Path) -> Result<Vec<LibraryRecord>, String> {
+    let path = library_jsonl_path(out_dir);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let raw = fs::read_to_string(&path)
+        .map_err(|e| format!("failed to read library index {}: {e}", path.display()))?;
+    let mut rows = Vec::new();
+    for line in raw.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<LibraryRecord>(t) {
+            rows.push(v);
+        }
+    }
+    Ok(rows)
+}
+
+fn write_library_records(out_dir: &Path, records: &[LibraryRecord]) -> Result<(), String> {
+    let path = library_jsonl_path(out_dir);
+    let mut lines = Vec::with_capacity(records.len());
+    for rec in records {
+        lines.push(
+            serde_json::to_string(rec)
+                .map_err(|e| format!("failed to encode library record {}: {e}", rec.paper_key))?,
+        );
+    }
+    let content = if lines.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", lines.join("\n"))
+    };
+    atomic_write_text(&path, &content)?;
+
+    let meta = LibraryMeta {
+        index_version: 1,
+        updated_at: Utc::now().to_rfc3339(),
+    };
+    let meta_text = serde_json::to_string_pretty(&meta)
+        .map_err(|e| format!("failed to serialize library meta: {e}"))?;
+    atomic_write_text(&library_meta_path(out_dir), &meta_text)
+}
+
+fn parse_known_title(v: &serde_json::Value) -> Option<String> {
+    for key in ["title", "paper_title", "name"] {
+        if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
+            let t = s.trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn parse_known_year(v: &serde_json::Value) -> Option<i32> {
+    for key in ["year", "published_year"] {
+        if let Some(y) = v.get(key).and_then(|x| x.as_i64()) {
+            if (1900..=2200).contains(&(y as i32)) {
+                return Some(y as i32);
+            }
+        }
+    }
+    None
+}
+
+fn extract_run_for_library(run_dir: &Path) -> Option<(String, LibraryRunEntry, Option<String>, Option<String>, Option<i32>)> {
+    let run_id = run_dir.file_name()?.to_string_lossy().to_string();
+    let meta = fs::metadata(run_dir).ok()?;
+    let created_at = meta
+        .created()
+        .or_else(|_| meta.modified())
+        .ok()
+        .map(to_iso_from_system_time)
+        .unwrap_or_else(|| Utc::now().to_rfc3339());
+    let updated_at = meta
+        .modified()
+        .ok()
+        .map(to_iso_from_system_time)
+        .unwrap_or_else(|| created_at.clone());
+
+    let input_path = run_dir.join("input.json");
+    let result_path = run_dir.join("result.json");
+
+    let mut canonical_id: Option<String> = None;
+    let mut template_id: Option<String> = None;
+    let mut title: Option<String> = None;
+    let mut year: Option<i32> = None;
+
+    if input_path.exists() {
+        if let Ok(raw) = fs::read_to_string(&input_path) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if let Some(s) = v
+                    .get("desktop")
+                    .and_then(|x| x.get("canonical_id"))
+                    .and_then(|x| x.as_str())
+                {
+                    if !s.trim().is_empty() {
+                        canonical_id = Some(s.trim().to_string());
+                    }
+                }
+                if let Some(s) = v
+                    .get("desktop")
+                    .and_then(|x| x.get("template_id"))
+                    .and_then(|x| x.as_str())
+                {
+                    if !s.trim().is_empty() {
+                        template_id = Some(s.trim().to_string());
+                    }
+                }
+                if canonical_id.is_none() {
+                    for key in ["paper_id", "canonical_id", "id"] {
+                        if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
+                            if !s.trim().is_empty() {
+                                canonical_id = Some(s.trim().to_string());
+                                break;
+                            }
+                        }
+                    }
+                }
+                if title.is_none() {
+                    title = parse_known_title(&v);
+                }
+                if year.is_none() {
+                    year = parse_known_year(&v);
+                }
+            }
+        }
+    }
+
+    let mut status = "unknown".to_string();
+    if result_path.exists() {
+        if let Ok(raw) = fs::read_to_string(&result_path) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if let Some(s) = v.get("status").and_then(|x| x.as_str()) {
+                    let raw_status = s.trim().to_lowercase();
+                    status = match raw_status.as_str() {
+                        "ok" | "success" | "succeeded" => "succeeded".to_string(),
+                        "error" | "failed" => "failed".to_string(),
+                        "needs_retry" => "needs_retry".to_string(),
+                        "running" => "running".to_string(),
+                        _ => "unknown".to_string(),
+                    };
+                } else if let Some(ok) = v.get("ok").and_then(|x| x.as_bool()) {
+                    status = if ok { "succeeded".to_string() } else { "failed".to_string() };
+                }
+
+                let (needs_retry, _retry_after) = inspect_retry_fields(&v);
+                if needs_retry {
+                    status = "needs_retry".to_string();
+                }
+
+                if title.is_none() {
+                    title = parse_known_title(&v);
+                }
+                if year.is_none() {
+                    year = parse_known_year(&v);
+                }
+            }
+        }
+    }
+
+    let run = LibraryRunEntry {
+        run_id: run_id.clone(),
+        template_id,
+        status,
+        created_at,
+        updated_at,
+    };
+
+    let paper_key = canonical_id
+        .as_ref()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("run:{run_id}"));
+    Some((paper_key, run, canonical_id, title, year))
+}
+
+fn build_library_records(out_dir: &Path, existing: &[LibraryRecord]) -> Result<Vec<LibraryRecord>, String> {
+    let mut existing_tags = std::collections::HashMap::<String, Vec<String>>::new();
+    for rec in existing {
+        existing_tags.insert(rec.paper_key.clone(), rec.tags.clone());
+    }
+
+    let mut grouped = std::collections::HashMap::<String, LibraryRecord>::new();
+    let entries = fs::read_dir(out_dir)
+        .map_err(|e| format!("failed to read runs directory {}: {e}", out_dir.display()))?;
+
+    for entry in entries.flatten() {
+        let run_dir = entry.path();
+        if !run_dir.is_dir() {
+            continue;
+        }
+        let Some((paper_key, run, canonical_id, title, year)) = extract_run_for_library(&run_dir) else {
+            continue;
+        };
+
+        let now = Utc::now().to_rfc3339();
+        let rec = grouped.entry(paper_key.clone()).or_insert_with(|| LibraryRecord {
+            paper_key: paper_key.clone(),
+            canonical_id: canonical_id.clone(),
+            title: title.clone(),
+            year,
+            source_kind: canonical_kind(canonical_id.as_deref()),
+            tags: existing_tags.get(&paper_key).cloned().unwrap_or_default(),
+            runs: Vec::new(),
+            last_run_id: None,
+            last_status: "unknown".to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+        });
+
+        if rec.canonical_id.is_none() {
+            rec.canonical_id = canonical_id.clone();
+            rec.source_kind = canonical_kind(rec.canonical_id.as_deref());
+        }
+        if rec.title.is_none() {
+            rec.title = title.clone();
+        }
+        if rec.year.is_none() {
+            rec.year = year;
+        }
+        rec.runs.push(run);
+    }
+
+    let mut records: Vec<LibraryRecord> = grouped
+        .into_values()
+        .map(|mut rec| {
+            rec.runs.sort_by(|a, b| {
+                b.updated_at
+                    .cmp(&a.updated_at)
+                    .then_with(|| a.run_id.cmp(&b.run_id))
+            });
+            rec.last_run_id = rec.runs.first().map(|r| r.run_id.clone());
+            rec.last_status = rec
+                .runs
+                .first()
+                .map(|r| r.status.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+            rec.updated_at = rec
+                .runs
+                .first()
+                .map(|r| r.updated_at.clone())
+                .unwrap_or_else(|| rec.updated_at.clone());
+            rec.created_at = rec
+                .runs
+                .iter()
+                .map(|r| r.created_at.clone())
+                .min()
+                .unwrap_or_else(|| rec.created_at.clone());
+            rec
+        })
+        .collect();
+
+    records.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| a.paper_key.cmp(&b.paper_key))
+    });
+
+    Ok(records)
+}
+
+fn upsert_library_run(out_dir: &Path, run_id: &str) -> Result<(), String> {
+    let mut records = read_library_records(out_dir)?;
+    for rec in &mut records {
+        rec.runs.retain(|r| r.run_id != run_id);
+    }
+    records.retain(|r| !r.runs.is_empty());
+
+    let run_dir = out_dir.join(run_id);
+    if let Some((paper_key, run, canonical_id, title, year)) = extract_run_for_library(&run_dir) {
+        let now = Utc::now().to_rfc3339();
+        let run_status = run.status.clone();
+        if let Some(rec) = records.iter_mut().find(|r| r.paper_key == paper_key) {
+            rec.runs.push(run);
+            rec.runs.sort_by(|a, b| {
+                b.updated_at
+                    .cmp(&a.updated_at)
+                    .then_with(|| a.run_id.cmp(&b.run_id))
+            });
+            rec.last_run_id = rec.runs.first().map(|r| r.run_id.clone());
+            rec.last_status = rec
+                .runs
+                .first()
+                .map(|r| r.status.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+            rec.updated_at = rec
+                .runs
+                .first()
+                .map(|r| r.updated_at.clone())
+                .unwrap_or_else(|| now.clone());
+            if rec.canonical_id.is_none() {
+                rec.canonical_id = canonical_id.clone();
+            }
+            if rec.title.is_none() {
+                rec.title = title.clone();
+            }
+            if rec.year.is_none() {
+                rec.year = year;
+            }
+            rec.source_kind = canonical_kind(rec.canonical_id.as_deref());
+        } else {
+            records.push(LibraryRecord {
+                paper_key: paper_key.clone(),
+                canonical_id: canonical_id.clone(),
+                title,
+                year,
+                source_kind: canonical_kind(canonical_id.as_deref()),
+                tags: Vec::new(),
+                runs: vec![run],
+                last_run_id: Some(run_id.to_string()),
+                last_status: run_status,
+                created_at: now.clone(),
+                updated_at: now,
+            });
+        }
+    }
+
+    records.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| a.paper_key.cmp(&b.paper_key))
+    });
+    write_library_records(out_dir, &records)
 }
 
 fn atomic_write_text(path: &Path, content: &str) -> Result<(), String> {
@@ -1518,6 +1942,7 @@ fn apply_job_result(
     run_result: &RunResult,
 ) -> Result<(), String> {
     let (runtime, _) = runtime_and_jobs_path()?;
+    let (run_id_for_index, status_for_index);
 
     {
         let mut guard = state
@@ -1555,12 +1980,23 @@ fn apply_job_result(
         guard.jobs[idx].retry_at = retry_at;
         guard.jobs[idx].last_error = err;
 
+        run_id_for_index = guard.jobs[idx].run_id.clone();
+        status_for_index = Some(guard.jobs[idx].status.clone());
+
         guard.running_job_id = None;
         guard.running_pid = None;
         guard.cancel_requested.remove(job_id);
     }
 
-    persist_state(state, jobs_path)
+    persist_state(state, jobs_path)?;
+
+    if let (Some(run_id), Some(status)) = (run_id_for_index, status_for_index) {
+        if status == JobStatus::Succeeded || status == JobStatus::Failed || status == JobStatus::NeedsRetry {
+            let _ = upsert_library_run(&runtime.out_base_dir, &run_id);
+        }
+    }
+
+    Ok(())
 }
 
 fn apply_mock_transition(
@@ -1579,6 +2015,155 @@ fn apply_mock_transition(
         let at = now_epoch_ms() as f64 + sec.max(0.0) * 1000.0;
         format!("{:.0}", at)
     });
+}
+
+#[tauri::command]
+fn library_reindex(full: Option<bool>) -> Result<LibraryReindexResult, String> {
+    let _full = full.unwrap_or(false);
+    let (runtime, _) = runtime_and_jobs_path()?;
+    let out_dir = runtime.out_base_dir.clone();
+    let existing = read_library_records(&out_dir)?;
+    let records = build_library_records(&out_dir, &existing)?;
+    let count_runs = records.iter().map(|r| r.runs.len()).sum();
+    write_library_records(&out_dir, &records)?;
+    Ok(LibraryReindexResult {
+        count_records: records.len(),
+        count_runs,
+        updated_at: Utc::now().to_rfc3339(),
+    })
+}
+
+#[tauri::command]
+fn library_list(filters: Option<LibraryListFilter>) -> Result<Vec<LibraryRecordSummary>, String> {
+    let (runtime, _) = runtime_and_jobs_path()?;
+    let records = read_library_records(&runtime.out_base_dir)?;
+    let f = filters.unwrap_or_default();
+    let query = f.query.unwrap_or_default().to_lowercase();
+    let status = f.status.unwrap_or_default().to_lowercase();
+    let kind = f.kind.unwrap_or_default().to_lowercase();
+    let tag = f.tag.unwrap_or_default().to_lowercase();
+
+    let mut out = Vec::new();
+    for rec in records {
+        if !query.is_empty() {
+            let hay = format!(
+                "{} {}",
+                rec.canonical_id.clone().unwrap_or_default().to_lowercase(),
+                rec.title.clone().unwrap_or_default().to_lowercase()
+            );
+            if !hay.contains(&query) {
+                continue;
+            }
+        }
+        if !status.is_empty() && rec.last_status.to_lowercase() != status {
+            continue;
+        }
+        if !kind.is_empty() {
+            let k = rec.source_kind.clone().unwrap_or_default().to_lowercase();
+            if k != kind {
+                continue;
+            }
+        }
+        if !tag.is_empty() {
+            let has = rec.tags.iter().any(|t| t.to_lowercase() == tag);
+            if !has {
+                continue;
+            }
+        }
+        if let Some(from) = f.year_from {
+            if rec.year.unwrap_or(i32::MIN) < from {
+                continue;
+            }
+        }
+        if let Some(to) = f.year_to {
+            if rec.year.unwrap_or(i32::MAX) > to {
+                continue;
+            }
+        }
+
+        out.push(LibraryRecordSummary {
+            paper_key: rec.paper_key,
+            canonical_id: rec.canonical_id,
+            title: rec.title,
+            source_kind: rec.source_kind,
+            last_status: rec.last_status,
+            last_run_id: rec.last_run_id,
+            updated_at: rec.updated_at,
+            tags: rec.tags,
+        });
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+fn library_get(paper_key: String) -> Result<LibraryRecord, String> {
+    let (runtime, _) = runtime_and_jobs_path()?;
+    let records = read_library_records(&runtime.out_base_dir)?;
+    records
+        .into_iter()
+        .find(|r| r.paper_key == paper_key)
+        .ok_or_else(|| format!("paper_key not found: {paper_key}"))
+}
+
+#[tauri::command]
+fn library_set_tags(paper_key: String, tags: Vec<String>) -> Result<LibraryRecord, String> {
+    let (runtime, _) = runtime_and_jobs_path()?;
+    let mut records = read_library_records(&runtime.out_base_dir)?;
+    let idx = records
+        .iter()
+        .position(|r| r.paper_key == paper_key)
+        .ok_or_else(|| format!("paper_key not found: {paper_key}"))?;
+
+    let mut cleaned: Vec<String> = tags
+        .into_iter()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    cleaned.sort();
+    cleaned.dedup();
+
+    records[idx].tags = cleaned;
+    records[idx].updated_at = Utc::now().to_rfc3339();
+    let out = records[idx].clone();
+    write_library_records(&runtime.out_base_dir, &records)?;
+    Ok(out)
+}
+
+#[tauri::command]
+fn library_stats() -> Result<LibraryStats, String> {
+    let (runtime, _) = runtime_and_jobs_path()?;
+    let records = read_library_records(&runtime.out_base_dir)?;
+
+    let mut status_counts = serde_json::Map::new();
+    let mut kind_counts = serde_json::Map::new();
+    let mut total_runs = 0usize;
+
+    for rec in &records {
+        total_runs += rec.runs.len();
+        let status_key = rec.last_status.clone();
+        let v = status_counts
+            .entry(status_key)
+            .or_insert(serde_json::Value::from(0));
+        let n = v.as_i64().unwrap_or(0) + 1;
+        *v = serde_json::Value::from(n);
+
+        let kind_key = rec
+            .source_kind
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        let kv = kind_counts
+            .entry(kind_key)
+            .or_insert(serde_json::Value::from(0));
+        let kn = kv.as_i64().unwrap_or(0) + 1;
+        *kv = serde_json::Value::from(kn);
+    }
+
+    Ok(LibraryStats {
+        total_papers: records.len(),
+        total_runs,
+        status_counts: serde_json::Value::Object(status_counts),
+        kind_counts: serde_json::Value::Object(kind_counts),
+    })
 }
 
 fn start_job_worker_if_needed() -> Result<(), String> {
@@ -2517,6 +3102,11 @@ fn main() {
             cancel_job,
             retry_job,
             clear_finished_jobs,
+            library_reindex,
+            library_list,
+            library_get,
+            library_set_tags,
+            library_stats,
             open_run_folder,
             list_task_templates,
             list_runs,
@@ -2772,5 +3362,96 @@ mod tests {
         job.retry_after_seconds = None;
         job.retry_at = None;
         assert_eq!(job.status, JobStatus::Queued);
+    }
+
+    #[test]
+    fn library_extract_with_and_without_artifacts() {
+        let base = std::env::temp_dir().join(format!("jarvis_lib_extract_{}", now_epoch_ms()));
+        let _ = fs::create_dir_all(&base);
+
+        let run1 = base.join("run_a");
+        let _ = fs::create_dir_all(&run1);
+        fs::write(
+            run1.join("input.json"),
+            r#"{"desktop":{"canonical_id":"arxiv:1706.03762","template_id":"TEMPLATE_TREE"},"title":"A"}"#,
+        )
+        .expect("write input run1");
+        fs::write(run1.join("result.json"), r#"{"status":"succeeded","year":2017}"#)
+            .expect("write result run1");
+
+        let run2 = base.join("run_b");
+        let _ = fs::create_dir_all(&run2);
+
+        let e1 = extract_run_for_library(&run1).expect("extract run1");
+        assert_eq!(e1.0, "arxiv:1706.03762");
+        assert_eq!(e1.1.status, "succeeded");
+
+        let e2 = extract_run_for_library(&run2).expect("extract run2");
+        assert_eq!(e2.0, "run:run_b");
+        assert_eq!(e2.1.status, "unknown");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn library_rebuild_is_deterministic() {
+        let base = std::env::temp_dir().join(format!("jarvis_lib_det_{}", now_epoch_ms()));
+        let _ = fs::create_dir_all(&base);
+
+        let run1 = base.join("run_1");
+        let run2 = base.join("run_2");
+        let _ = fs::create_dir_all(&run1);
+        let _ = fs::create_dir_all(&run2);
+        fs::write(
+            run1.join("input.json"),
+            r#"{"desktop":{"canonical_id":"doi:10.1/abc","template_id":"TEMPLATE_TREE"}}"#,
+        )
+        .expect("write run1 input");
+        fs::write(run1.join("result.json"), r#"{"status":"failed"}"#).expect("write run1 result");
+        fs::write(
+            run2.join("input.json"),
+            r#"{"desktop":{"canonical_id":"arxiv:1706.03762","template_id":"TEMPLATE_TREE"}}"#,
+        )
+        .expect("write run2 input");
+        fs::write(run2.join("result.json"), r#"{"status":"succeeded"}"#).expect("write run2 result");
+
+        let r1 = build_library_records(&base, &[]).expect("build first");
+        let r2 = build_library_records(&base, &[]).expect("build second");
+        let s1 = serde_json::to_string(&r1).expect("ser1");
+        let s2 = serde_json::to_string(&r2).expect("ser2");
+        assert_eq!(s1, s2);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn library_set_tags_persistence_roundtrip() {
+        let out_dir = std::env::temp_dir().join(format!("jarvis_lib_tags_{}", now_epoch_ms()));
+        let _ = fs::create_dir_all(&out_dir);
+
+        let rec = LibraryRecord {
+            paper_key: "arxiv:1706.03762".to_string(),
+            canonical_id: Some("arxiv:1706.03762".to_string()),
+            title: None,
+            year: None,
+            source_kind: Some("arxiv".to_string()),
+            tags: vec!["old".to_string()],
+            runs: vec![],
+            last_run_id: None,
+            last_status: "unknown".to_string(),
+            created_at: Utc::now().to_rfc3339(),
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        write_library_records(&out_dir, &[rec]).expect("write initial library");
+
+        let mut loaded = read_library_records(&out_dir).expect("load initial library");
+        assert_eq!(loaded.len(), 1);
+        loaded[0].tags = vec!["tag1".to_string(), "tag2".to_string()];
+        write_library_records(&out_dir, &loaded).expect("write updated library");
+
+        let reloaded = read_library_records(&out_dir).expect("reload updated library");
+        assert_eq!(reloaded[0].tags, vec!["tag1".to_string(), "tag2".to_string()]);
+
+        let _ = fs::remove_dir_all(&out_dir);
     }
 }
