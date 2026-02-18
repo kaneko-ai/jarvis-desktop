@@ -205,6 +205,8 @@ export default function App() {
   const [selectedPipelineId, setSelectedPipelineId] = useState("");
   const [pipelineDetail, setPipelineDetail] = useState(null);
   const [pipelineDetailLoading, setPipelineDetailLoading] = useState(false);
+  const [activeScreen, setActiveScreen] = useState("main");
+  const [opsNeedsAttentionOnly, setOpsNeedsAttentionOnly] = useState(false);
   const [libraryRows, setLibraryRows] = useState([]);
   const [libraryLoading, setLibraryLoading] = useState(false);
   const [libraryError, setLibraryError] = useState("");
@@ -283,7 +285,10 @@ export default function App() {
     setRunsLoading(true);
     setRunsError("");
     try {
-      const rows = await invoke("list_runs");
+      const rows = await invoke("list_runs", {
+        limit: 500,
+        filters: null,
+      });
       const list = Array.isArray(rows) ? rows : [];
       setRuns(list);
       setSelectedRunId((prev) => {
@@ -396,6 +401,33 @@ export default function App() {
     } catch (e) {
       alert(String(e));
     }
+  }
+
+  async function onResumePipeline(pipeline) {
+    if (!pipeline?.pipeline_id) return;
+    const steps = Array.isArray(pipeline.steps) ? pipeline.steps : [];
+    const blocked = steps.find((s) => s?.status === "needs_retry")
+      || steps[pipeline.current_step_index ?? 0]
+      || null;
+    if (!blocked?.step_id) return;
+    await onRetryPipelineStep(pipeline.pipeline_id, blocked.step_id, false);
+  }
+
+  async function onOpenRunLogs(runIdFromRow) {
+    if (!runIdFromRow) return;
+    let target = "";
+    try {
+      const items = await invoke("list_run_artifacts", { runId: runIdFromRow });
+      const list = Array.isArray(items) ? items : [];
+      const hasStdout = list.some((i) => i?.name === "stdout.log");
+      const hasStderr = list.some((i) => i?.name === "stderr.log");
+      target = hasStdout ? "stdout.log" : (hasStderr ? "stderr.log" : "");
+    } catch {
+      target = "";
+    }
+    if (!target) return;
+    await onOpenNamedArtifactForRun(runIdFromRow, target);
+    setActiveScreen("main");
   }
 
   async function loadArtifact(runId, artifactKey) {
@@ -999,6 +1031,17 @@ export default function App() {
   const selectedPipeline = pipelineDetail && pipelineDetail.pipeline_id === selectedPipelineId
     ? pipelineDetail
     : null;
+  const opsPipelineRows = useMemo(() => {
+    const rows = Array.isArray(pipelines) ? pipelines : [];
+    if (!opsNeedsAttentionOnly) return rows;
+    return rows.filter((p) => p?.status === "failed" || p?.status === "needs_retry");
+  }, [pipelines, opsNeedsAttentionOnly]);
+  const opsJobRows = useMemo(() => {
+    const rows = Array.isArray(jobs) ? jobs : [];
+    if (!opsNeedsAttentionOnly) return rows;
+    return rows.filter((j) => j?.status === "failed" || j?.status === "needs_retry");
+  }, [jobs, opsNeedsAttentionOnly]);
+  const opsRunRows = useMemo(() => (Array.isArray(runs) ? runs : []), [runs]);
   const isLibrarySearchMode = String(librarySearchQuery ?? "").trim() !== "";
   const visibleLibraryRows = isLibrarySearchMode ? librarySearchRows : libraryRows;
   const artifactKind = artifactView?.kind ?? "";
@@ -1192,6 +1235,34 @@ export default function App() {
   return (
     <div style={{ fontFamily: "system-ui", padding: 16, maxWidth: 960 }}>
       <h2 style={{ marginTop: 0 }}>Javis Desktop</h2>
+
+      <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+        <button
+          onClick={() => setActiveScreen("main")}
+          style={{
+            padding: "8px 12px",
+            borderRadius: 8,
+            border: "1px solid #333",
+            background: activeScreen === "main" ? "#eef5ff" : "white",
+          }}
+        >
+          Main
+        </button>
+        <button
+          onClick={() => setActiveScreen("ops")}
+          style={{
+            padding: "8px 12px",
+            borderRadius: 8,
+            border: "1px solid #333",
+            background: activeScreen === "ops" ? "#eef5ff" : "white",
+          }}
+        >
+          Ops
+        </button>
+      </div>
+
+      {activeScreen === "main" ? (
+      <>
 
       <div
         style={{
@@ -2200,6 +2271,179 @@ export default function App() {
           ) : null}
         </div>
       </div>
+      </>
+      ) : (
+        <div>
+          <div style={{ display: "flex", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
+            <button
+              onClick={async () => {
+                await loadPipelines();
+                await loadJobs();
+                await loadRuns();
+              }}
+              style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+            >
+              Refresh Ops
+            </button>
+            <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
+              <input
+                type="checkbox"
+                checked={opsNeedsAttentionOnly}
+                onChange={(e) => setOpsNeedsAttentionOnly(e.target.checked)}
+              />
+              Needs Attention only (failed / needs_retry)
+            </label>
+          </div>
+
+          <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: 10, marginBottom: 12 }}>
+            <div style={{ fontWeight: 600, marginBottom: 8 }}>Pipelines</div>
+            {opsPipelineRows.length === 0 ? (
+              <div style={{ fontSize: 12, opacity: 0.8 }}>No pipelines.</div>
+            ) : (
+              <div style={{ display: "grid", gap: 6 }}>
+                {opsPipelineRows.map((p) => {
+                  return (
+                    <div key={p.pipeline_id} style={{ border: "1px solid #eee", borderRadius: 6, padding: 8 }}>
+                      <div style={{ fontSize: 12, fontWeight: 600 }}>{p.pipeline_id}</div>
+                      <div style={{ fontSize: 11 }}>{p.name} / {p.canonical_id}</div>
+                      <div style={{ fontSize: 11 }}>status={p.status} current_step={Math.min((p.current_step_index ?? 0) + 1, p.total_steps ?? 0)}/{p.total_steps} updated_at={p.updated_at}</div>
+                      <div style={{ display: "flex", gap: 6, marginTop: 6, flexWrap: "wrap" }}>
+                        <button
+                          onClick={async () => {
+                            setSelectedPipelineId(p.pipeline_id);
+                            await loadPipelineDetail(p.pipeline_id);
+                            setActiveScreen("main");
+                          }}
+                          style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+                        >
+                          Open pipeline
+                        </button>
+                        <button
+                          onClick={() => onCancelPipeline(p.pipeline_id)}
+                          disabled={p.status !== "running"}
+                          style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          onClick={async () => {
+                            const detail = await invoke("get_pipeline", { pipelineId: p.pipeline_id });
+                            await onResumePipeline(detail);
+                          }}
+                          disabled={p.status !== "needs_retry"}
+                          style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+                        >
+                          Resume
+                        </button>
+                        <button
+                          onClick={async () => {
+                            const detail = await invoke("get_pipeline", { pipelineId: p.pipeline_id });
+                            const idx = Number(detail?.current_step_index ?? 0);
+                            const step = (Array.isArray(detail?.steps) ? detail.steps : [])[idx] ?? null;
+                            if (step?.step_id) {
+                              await onRetryPipelineStep(p.pipeline_id, step.step_id, true);
+                            }
+                          }}
+                          disabled={p.status !== "needs_retry" && p.status !== "failed"}
+                          style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+                        >
+                          Retry current step (force)
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: 10, marginBottom: 12 }}>
+            <div style={{ fontWeight: 600, marginBottom: 8 }}>Jobs</div>
+            {opsJobRows.length === 0 ? (
+              <div style={{ fontSize: 12, opacity: 0.8 }}>No jobs.</div>
+            ) : (
+              <div style={{ display: "grid", gap: 6 }}>
+                {opsJobRows.map((j) => (
+                  <div key={j.job_id} style={{ border: "1px solid #eee", borderRadius: 6, padding: 8 }}>
+                    <div style={{ fontSize: 12, fontWeight: 600 }}>{j.job_id}</div>
+                    <div style={{ fontSize: 11 }}>{j.template_id} / {j.canonical_id}</div>
+                    <div style={{ fontSize: 11 }}>status={j.status} attempt={j.attempt} updated_at={j.updated_at}</div>
+                    <div style={{ display: "flex", gap: 6, marginTop: 6, flexWrap: "wrap" }}>
+                      <button
+                        onClick={() => onCancelJob(j.job_id)}
+                        disabled={j.status !== "queued" && j.status !== "running"}
+                        style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        onClick={() => onRetryJob(j.job_id, false)}
+                        disabled={j.status !== "failed" && j.status !== "needs_retry"}
+                        style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+                      >
+                        Retry
+                      </button>
+                      <button
+                        onClick={() => onOpenRunFromLibrary(j.run_id)}
+                        disabled={!j.run_id}
+                        style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+                      >
+                        Open run detail
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: 10 }}>
+            <div style={{ fontWeight: 600, marginBottom: 8 }}>Runs</div>
+            {opsRunRows.length === 0 ? (
+              <div style={{ fontSize: 12, opacity: 0.8 }}>No runs.</div>
+            ) : (
+              <div style={{ display: "grid", gap: 6 }}>
+                {opsRunRows.map((r) => (
+                  <div key={r.run_id} style={{ border: "1px solid #eee", borderRadius: 6, padding: 8 }}>
+                    <div style={{ fontSize: 12, fontWeight: 600 }}>{r.run_id}</div>
+                    <div style={{ fontSize: 11 }}>status={r.status} paper_id={r.paper_id}</div>
+                    <div style={{ fontSize: 11 }}>mtime={new Date(r.mtime_epoch_ms ?? r.created_at_epoch_ms ?? 0).toLocaleString()}</div>
+                    <div style={{ display: "flex", gap: 6, marginTop: 6, flexWrap: "wrap" }}>
+                      <button
+                        onClick={() => {
+                          if (r.primary_viz?.name) {
+                            onOpenNamedArtifactForRun(r.run_id, r.primary_viz.name);
+                            setActiveScreen("main");
+                          }
+                        }}
+                        disabled={!r.primary_viz?.name}
+                        style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+                      >
+                        View primary_viz
+                      </button>
+                      <button
+                        onClick={() => {
+                          onOpenRunFromLibrary(r.run_id);
+                          setActiveScreen("main");
+                        }}
+                        style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+                      >
+                        Open run detail
+                      </button>
+                      <button
+                        onClick={() => onOpenRunLogs(r.run_id)}
+                        style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+                      >
+                        Open logs
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

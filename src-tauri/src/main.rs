@@ -79,8 +79,16 @@ struct RunListItem {
     run_id: String,
     status: String,
     created_at_epoch_ms: u64,
+    mtime_epoch_ms: u64,
     paper_id: String,
+    primary_viz: Option<PrimaryVizRef>,
     run_dir: String,
+}
+
+#[derive(Deserialize, Default)]
+struct RunListFilter {
+    query: Option<String>,
+    status: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1600,6 +1608,24 @@ fn pipeline_step_status_from_job(job: &JobRecord) -> PipelineStepStatus {
     }
 }
 
+fn is_needs_attention_job_status(status: &JobStatus) -> bool {
+    matches!(status, JobStatus::Failed | JobStatus::NeedsRetry)
+}
+
+fn is_needs_attention_pipeline_status(status: &PipelineStatus) -> bool {
+    matches!(status, PipelineStatus::Failed | PipelineStatus::NeedsRetry)
+}
+
+fn pipeline_status_text(status: &PipelineStatus) -> &'static str {
+    match status {
+        PipelineStatus::Running => "running",
+        PipelineStatus::Succeeded => "succeeded",
+        PipelineStatus::Failed => "failed",
+        PipelineStatus::NeedsRetry => "needs_retry",
+        PipelineStatus::Canceled => "canceled",
+    }
+}
+
 fn is_pipeline_step_terminal(status: &PipelineStepStatus) -> bool {
     matches!(
         status,
@@ -2459,6 +2485,22 @@ fn infer_newest_run_id_after(out_dir: &Path, started_ms: u128) -> Option<String>
     }
     candidates.sort_by(|a, b| b.0.cmp(&a.0));
     candidates.first().map(|(_, run_id)| run_id.clone())
+}
+
+fn sort_jobs_for_display(rows: &mut [JobRecord]) {
+    rows.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| a.job_id.cmp(&b.job_id))
+    });
+}
+
+fn sort_runs_for_display(rows: &mut [RunListItem]) {
+    rows.sort_by(|a, b| {
+        b.mtime_epoch_ms
+            .cmp(&a.mtime_epoch_ms)
+            .then_with(|| a.run_id.cmp(&b.run_id))
+    });
 }
 
 fn classify_job_status(
@@ -3664,9 +3706,13 @@ fn resolve_run_dir_from_id(runtime: &RuntimeConfig, run_id: &str) -> Result<Path
 }
 
 #[tauri::command]
-fn list_runs() -> Result<Vec<RunListItem>, String> {
+fn list_runs(limit: Option<usize>, filters: Option<RunListFilter>) -> Result<Vec<RunListItem>, String> {
     let root = repo_root();
     let runtime = resolve_runtime_config(&root)?;
+    let f = filters.unwrap_or_default();
+    let query = f.query.unwrap_or_default().to_lowercase();
+    let status_filter = f.status.unwrap_or_default().to_lowercase();
+    let max_rows = limit.unwrap_or(500).clamp(1, 5000);
 
     let mut entries: Vec<(PathBuf, u64)> = Vec::new();
     for entry in fs::read_dir(&runtime.out_base_dir)
@@ -3684,7 +3730,13 @@ fn list_runs() -> Result<Vec<RunListItem>, String> {
         entries.push((path, ts));
     }
 
-    entries.sort_by(|a, b| b.1.cmp(&a.1));
+    entries.sort_by(|a, b| {
+        b.1.cmp(&a.1).then_with(|| {
+            let an = a.0.file_name().map(|v| v.to_string_lossy().to_string()).unwrap_or_default();
+            let bn = b.0.file_name().map(|v| v.to_string_lossy().to_string()).unwrap_or_default();
+            an.cmp(&bn)
+        })
+    });
 
     let mut rows = Vec::with_capacity(entries.len());
     for (run_dir, ts) in entries {
@@ -3694,16 +3746,52 @@ fn list_runs() -> Result<Vec<RunListItem>, String> {
             .unwrap_or_else(|| "unknown".to_string());
         let status = parse_status_from_result(&run_dir.join("result.json"));
         let paper_id = parse_paper_id_from_input(&run_dir.join("input.json"));
+        let primary_viz = if let Ok(raw) = fs::read_to_string(run_dir.join("input.json")) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                parse_primary_viz_from_input(&v)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if !status_filter.is_empty() && status.to_lowercase() != status_filter {
+            continue;
+        }
+        if !query.is_empty() {
+            let hay = format!("{} {} {}", run_id.to_lowercase(), paper_id.to_lowercase(), status.to_lowercase());
+            if !hay.contains(&query) {
+                continue;
+            }
+        }
+
         rows.push(RunListItem {
             run_id,
             status,
             created_at_epoch_ms: ts,
+            mtime_epoch_ms: ts,
             paper_id,
+            primary_viz,
             run_dir: run_dir.to_string_lossy().to_string(),
         });
     }
 
+    sort_runs_for_display(&mut rows);
+    if rows.len() > max_rows {
+        rows.truncate(max_rows);
+    }
+
     Ok(rows)
+}
+
+#[tauri::command]
+fn get_run_status(run_id: String) -> Result<String, String> {
+    let root = repo_root();
+    let runtime = resolve_runtime_config(&root)?;
+    let run_id = validate_run_id_component(&run_id)?;
+    let run_dir = resolve_run_dir_from_id(&runtime, &run_id)?;
+    Ok(parse_status_from_result(&run_dir.join("result.json")))
 }
 
 #[tauri::command]
@@ -4102,7 +4190,7 @@ fn list_jobs() -> Result<Vec<JobRecord>, String> {
             .map_err(|_| "failed to lock job runtime".to_string())?;
         guard.jobs = load_jobs_from_file(&jobs_path)?;
         let mut rows = guard.jobs.clone();
-        rows.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        sort_jobs_for_display(&mut rows);
         Ok(rows)
     }
 }
@@ -4445,7 +4533,7 @@ fn list_pipelines(filters: Option<PipelineListFilter>) -> Result<Vec<PipelineSum
                 continue;
             }
         }
-        if !status.is_empty() && format!("{:?}", p.status).to_lowercase() != status {
+        if !status.is_empty() && pipeline_status_text(&p.status) != status {
             continue;
         }
         out.push(PipelineSummary {
@@ -4861,6 +4949,7 @@ fn main() {
             open_run_folder,
             list_task_templates,
             list_runs,
+            get_run_status,
             read_run_artifact,
             list_run_artifacts,
             read_run_artifact_named,
@@ -5792,5 +5881,127 @@ mod tests {
         assert_eq!(rows[0].steps[0].status, PipelineStepStatus::Canceled);
 
         let _ = fs::remove_dir_all(&out_dir);
+    }
+
+    #[test]
+    fn needs_attention_filter_logic_matches_failed_and_retry_only() {
+        assert!(is_needs_attention_job_status(&JobStatus::Failed));
+        assert!(is_needs_attention_job_status(&JobStatus::NeedsRetry));
+        assert!(!is_needs_attention_job_status(&JobStatus::Queued));
+        assert!(!is_needs_attention_job_status(&JobStatus::Running));
+        assert!(!is_needs_attention_job_status(&JobStatus::Succeeded));
+        assert!(!is_needs_attention_job_status(&JobStatus::Canceled));
+
+        assert!(is_needs_attention_pipeline_status(&PipelineStatus::Failed));
+        assert!(is_needs_attention_pipeline_status(&PipelineStatus::NeedsRetry));
+        assert!(!is_needs_attention_pipeline_status(&PipelineStatus::Running));
+        assert!(!is_needs_attention_pipeline_status(&PipelineStatus::Succeeded));
+        assert!(!is_needs_attention_pipeline_status(&PipelineStatus::Canceled));
+    }
+
+    #[test]
+    fn deterministic_sorting_for_jobs_and_runs() {
+        let mut jobs = vec![
+            JobRecord {
+                job_id: "job_b".to_string(),
+                template_id: "TEMPLATE_TREE".to_string(),
+                canonical_id: "arxiv:1".to_string(),
+                params: serde_json::json!({}),
+                status: JobStatus::Queued,
+                attempt: 0,
+                created_at: "1".to_string(),
+                updated_at: "100".to_string(),
+                run_id: None,
+                last_error: None,
+                retry_after_seconds: None,
+                retry_at: None,
+            },
+            JobRecord {
+                job_id: "job_a".to_string(),
+                template_id: "TEMPLATE_TREE".to_string(),
+                canonical_id: "arxiv:1".to_string(),
+                params: serde_json::json!({}),
+                status: JobStatus::Queued,
+                attempt: 0,
+                created_at: "1".to_string(),
+                updated_at: "100".to_string(),
+                run_id: None,
+                last_error: None,
+                retry_after_seconds: None,
+                retry_at: None,
+            },
+            JobRecord {
+                job_id: "job_c".to_string(),
+                template_id: "TEMPLATE_TREE".to_string(),
+                canonical_id: "arxiv:1".to_string(),
+                params: serde_json::json!({}),
+                status: JobStatus::Queued,
+                attempt: 0,
+                created_at: "1".to_string(),
+                updated_at: "101".to_string(),
+                run_id: None,
+                last_error: None,
+                retry_after_seconds: None,
+                retry_at: None,
+            },
+        ];
+        sort_jobs_for_display(&mut jobs);
+        assert_eq!(jobs[0].job_id, "job_c");
+        assert_eq!(jobs[1].job_id, "job_a");
+        assert_eq!(jobs[2].job_id, "job_b");
+
+        let mut runs = vec![
+            RunListItem {
+                run_id: "run_b".to_string(),
+                status: "ok".to_string(),
+                created_at_epoch_ms: 10,
+                mtime_epoch_ms: 10,
+                paper_id: "arxiv:1".to_string(),
+                primary_viz: None,
+                run_dir: "x".to_string(),
+            },
+            RunListItem {
+                run_id: "run_a".to_string(),
+                status: "ok".to_string(),
+                created_at_epoch_ms: 10,
+                mtime_epoch_ms: 10,
+                paper_id: "arxiv:1".to_string(),
+                primary_viz: None,
+                run_dir: "x".to_string(),
+            },
+            RunListItem {
+                run_id: "run_c".to_string(),
+                status: "ok".to_string(),
+                created_at_epoch_ms: 11,
+                mtime_epoch_ms: 11,
+                paper_id: "arxiv:1".to_string(),
+                primary_viz: None,
+                run_dir: "x".to_string(),
+            },
+        ];
+        sort_runs_for_display(&mut runs);
+        assert_eq!(runs[0].run_id, "run_c");
+        assert_eq!(runs[1].run_id, "run_a");
+        assert_eq!(runs[2].run_id, "run_b");
+    }
+
+    #[test]
+    fn run_summary_extraction_handles_missing_files() {
+        let base = std::env::temp_dir().join(format!("jarvis_run_summary_{}", now_epoch_ms()));
+        let run = base.join("run_1");
+        let _ = fs::create_dir_all(&run);
+
+        assert_eq!(parse_paper_id_from_input(&run.join("input.json")), "unknown");
+        assert_eq!(parse_status_from_result(&run.join("result.json")), "unknown");
+
+        fs::write(run.join("input.json"), r#"{"desktop":{"canonical_id":"doi:10.1/abc"}}"#)
+            .expect("write input");
+        fs::write(run.join("result.json"), r#"{"status":"succeeded"}"#)
+            .expect("write result");
+
+        assert_eq!(parse_paper_id_from_input(&run.join("input.json")), "doi:10.1/abc");
+        assert_eq!(parse_status_from_result(&run.join("result.json")), "succeeded");
+
+        let _ = fs::remove_dir_all(&base);
     }
 }
