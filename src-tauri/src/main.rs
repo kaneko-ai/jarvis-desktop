@@ -11,6 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::{fs, io::Write};
 use chrono::{DateTime, Utc};
 
+const MAX_ARTIFACT_READ_BYTES: u64 = 3 * 1024 * 1024;
+
 #[derive(Serialize)]
 struct RunResult {
     ok: bool,
@@ -89,6 +91,30 @@ struct RunArtifactView {
     exists: bool,
     content: String,
     parse_status: String,
+}
+
+#[derive(Serialize, Clone)]
+struct ArtifactItem {
+    name: String,
+    rel_path: String,
+    kind: String,
+    size_bytes: Option<u64>,
+    mtime_iso: Option<String>,
+}
+
+#[derive(Serialize)]
+struct NamedArtifactView {
+    kind: String,
+    content: String,
+    truncated: bool,
+}
+
+#[derive(Clone)]
+struct ArtifactSpec {
+    name: &'static str,
+    rel_path: &'static str,
+    kind: &'static str,
+    legacy_key: &'static str,
 }
 
 #[derive(Serialize, Clone)]
@@ -2618,6 +2644,253 @@ fn parse_paper_id_from_input(path: &Path) -> String {
     "unknown".to_string()
 }
 
+fn known_artifact_specs() -> Vec<ArtifactSpec> {
+    vec![
+        ArtifactSpec {
+            name: "tree.md",
+            rel_path: "paper_graph/tree/tree.md",
+            kind: "markdown",
+            legacy_key: "tree_md",
+        },
+        ArtifactSpec {
+            name: "result.json",
+            rel_path: "result.json",
+            kind: "json",
+            legacy_key: "result_json",
+        },
+        ArtifactSpec {
+            name: "input.json",
+            rel_path: "input.json",
+            kind: "json",
+            legacy_key: "input_json",
+        },
+        ArtifactSpec {
+            name: "stdout.log",
+            rel_path: "stdout.log",
+            kind: "text",
+            legacy_key: "stdout_log",
+        },
+        ArtifactSpec {
+            name: "stderr.log",
+            rel_path: "stderr.log",
+            kind: "text",
+            legacy_key: "stderr_log",
+        },
+    ]
+}
+
+fn rel_path_to_pathbuf(rel_path: &str) -> PathBuf {
+    let mut buf = PathBuf::new();
+    for seg in rel_path.split('/') {
+        if !seg.trim().is_empty() {
+            buf.push(seg);
+        }
+    }
+    buf
+}
+
+fn normalized_rel_path(root: &Path, target: &Path) -> Option<String> {
+    let rel = target.strip_prefix(root).ok()?;
+    let parts: Vec<String> = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .collect();
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("/"))
+    }
+}
+
+fn detect_artifact_kind_by_name(name: &str) -> String {
+    let lower = name.to_lowercase();
+    if lower.ends_with(".md") {
+        "markdown".to_string()
+    } else if lower.ends_with(".json") {
+        "json".to_string()
+    } else if lower.ends_with(".log") || lower.ends_with(".txt") {
+        "text".to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+fn kind_priority(kind: &str) -> i32 {
+    match kind {
+        "markdown" => 0,
+        "json" => 1,
+        "text" => 2,
+        _ => 3,
+    }
+}
+
+fn list_run_artifacts_internal(run_dir: &Path) -> Result<Vec<ArtifactItem>, String> {
+    let run_dir_canonical = run_dir
+        .canonicalize()
+        .map_err(|e| format!("failed to canonicalize run directory {}: {e}", run_dir.display()))?;
+
+    let mut out: Vec<ArtifactItem> = Vec::new();
+    let specs = known_artifact_specs();
+    let mut known_rel_paths = HashSet::new();
+
+    for spec in &specs {
+        let path = run_dir_canonical.join(rel_path_to_pathbuf(spec.rel_path));
+        if !path.exists() || !path.is_file() {
+            continue;
+        }
+        let canonical = path
+            .canonicalize()
+            .map_err(|e| format!("failed to canonicalize artifact {}: {e}", path.display()))?;
+        if !canonical.starts_with(&run_dir_canonical) {
+            continue;
+        }
+        let meta = fs::metadata(&canonical).ok();
+        let size_bytes = meta.as_ref().map(|m| m.len());
+        let mtime_iso = meta
+            .and_then(|m| m.modified().ok())
+            .map(to_iso_from_system_time);
+
+        out.push(ArtifactItem {
+            name: spec.name.to_string(),
+            rel_path: spec.rel_path.to_string(),
+            kind: spec.kind.to_string(),
+            size_bytes,
+            mtime_iso,
+        });
+        known_rel_paths.insert(spec.rel_path.to_string());
+    }
+
+    let mut stack = vec![run_dir_canonical.clone()];
+    while let Some(dir) = stack.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            if !p.is_file() {
+                continue;
+            }
+            let canonical = match p.canonicalize() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if !canonical.starts_with(&run_dir_canonical) {
+                continue;
+            }
+            let Some(rel) = normalized_rel_path(&run_dir_canonical, &canonical) else {
+                continue;
+            };
+            if known_rel_paths.contains(&rel) {
+                continue;
+            }
+            let name = canonical
+                .file_name()
+                .map(|v| v.to_string_lossy().to_string())
+                .unwrap_or_else(|| rel.clone());
+            let meta = fs::metadata(&canonical).ok();
+            let size_bytes = meta.as_ref().map(|m| m.len());
+            let mtime_iso = meta
+                .and_then(|m| m.modified().ok())
+                .map(to_iso_from_system_time);
+
+            out.push(ArtifactItem {
+                name: name.clone(),
+                rel_path: rel,
+                kind: detect_artifact_kind_by_name(&name),
+                size_bytes,
+                mtime_iso,
+            });
+        }
+    }
+
+    out.sort_by(|a, b| {
+        kind_priority(&a.kind)
+            .cmp(&kind_priority(&b.kind))
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.rel_path.cmp(&b.rel_path))
+    });
+    Ok(out)
+}
+
+fn resolve_named_artifact_from_catalog(run_dir: &Path, name: &str) -> Result<ArtifactItem, String> {
+    let n = name.trim();
+    if n.is_empty() {
+        return Err("artifact name is empty".to_string());
+    }
+    if n.contains('/') || n.contains('\\') || n.contains("..") {
+        return Err("illegal artifact name".to_string());
+    }
+
+    let catalog = list_run_artifacts_internal(run_dir)?;
+    let mut hits: Vec<ArtifactItem> = catalog.into_iter().filter(|a| a.name == n).collect();
+    if hits.is_empty() {
+        return Err(format!("artifact not found: {n}"));
+    }
+    if hits.len() > 1 {
+        return Err(format!("artifact name is ambiguous: {n}"));
+    }
+    Ok(hits.remove(0))
+}
+
+fn read_artifact_content_internal(run_dir: &Path, item: &ArtifactItem) -> Result<NamedArtifactView, String> {
+    let run_dir_canonical = run_dir
+        .canonicalize()
+        .map_err(|e| format!("failed to canonicalize run directory {}: {e}", run_dir.display()))?;
+    let target = run_dir_canonical.join(rel_path_to_pathbuf(&item.rel_path));
+    let canonical = target
+        .canonicalize()
+        .map_err(|e| format!("failed to canonicalize artifact {}: {e}", target.display()))?;
+    if !canonical.starts_with(&run_dir_canonical) {
+        return Err("artifact path is outside run directory".to_string());
+    }
+
+    let meta = fs::metadata(&canonical)
+        .map_err(|e| format!("failed to stat artifact {}: {e}", canonical.display()))?;
+    if meta.len() > MAX_ARTIFACT_READ_BYTES {
+        return Ok(NamedArtifactView {
+            kind: item.kind.clone(),
+            content: format!(
+                "artifact is too large to preview ({} bytes, limit={} bytes). Use Open run folder.",
+                meta.len(),
+                MAX_ARTIFACT_READ_BYTES
+            ),
+            truncated: true,
+        });
+    }
+
+    let raw = fs::read_to_string(&canonical)
+        .map_err(|e| format!("failed to read artifact {}: {e}", canonical.display()))?;
+
+    if item.kind == "json" {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+            let pretty = serde_json::to_string_pretty(&v)
+                .map_err(|e| format!("failed to pretty print json {}: {e}", canonical.display()))?;
+            return Ok(NamedArtifactView {
+                kind: item.kind.clone(),
+                content: pretty,
+                truncated: false,
+            });
+        }
+    }
+
+    Ok(NamedArtifactView {
+        kind: item.kind.clone(),
+        content: raw,
+        truncated: false,
+    })
+}
+
+fn artifact_spec_by_legacy_key(legacy_key: &str) -> Option<ArtifactSpec> {
+    known_artifact_specs()
+        .into_iter()
+        .find(|s| s.legacy_key == legacy_key)
+}
+
 fn modified_epoch_ms(path: &Path) -> u64 {
     match fs::metadata(path)
         .and_then(|m| m.modified())
@@ -2699,20 +2972,29 @@ fn read_run_artifact(run_id: String, artifact: String) -> Result<RunArtifactView
     let run_id = validate_run_id_component(&run_id)?;
     let run_dir = resolve_run_dir_from_id(&runtime, &run_id)?;
 
-    let (artifact_key, rel_path, is_json) = match artifact.as_str() {
-        "tree_md" => ("tree_md", PathBuf::from("paper_graph").join("tree").join("tree.md"), false),
-        "result_json" => ("result_json", PathBuf::from("result.json"), true),
-        "input_json" => ("input_json", PathBuf::from("input.json"), true),
-        "stdout_log" => ("stdout_log", PathBuf::from("stdout.log"), false),
-        "stderr_log" => ("stderr_log", PathBuf::from("stderr.log"), false),
-        _ => return Err(format!("unsupported artifact: {artifact}")),
+    let spec = artifact_spec_by_legacy_key(&artifact)
+        .ok_or_else(|| format!("unsupported artifact: {artifact}"))?;
+    let item = resolve_named_artifact_from_catalog(&run_dir, spec.name);
+    let item = match item {
+        Ok(v) => v,
+        Err(_) => {
+            let target = run_dir.join(rel_path_to_pathbuf(spec.rel_path));
+            return Ok(RunArtifactView {
+                run_id,
+                artifact: artifact.to_string(),
+                path: target.to_string_lossy().to_string(),
+                exists: false,
+                content: "missing".to_string(),
+                parse_status: "missing".to_string(),
+            });
+        }
     };
 
-    let target = run_dir.join(rel_path);
-    if !target.exists() {
+    let target = run_dir.join(rel_path_to_pathbuf(&item.rel_path));
+    if !target.exists() || !target.is_file() {
         return Ok(RunArtifactView {
             run_id,
-            artifact: artifact_key.to_string(),
+            artifact: artifact.to_string(),
             path: target.to_string_lossy().to_string(),
             exists: false,
             content: "missing".to_string(),
@@ -2720,42 +3002,38 @@ fn read_run_artifact(run_id: String, artifact: String) -> Result<RunArtifactView
         });
     }
 
-    let raw = fs::read_to_string(&target)
-        .map_err(|e| format!("failed to read artifact {}: {e}", target.display()))?;
+    let named = read_artifact_content_internal(&run_dir, &item)?;
+    Ok(RunArtifactView {
+        run_id,
+        artifact: artifact.to_string(),
+        path: target.to_string_lossy().to_string(),
+        exists: true,
+        content: named.content,
+        parse_status: if named.truncated {
+            "truncated".to_string()
+        } else {
+            "ok".to_string()
+        },
+    })
+}
 
-    if is_json {
-        match serde_json::from_str::<serde_json::Value>(&raw) {
-            Ok(v) => {
-                let pretty = serde_json::to_string_pretty(&v)
-                    .map_err(|e| format!("failed to pretty print json {}: {e}", target.display()))?;
-                Ok(RunArtifactView {
-                    run_id,
-                    artifact: artifact_key.to_string(),
-                    path: target.to_string_lossy().to_string(),
-                    exists: true,
-                    content: pretty,
-                    parse_status: "ok".to_string(),
-                })
-            }
-            Err(_) => Ok(RunArtifactView {
-                run_id,
-                artifact: artifact_key.to_string(),
-                path: target.to_string_lossy().to_string(),
-                exists: true,
-                content: raw,
-                parse_status: "raw".to_string(),
-            }),
-        }
-    } else {
-        Ok(RunArtifactView {
-            run_id,
-            artifact: artifact_key.to_string(),
-            path: target.to_string_lossy().to_string(),
-            exists: true,
-            content: raw,
-            parse_status: "ok".to_string(),
-        })
-    }
+#[tauri::command]
+fn list_run_artifacts(run_id: String) -> Result<Vec<ArtifactItem>, String> {
+    let root = repo_root();
+    let runtime = resolve_runtime_config(&root)?;
+    let run_id = validate_run_id_component(&run_id)?;
+    let run_dir = resolve_run_dir_from_id(&runtime, &run_id)?;
+    list_run_artifacts_internal(&run_dir)
+}
+
+#[tauri::command]
+fn read_run_artifact_named(run_id: String, name: String) -> Result<NamedArtifactView, String> {
+    let root = repo_root();
+    let runtime = resolve_runtime_config(&root)?;
+    let run_id = validate_run_id_component(&run_id)?;
+    let run_dir = resolve_run_dir_from_id(&runtime, &run_id)?;
+    let item = resolve_named_artifact_from_catalog(&run_dir, &name)?;
+    read_artifact_content_internal(&run_dir, &item)
 }
 
 fn merge_desktop_input_metadata(
@@ -3384,6 +3662,8 @@ fn main() {
             list_task_templates,
             list_runs,
             read_run_artifact,
+            list_run_artifacts,
+            read_run_artifact_named,
             normalize_identifier,
             preflight_check,
             get_runtime_config,
@@ -3761,5 +4041,78 @@ mod tests {
     fn library_search_tokenization_trims_and_lowers() {
         let tokens = tokenize_query("  DOI:10.1000/XYZ   failed ");
         assert_eq!(tokens, vec!["doi:10.1000/xyz".to_string(), "failed".to_string()]);
+    }
+
+    #[test]
+    fn list_run_artifacts_returns_safe_relative_paths() {
+        let run_dir = std::env::temp_dir().join(format!("jarvis_artifacts_{}", now_epoch_ms()));
+        let _ = fs::create_dir_all(run_dir.join("paper_graph").join("tree"));
+        fs::write(run_dir.join("paper_graph").join("tree").join("tree.md"), "# tree")
+            .expect("write tree");
+        fs::write(run_dir.join("result.json"), "{}")
+            .expect("write result");
+
+        let items = list_run_artifacts_internal(&run_dir).expect("list artifacts");
+        assert!(items.iter().any(|a| a.name == "tree.md"));
+        assert!(items.iter().all(|a| !a.rel_path.starts_with("..")));
+        assert!(items.iter().all(|a| !PathBuf::from(&a.rel_path).is_absolute()));
+
+        let _ = fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn artifact_name_rejects_traversal_patterns() {
+        let run_dir = std::env::temp_dir().join(format!("jarvis_artifacts_bad_name_{}", now_epoch_ms()));
+        let _ = fs::create_dir_all(&run_dir);
+        fs::write(run_dir.join("result.json"), "{}")
+            .expect("write result");
+
+        let bad = resolve_named_artifact_from_catalog(&run_dir, "../result.json");
+        assert!(bad.is_err());
+        let slash = resolve_named_artifact_from_catalog(&run_dir, "paper_graph/tree/tree.md");
+        assert!(slash.is_err());
+
+        let _ = fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn artifact_catalog_order_is_deterministic() {
+        let run_dir = std::env::temp_dir().join(format!("jarvis_artifacts_order_{}", now_epoch_ms()));
+        let _ = fs::create_dir_all(run_dir.join("paper_graph").join("tree"));
+        fs::write(run_dir.join("paper_graph").join("tree").join("tree.md"), "# tree")
+            .expect("write tree");
+        fs::write(run_dir.join("a.json"), "{}")
+            .expect("write a json");
+        fs::write(run_dir.join("z.log"), "ok")
+            .expect("write z log");
+
+        let first = list_run_artifacts_internal(&run_dir).expect("list first");
+        let second = list_run_artifacts_internal(&run_dir).expect("list second");
+        let s1 = serde_json::to_string(&first).expect("ser first");
+        let s2 = serde_json::to_string(&second).expect("ser second");
+        assert_eq!(s1, s2);
+
+        let _ = fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn artifact_size_limit_returns_truncated_message() {
+        let run_dir = std::env::temp_dir().join(format!("jarvis_artifacts_size_{}", now_epoch_ms()));
+        let _ = fs::create_dir_all(&run_dir);
+        let big = "A".repeat((MAX_ARTIFACT_READ_BYTES + 1024) as usize);
+        fs::write(run_dir.join("stdout.log"), big).expect("write big log");
+
+        let item = ArtifactItem {
+            name: "stdout.log".to_string(),
+            rel_path: "stdout.log".to_string(),
+            kind: "text".to_string(),
+            size_bytes: None,
+            mtime_iso: None,
+        };
+        let view = read_artifact_content_internal(&run_dir, &item).expect("read item");
+        assert!(view.truncated);
+        assert!(view.content.to_lowercase().contains("too large"));
+
+        let _ = fs::remove_dir_all(&run_dir);
     }
 }

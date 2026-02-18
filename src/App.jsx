@@ -116,6 +116,11 @@ export default function App() {
   const [artifactLoading, setArtifactLoading] = useState(false);
   const [artifactError, setArtifactError] = useState("");
   const [artifactView, setArtifactView] = useState(null);
+  const [artifactWrap, setArtifactWrap] = useState(true);
+  const [runArtifactCatalog, setRunArtifactCatalog] = useState([]);
+  const [runArtifactCatalogLoading, setRunArtifactCatalogLoading] = useState(false);
+  const [runArtifactCatalogError, setRunArtifactCatalogError] = useState("");
+  const [artifactCatalogByRun, setArtifactCatalogByRun] = useState({});
   const [jobs, setJobs] = useState([]);
   const [jobsLoading, setJobsLoading] = useState(false);
   const [jobsError, setJobsError] = useState("");
@@ -253,6 +258,102 @@ export default function App() {
     }
   }
 
+  function mapArtifactNameToLegacyKey(name) {
+    if (name === "tree.md") return "tree_md";
+    if (name === "result.json") return "result_json";
+    if (name === "input.json") return "input_json";
+    if (name === "stdout.log") return "stdout_log";
+    if (name === "stderr.log") return "stderr_log";
+    return "";
+  }
+
+  async function fetchArtifactCatalogForRun(runId, force = false) {
+    if (!runId) return;
+    let shouldFetch = false;
+    setArtifactCatalogByRun((prev) => {
+      const current = prev[runId];
+      if (!force && current && (current.loading || current.loaded)) {
+        return prev;
+      }
+      shouldFetch = true;
+      return {
+        ...prev,
+        [runId]: {
+          loading: true,
+          loaded: false,
+          error: "",
+          items: current?.items ?? [],
+          names: current?.names ?? {},
+        },
+      };
+    });
+    if (!shouldFetch) return;
+
+    try {
+      const items = await invoke("list_run_artifacts", { runId });
+      const list = Array.isArray(items) ? items : [];
+      const names = {};
+      for (const item of list) {
+        names[item.name] = true;
+      }
+      setArtifactCatalogByRun((prev) => ({
+        ...prev,
+        [runId]: {
+          loading: false,
+          loaded: true,
+          error: "",
+          items: list,
+          names,
+        },
+      }));
+    } catch (e) {
+      setArtifactCatalogByRun((prev) => ({
+        ...prev,
+        [runId]: {
+          loading: false,
+          loaded: true,
+          error: String(e),
+          items: [],
+          names: {},
+        },
+      }));
+    }
+  }
+
+  async function loadSelectedRunArtifactCatalog(runId) {
+    if (!runId) {
+      setRunArtifactCatalog([]);
+      setRunArtifactCatalogError("");
+      return;
+    }
+    setRunArtifactCatalogLoading(true);
+    setRunArtifactCatalogError("");
+    try {
+      const items = await invoke("list_run_artifacts", { runId });
+      const list = Array.isArray(items) ? items : [];
+      setRunArtifactCatalog(list);
+      const names = {};
+      for (const item of list) {
+        names[item.name] = true;
+      }
+      setArtifactCatalogByRun((prev) => ({
+        ...prev,
+        [runId]: {
+          loading: false,
+          loaded: true,
+          error: "",
+          items: list,
+          names,
+        },
+      }));
+    } catch (e) {
+      setRunArtifactCatalog([]);
+      setRunArtifactCatalogError(String(e));
+    } finally {
+      setRunArtifactCatalogLoading(false);
+    }
+  }
+
   async function loadLibraryRows(nextFilters = libraryFilters) {
     setLibraryLoading(true);
     setLibraryError("");
@@ -387,6 +488,46 @@ export default function App() {
     setSelectedRunId(runIdFromLibrary);
   }
 
+  async function onOpenArtifactQuick(runIdFromLibrary, artifactName) {
+    if (!runIdFromLibrary) return;
+    const key = mapArtifactNameToLegacyKey(artifactName);
+    if (!key) return;
+    await loadRuns();
+    setSelectedRunId(runIdFromLibrary);
+    setSelectedArtifact(key);
+  }
+
+  async function onOpenCatalogArtifact(item) {
+    if (!selectedRunId || !item?.name) return;
+    const key = mapArtifactNameToLegacyKey(item.name);
+    if (key) {
+      setSelectedArtifact(key);
+      return;
+    }
+
+    setArtifactLoading(true);
+    setArtifactError("");
+    try {
+      const named = await invoke("read_run_artifact_named", {
+        runId: selectedRunId,
+        name: item.name,
+      });
+      setArtifactView({
+        run_id: selectedRunId,
+        artifact: item.name,
+        path: item.rel_path,
+        exists: true,
+        content: named?.content ?? "",
+        parse_status: named?.truncated ? "truncated" : "ok",
+      });
+    } catch (e) {
+      setArtifactView(null);
+      setArtifactError(String(e));
+    } finally {
+      setArtifactLoading(false);
+    }
+  }
+
   useEffect(() => {
     loadRuntimeConfig(false);
     loadPreflight();
@@ -461,6 +602,23 @@ export default function App() {
   useEffect(() => {
     loadArtifact(selectedRunId, selectedArtifact);
   }, [selectedRunId, selectedArtifact]);
+
+  useEffect(() => {
+    loadSelectedRunArtifactCatalog(selectedRunId);
+  }, [selectedRunId]);
+
+  useEffect(() => {
+    const searchMode = String(librarySearchQuery ?? "").trim() !== "";
+    const rows = Array.isArray(searchMode ? librarySearchRows : libraryRows)
+      ? searchMode
+        ? librarySearchRows
+        : libraryRows
+      : [];
+    const ids = [...new Set(rows.map((r) => r.last_run_id).filter(Boolean))].slice(0, 24);
+    for (const id of ids) {
+      fetchArtifactCatalogForRun(id, false);
+    }
+  }, [libraryRows, librarySearchRows, librarySearchQuery]);
 
   async function runTree(params) {
     setRunning(true);
@@ -592,6 +750,88 @@ export default function App() {
   const selectedJob = jobs.find((j) => j.job_id === selectedJobId) ?? null;
   const isLibrarySearchMode = String(librarySearchQuery ?? "").trim() !== "";
   const visibleLibraryRows = isLibrarySearchMode ? librarySearchRows : libraryRows;
+
+  function renderRowArtifactButtons(row) {
+    const runIdFromRow = row?.last_run_id;
+    const catalog = runIdFromRow ? artifactCatalogByRun[runIdFromRow] : null;
+    const loaded = !!catalog?.loaded;
+    const hasName = (name) => !!catalog?.names?.[name];
+    const hasLogs = hasName("stdout.log") || hasName("stderr.log");
+    const logTarget = hasName("stdout.log") ? "stdout.log" : "stderr.log";
+
+    const makeDisabled = (name) => {
+      if (!runIdFromRow) return true;
+      if (!loaded) return true;
+      if (name === "logs") return !hasLogs;
+      return !hasName(name);
+    };
+
+    const makeTitle = (name) => {
+      if (!runIdFromRow) return "not available";
+      if (!loaded) return "checking availability...";
+      if (name === "logs") return hasLogs ? "Open logs" : "not available";
+      return hasName(name) ? `Open ${name}` : "not available";
+    };
+
+    return (
+      <div style={{ marginTop: 6, display: "flex", gap: 6, flexWrap: "wrap" }}>
+        <button
+          title={makeTitle("tree.md")}
+          onClick={(e) => {
+            e.stopPropagation();
+            onOpenArtifactQuick(runIdFromRow, "tree.md");
+          }}
+          disabled={makeDisabled("tree.md")}
+          style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+        >
+          Tree
+        </button>
+        <button
+          title={makeTitle("result.json")}
+          onClick={(e) => {
+            e.stopPropagation();
+            onOpenArtifactQuick(runIdFromRow, "result.json");
+          }}
+          disabled={makeDisabled("result.json")}
+          style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+        >
+          Result
+        </button>
+        <button
+          title={makeTitle("input.json")}
+          onClick={(e) => {
+            e.stopPropagation();
+            onOpenArtifactQuick(runIdFromRow, "input.json");
+          }}
+          disabled={makeDisabled("input.json")}
+          style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+        >
+          Input
+        </button>
+        <button
+          title={makeTitle("logs")}
+          onClick={(e) => {
+            e.stopPropagation();
+            onOpenArtifactQuick(runIdFromRow, logTarget);
+          }}
+          disabled={makeDisabled("logs")}
+          style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+        >
+          Logs
+        </button>
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            onOpenRunFromLibrary(runIdFromRow);
+          }}
+          disabled={!runIdFromRow}
+          style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+        >
+          Open last run
+        </button>
+      </div>
+    );
+  }
 
   return (
     <div style={{ fontFamily: "system-ui", padding: 16, maxWidth: 960 }}>
@@ -1046,18 +1286,7 @@ export default function App() {
                     hit: {(row.highlights ?? []).slice(0, 2).map((h) => `${h.field}:${h.snippet}`).join(" | ")}
                   </div>
                 ) : null}
-                <div style={{ marginTop: 6 }}>
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onOpenRunFromLibrary(row.last_run_id);
-                    }}
-                    disabled={!row.last_run_id}
-                    style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
-                  >
-                    Open last run
-                  </button>
-                </div>
+                {renderRowArtifactButtons(row)}
               </button>
             ))
           )}
@@ -1182,6 +1411,42 @@ export default function App() {
             </select>
           </div>
 
+          <div style={{ border: "1px solid #eee", borderRadius: 6, padding: 8, marginBottom: 8 }}>
+            <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>Artifact catalog</div>
+            {runArtifactCatalogLoading ? <div style={{ fontSize: 12 }}>Loading catalog...</div> : null}
+            {runArtifactCatalogError ? <div style={{ color: "#a33", fontSize: 12 }}>{runArtifactCatalogError}</div> : null}
+            {!runArtifactCatalogLoading && runArtifactCatalog.length === 0 ? (
+              <div style={{ fontSize: 12, opacity: 0.8 }}>No artifacts found.</div>
+            ) : null}
+            <div style={{ display: "grid", gap: 6 }}>
+              {runArtifactCatalog.map((item) => (
+                <div
+                  key={`${item.rel_path}:${item.name}`}
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "1fr auto",
+                    gap: 8,
+                    border: "1px solid #f0f0f0",
+                    borderRadius: 6,
+                    padding: 6,
+                  }}
+                >
+                  <div style={{ fontSize: 11 }}>
+                    <div style={{ fontWeight: 600 }}>{item.name}</div>
+                    <div style={{ opacity: 0.8 }}>kind={item.kind} size={item.size_bytes ?? "-"}</div>
+                    <div style={{ opacity: 0.8 }}>mtime={item.mtime_iso ?? "-"}</div>
+                  </div>
+                  <button
+                    onClick={() => onOpenCatalogArtifact(item)}
+                    style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+                  >
+                    Open
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+
           {artifactLoading ? <div style={{ fontSize: 12 }}>Loading artifact...</div> : null}
           {artifactError ? <div style={{ color: "#a33", fontSize: 12 }}>{artifactError}</div> : null}
           {artifactIsMissing ? (
@@ -1209,19 +1474,36 @@ export default function App() {
                   dangerouslySetInnerHTML={{ __html: renderMarkdownToHtml(artifactView.content) }}
                 />
               ) : (
-                <textarea
-                  readOnly
-                  value={artifactView.content ?? ""}
-                  style={{
-                    width: "100%",
-                    height: 280,
-                    padding: 10,
-                    borderRadius: 8,
-                    border: "1px solid #ccc",
-                    fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
-                    fontSize: 12,
-                  }}
-                />
+                <div>
+                  <div style={{ display: "flex", gap: 8, marginBottom: 6 }}>
+                    <button
+                      onClick={() => navigator.clipboard?.writeText(artifactView.content ?? "")}
+                      style={{ padding: "6px 10px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+                    >
+                      Copy
+                    </button>
+                    <button
+                      onClick={() => setArtifactWrap((prev) => !prev)}
+                      style={{ padding: "6px 10px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+                    >
+                      Wrap: {artifactWrap ? "on" : "off"}
+                    </button>
+                  </div>
+                  <textarea
+                    readOnly
+                    value={artifactView.content ?? ""}
+                    wrap={artifactWrap ? "soft" : "off"}
+                    style={{
+                      width: "100%",
+                      height: 280,
+                      padding: 10,
+                      borderRadius: 8,
+                      border: "1px solid #ccc",
+                      fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+                      fontSize: 12,
+                    }}
+                  />
+                </div>
               )}
             </div>
           ) : null}
