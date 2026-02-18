@@ -221,7 +221,42 @@ struct LibraryMeta {
     updated_at: String,
 }
 
+#[derive(Deserialize, Default)]
+struct LibrarySearchOpts {
+    limit: Option<usize>,
+    status: Option<String>,
+    kind: Option<String>,
+    tag: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+struct LibrarySearchHighlight {
+    field: String,
+    snippet: String,
+}
+
+#[derive(Serialize, Clone)]
+struct LibrarySearchResult {
+    paper_key: String,
+    canonical_id: Option<String>,
+    title: Option<String>,
+    tags: Vec<String>,
+    last_status: String,
+    last_run_id: Option<String>,
+    score: i64,
+    highlights: Option<Vec<LibrarySearchHighlight>>,
+    updated_at: String,
+}
+
+#[derive(Default)]
+struct LibraryCacheState {
+    out_dir: Option<PathBuf>,
+    source_mtime_ms: u64,
+    records: Vec<LibraryRecord>,
+}
+
 static JOB_RUNTIME: OnceLock<Arc<Mutex<JobRuntimeState>>> = OnceLock::new();
+static LIBRARY_CACHE: OnceLock<Arc<Mutex<LibraryCacheState>>> = OnceLock::new();
 
 #[derive(Serialize, Clone)]
 struct TemplateParamDef {
@@ -672,6 +707,52 @@ fn library_meta_path(out_dir: &Path) -> PathBuf {
     out_dir.join(".jarvis-desktop").join("library_meta.json")
 }
 
+fn library_cache_state() -> Arc<Mutex<LibraryCacheState>> {
+    LIBRARY_CACHE
+        .get_or_init(|| Arc::new(Mutex::new(LibraryCacheState::default())))
+        .clone()
+}
+
+fn library_source_mtime_ms(out_dir: &Path) -> u64 {
+    let src = library_jsonl_path(out_dir);
+    if !src.exists() {
+        return 0;
+    }
+    modified_epoch_ms(&src)
+}
+
+fn cache_library_records(out_dir: &Path, records: &[LibraryRecord]) -> Result<(), String> {
+    let state = library_cache_state();
+    let mut guard = state
+        .lock()
+        .map_err(|_| "failed to lock library cache".to_string())?;
+    guard.out_dir = Some(out_dir.to_path_buf());
+    guard.source_mtime_ms = library_source_mtime_ms(out_dir);
+    guard.records = records.to_vec();
+    Ok(())
+}
+
+fn load_library_records_cached(out_dir: &Path, force_reload: bool) -> Result<Vec<LibraryRecord>, String> {
+    let state = library_cache_state();
+    let src_mtime = library_source_mtime_ms(out_dir);
+
+    {
+        let guard = state
+            .lock()
+            .map_err(|_| "failed to lock library cache".to_string())?;
+        if !force_reload
+            && guard.out_dir.as_deref() == Some(out_dir)
+            && guard.source_mtime_ms == src_mtime
+        {
+            return Ok(guard.records.clone());
+        }
+    }
+
+    let fresh = read_library_records(out_dir)?;
+    cache_library_records(out_dir, &fresh)?;
+    Ok(fresh)
+}
+
 fn to_iso_from_system_time(st: SystemTime) -> String {
     let dt: DateTime<Utc> = st.into();
     dt.to_rfc3339()
@@ -734,7 +815,122 @@ fn write_library_records(out_dir: &Path, records: &[LibraryRecord]) -> Result<()
     };
     let meta_text = serde_json::to_string_pretty(&meta)
         .map_err(|e| format!("failed to serialize library meta: {e}"))?;
-    atomic_write_text(&library_meta_path(out_dir), &meta_text)
+    atomic_write_text(&library_meta_path(out_dir), &meta_text)?;
+    cache_library_records(out_dir, records)
+}
+
+fn tokenize_query(raw: &str) -> Vec<String> {
+    raw.to_lowercase()
+        .split_whitespace()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+fn make_highlight(field: &str, value: &str, token: &str) -> LibrarySearchHighlight {
+    let lower = value.to_lowercase();
+    if let Some(pos) = lower.find(token) {
+        let start = pos.saturating_sub(24);
+        let end = (pos + token.len() + 24).min(value.len());
+        let snippet = value[start..end].trim().to_string();
+        return LibrarySearchHighlight {
+            field: field.to_string(),
+            snippet,
+        };
+    }
+    LibrarySearchHighlight {
+        field: field.to_string(),
+        snippet: value.chars().take(72).collect::<String>(),
+    }
+}
+
+fn score_library_record(rec: &LibraryRecord, tokens: &[String]) -> (i64, Vec<LibrarySearchHighlight>, bool) {
+    let canonical = rec.canonical_id.clone().unwrap_or_default();
+    let canonical_lower = canonical.to_lowercase();
+    let title = rec.title.clone().unwrap_or_default();
+    let title_lower = title.to_lowercase();
+    let tags_lower: Vec<String> = rec.tags.iter().map(|t| t.to_lowercase()).collect();
+    let run_ids_lower: Vec<String> = rec.runs.iter().map(|r| r.run_id.to_lowercase()).collect();
+    let template_ids_lower: Vec<String> = rec
+        .runs
+        .iter()
+        .filter_map(|r| r.template_id.clone())
+        .map(|t| t.to_lowercase())
+        .collect();
+    let statuses_lower: Vec<String> = rec.runs.iter().map(|r| r.status.to_lowercase()).collect();
+
+    let mut score = 0i64;
+    let mut highlights: Vec<LibrarySearchHighlight> = Vec::new();
+    let mut matched_any = false;
+
+    for tok in tokens {
+        let mut token_matched = false;
+
+        if !canonical_lower.is_empty() {
+            if canonical_lower == *tok {
+                score += 100;
+                token_matched = true;
+                highlights.push(make_highlight("canonical_id", &canonical, tok));
+            } else if canonical_lower.contains(tok) {
+                score += 60;
+                token_matched = true;
+                highlights.push(make_highlight("canonical_id", &canonical, tok));
+            }
+        }
+
+        if !title_lower.is_empty() && title_lower.contains(tok) {
+            score += 40;
+            token_matched = true;
+            highlights.push(make_highlight("title", &title, tok));
+        }
+
+        if tags_lower.iter().any(|t| t == tok) {
+            score += 30;
+            token_matched = true;
+            if let Some(tag) = rec.tags.iter().find(|t| t.to_lowercase() == *tok) {
+                highlights.push(make_highlight("tag", tag, tok));
+            }
+        }
+
+        if run_ids_lower.iter().any(|r| r.contains(tok)) {
+            score += 20;
+            token_matched = true;
+            if let Some(run) = rec.runs.iter().find(|r| r.run_id.to_lowercase().contains(tok)) {
+                highlights.push(make_highlight("run_id", &run.run_id, tok));
+            }
+        }
+
+        if template_ids_lower.iter().any(|t| t.contains(tok)) {
+            score += 10;
+            token_matched = true;
+            if let Some(run) = rec.runs.iter().find(|r| {
+                r.template_id
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_lowercase()
+                    .contains(tok)
+            }) {
+                let text = run.template_id.clone().unwrap_or_default();
+                highlights.push(make_highlight("template_id", &text, tok));
+            }
+        }
+
+        if rec.last_status.to_lowercase().contains(tok)
+            || statuses_lower.iter().any(|s| s.contains(tok))
+        {
+            token_matched = true;
+            highlights.push(make_highlight("status", &rec.last_status, tok));
+        }
+
+        if token_matched {
+            matched_any = true;
+        }
+    }
+
+    if highlights.len() > 6 {
+        highlights.truncate(6);
+    }
+    (score.min(10_000), highlights, matched_any)
 }
 
 fn parse_known_title(v: &serde_json::Value) -> Option<String> {
@@ -957,7 +1153,7 @@ fn build_library_records(out_dir: &Path, existing: &[LibraryRecord]) -> Result<V
 }
 
 fn upsert_library_run(out_dir: &Path, run_id: &str) -> Result<(), String> {
-    let mut records = read_library_records(out_dir)?;
+    let mut records = load_library_records_cached(out_dir, false)?;
     for rec in &mut records {
         rec.runs.retain(|r| r.run_id != run_id);
     }
@@ -2022,7 +2218,7 @@ fn library_reindex(full: Option<bool>) -> Result<LibraryReindexResult, String> {
     let _full = full.unwrap_or(false);
     let (runtime, _) = runtime_and_jobs_path()?;
     let out_dir = runtime.out_base_dir.clone();
-    let existing = read_library_records(&out_dir)?;
+    let existing = load_library_records_cached(&out_dir, false)?;
     let records = build_library_records(&out_dir, &existing)?;
     let count_runs = records.iter().map(|r| r.runs.len()).sum();
     write_library_records(&out_dir, &records)?;
@@ -2034,9 +2230,21 @@ fn library_reindex(full: Option<bool>) -> Result<LibraryReindexResult, String> {
 }
 
 #[tauri::command]
+fn library_reload() -> Result<LibraryReindexResult, String> {
+    let (runtime, _) = runtime_and_jobs_path()?;
+    let records = load_library_records_cached(&runtime.out_base_dir, true)?;
+    let count_runs = records.iter().map(|r| r.runs.len()).sum();
+    Ok(LibraryReindexResult {
+        count_records: records.len(),
+        count_runs,
+        updated_at: Utc::now().to_rfc3339(),
+    })
+}
+
+#[tauri::command]
 fn library_list(filters: Option<LibraryListFilter>) -> Result<Vec<LibraryRecordSummary>, String> {
     let (runtime, _) = runtime_and_jobs_path()?;
-    let records = read_library_records(&runtime.out_base_dir)?;
+    let records = load_library_records_cached(&runtime.out_base_dir, false)?;
     let f = filters.unwrap_or_default();
     let query = f.query.unwrap_or_default().to_lowercase();
     let status = f.status.unwrap_or_default().to_lowercase();
@@ -2096,9 +2304,72 @@ fn library_list(filters: Option<LibraryListFilter>) -> Result<Vec<LibraryRecordS
 }
 
 #[tauri::command]
+fn library_search(query: String, opts: Option<LibrarySearchOpts>) -> Result<Vec<LibrarySearchResult>, String> {
+    let tokens = tokenize_query(&query);
+    if tokens.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let (runtime, _) = runtime_and_jobs_path()?;
+    let records = load_library_records_cached(&runtime.out_base_dir, false)?;
+    let options = opts.unwrap_or_default();
+    let status_filter = options.status.unwrap_or_default().to_lowercase();
+    let kind_filter = options.kind.unwrap_or_default().to_lowercase();
+    let tag_filter = options.tag.unwrap_or_default().to_lowercase();
+    let limit = options.limit.unwrap_or(200).clamp(1, 1000);
+
+    let mut out = Vec::new();
+    for rec in records {
+        if !status_filter.is_empty() && rec.last_status.to_lowercase() != status_filter {
+            continue;
+        }
+        if !kind_filter.is_empty() {
+            let k = rec.source_kind.clone().unwrap_or_default().to_lowercase();
+            if k != kind_filter {
+                continue;
+            }
+        }
+        if !tag_filter.is_empty() {
+            let has = rec.tags.iter().any(|t| t.to_lowercase() == tag_filter);
+            if !has {
+                continue;
+            }
+        }
+
+        let (score, highlights, matched_any) = score_library_record(&rec, &tokens);
+        if !matched_any {
+            continue;
+        }
+
+        out.push(LibrarySearchResult {
+            paper_key: rec.paper_key,
+            canonical_id: rec.canonical_id,
+            title: rec.title,
+            tags: rec.tags,
+            last_status: rec.last_status,
+            last_run_id: rec.last_run_id,
+            score,
+            highlights: if highlights.is_empty() { None } else { Some(highlights) },
+            updated_at: rec.updated_at,
+        });
+    }
+
+    out.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| b.updated_at.cmp(&a.updated_at))
+            .then_with(|| a.paper_key.cmp(&b.paper_key))
+    });
+    if out.len() > limit {
+        out.truncate(limit);
+    }
+    Ok(out)
+}
+
+#[tauri::command]
 fn library_get(paper_key: String) -> Result<LibraryRecord, String> {
     let (runtime, _) = runtime_and_jobs_path()?;
-    let records = read_library_records(&runtime.out_base_dir)?;
+    let records = load_library_records_cached(&runtime.out_base_dir, false)?;
     records
         .into_iter()
         .find(|r| r.paper_key == paper_key)
@@ -2108,7 +2379,7 @@ fn library_get(paper_key: String) -> Result<LibraryRecord, String> {
 #[tauri::command]
 fn library_set_tags(paper_key: String, tags: Vec<String>) -> Result<LibraryRecord, String> {
     let (runtime, _) = runtime_and_jobs_path()?;
-    let mut records = read_library_records(&runtime.out_base_dir)?;
+    let mut records = load_library_records_cached(&runtime.out_base_dir, false)?;
     let idx = records
         .iter()
         .position(|r| r.paper_key == paper_key)
@@ -2132,7 +2403,7 @@ fn library_set_tags(paper_key: String, tags: Vec<String>) -> Result<LibraryRecor
 #[tauri::command]
 fn library_stats() -> Result<LibraryStats, String> {
     let (runtime, _) = runtime_and_jobs_path()?;
-    let records = read_library_records(&runtime.out_base_dir)?;
+    let records = load_library_records_cached(&runtime.out_base_dir, false)?;
 
     let mut status_counts = serde_json::Map::new();
     let mut kind_counts = serde_json::Map::new();
@@ -3103,7 +3374,9 @@ fn main() {
             retry_job,
             clear_finished_jobs,
             library_reindex,
+            library_reload,
             library_list,
+            library_search,
             library_get,
             library_set_tags,
             library_stats,
@@ -3453,5 +3726,40 @@ mod tests {
         assert_eq!(reloaded[0].tags, vec!["tag1".to_string(), "tag2".to_string()]);
 
         let _ = fs::remove_dir_all(&out_dir);
+    }
+
+    #[test]
+    fn library_search_ranking_is_deterministic() {
+        let now = Utc::now().to_rfc3339();
+        let rec = LibraryRecord {
+            paper_key: "arxiv:1706.03762".to_string(),
+            canonical_id: Some("arxiv:1706.03762".to_string()),
+            title: Some("Attention Is All You Need".to_string()),
+            year: Some(2017),
+            source_kind: Some("arxiv".to_string()),
+            tags: vec!["transformer".to_string()],
+            runs: vec![LibraryRunEntry {
+                run_id: "20260218_abc".to_string(),
+                template_id: Some("TEMPLATE_TREE".to_string()),
+                status: "succeeded".to_string(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            }],
+            last_run_id: Some("20260218_abc".to_string()),
+            last_status: "succeeded".to_string(),
+            created_at: now.clone(),
+            updated_at: now,
+        };
+
+        let tokens = tokenize_query("arxiv:1706.03762 transformer template_tree");
+        let (score, _, matched) = score_library_record(&rec, &tokens);
+        assert!(matched);
+        assert!(score >= 140);
+    }
+
+    #[test]
+    fn library_search_tokenization_trims_and_lowers() {
+        let tokens = tokenize_query("  DOI:10.1000/XYZ   failed ");
+        assert_eq!(tokens, vec!["doi:10.1000/xyz".to_string(), "failed".to_string()]);
     }
 }

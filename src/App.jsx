@@ -127,13 +127,15 @@ export default function App() {
   const [selectedPaperKey, setSelectedPaperKey] = useState("");
   const [libraryDetail, setLibraryDetail] = useState(null);
   const [libraryFilters, setLibraryFilters] = useState({
-    query: "",
     status: "",
     kind: "",
     tag: "",
   });
   const [tagInput, setTagInput] = useState("");
   const [libraryReindexInfo, setLibraryReindexInfo] = useState(null);
+  const [librarySearchQuery, setLibrarySearchQuery] = useState("");
+  const [librarySearchRows, setLibrarySearchRows] = useState([]);
+  const [librarySearchLoading, setLibrarySearchLoading] = useState(false);
 
   const combined = useMemo(() => {
     const parts = [];
@@ -278,6 +280,40 @@ export default function App() {
     }
   }
 
+  async function loadLibrarySearch(query, nextFilters = libraryFilters) {
+    const normalized = String(query ?? "").trim();
+    if (!normalized) {
+      setLibrarySearchRows([]);
+      setLibrarySearchLoading(false);
+      return;
+    }
+    setLibrarySearchLoading(true);
+    setLibraryError("");
+    try {
+      const opts = {};
+      if (String(nextFilters.status ?? "").trim()) opts.status = nextFilters.status;
+      if (String(nextFilters.kind ?? "").trim()) opts.kind = nextFilters.kind;
+      if (String(nextFilters.tag ?? "").trim()) opts.tag = nextFilters.tag;
+      opts.limit = 300;
+
+      const rows = await invoke("library_search", {
+        query: normalized,
+        opts,
+      });
+      const list = Array.isArray(rows) ? rows : [];
+      setLibrarySearchRows(list);
+      setSelectedPaperKey((prev) => {
+        if (prev && list.some((r) => r.paper_key === prev)) return prev;
+        return list[0]?.paper_key ?? "";
+      });
+    } catch (e) {
+      setLibrarySearchRows([]);
+      setLibraryError(String(e));
+    } finally {
+      setLibrarySearchLoading(false);
+    }
+  }
+
   async function loadLibraryStats() {
     try {
       const stats = await invoke("library_stats");
@@ -307,8 +343,13 @@ export default function App() {
     setLibraryError("");
     try {
       const info = await invoke("library_reindex", { full: true });
+      await invoke("library_reload");
       setLibraryReindexInfo(info);
-      await loadLibraryRows(libraryFilters);
+      if (String(librarySearchQuery).trim()) {
+        await loadLibrarySearch(librarySearchQuery, libraryFilters);
+      } else {
+        await loadLibraryRows(libraryFilters);
+      }
       await loadLibraryStats();
     } catch (e) {
       setLibraryError(String(e));
@@ -329,7 +370,11 @@ export default function App() {
         tags,
       });
       setLibraryDetail(updated);
-      await loadLibraryRows(libraryFilters);
+      if (String(librarySearchQuery).trim()) {
+        await loadLibrarySearch(librarySearchQuery, libraryFilters);
+      } else {
+        await loadLibraryRows(libraryFilters);
+      }
       await loadLibraryStats();
     } catch (e) {
       setLibraryError(String(e));
@@ -362,6 +407,20 @@ export default function App() {
   useEffect(() => {
     loadLibraryDetail(selectedPaperKey);
   }, [selectedPaperKey]);
+
+  useEffect(() => {
+    const q = String(librarySearchQuery ?? "").trim();
+    if (!q) {
+      setLibrarySearchRows([]);
+      setLibrarySearchLoading(false);
+      return;
+    }
+    setLibrarySearchLoading(true);
+    const timer = setTimeout(() => {
+      loadLibrarySearch(q, libraryFilters);
+    }, 260);
+    return () => clearTimeout(timer);
+  }, [librarySearchQuery, libraryFilters.status, libraryFilters.kind, libraryFilters.tag]);
 
   const selectedTemplate = templates.find((t) => t.id === selectedTemplateId) ?? null;
 
@@ -531,6 +590,8 @@ export default function App() {
     ? new Date(selectedRun.created_at_epoch_ms).toLocaleString()
     : "-";
   const selectedJob = jobs.find((j) => j.job_id === selectedJobId) ?? null;
+  const isLibrarySearchMode = String(librarySearchQuery ?? "").trim() !== "";
+  const visibleLibraryRows = isLibrarySearchMode ? librarySearchRows : libraryRows;
 
   return (
     <div style={{ fontFamily: "system-ui", padding: 16, maxWidth: 960 }}>
@@ -887,10 +948,10 @@ export default function App() {
       <h3 style={{ marginBottom: 8 }}>Library</h3>
       <div style={{ display: "flex", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
         <input
-          placeholder="query (canonical/title)"
-          value={libraryFilters.query}
-          onChange={(e) => setLibraryFilters((prev) => ({ ...prev, query: e.target.value }))}
-          style={{ padding: 8, borderRadius: 6, border: "1px solid #ccc", minWidth: 220 }}
+          placeholder="Search library (canonical/title/tag/template/run/status)"
+          value={librarySearchQuery}
+          onChange={(e) => setLibrarySearchQuery(e.target.value)}
+          style={{ padding: 8, borderRadius: 6, border: "1px solid #ccc", minWidth: 320 }}
         />
         <select
           value={libraryFilters.status}
@@ -924,10 +985,10 @@ export default function App() {
         />
         <button
           onClick={() => loadLibraryRows(libraryFilters)}
-          disabled={libraryLoading}
+          disabled={libraryLoading || isLibrarySearchMode}
           style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
         >
-          {libraryLoading ? "Loading..." : "Apply filters"}
+          {libraryLoading ? "Loading..." : "Refresh list"}
         </button>
         <button
           onClick={onLibraryReindex}
@@ -942,16 +1003,21 @@ export default function App() {
       {libraryStats ? (
         <div style={{ fontSize: 12, marginBottom: 8, opacity: 0.9 }}>
           papers={libraryStats.total_papers} runs={libraryStats.total_runs}
+          {isLibrarySearchMode ? ` | search_hits=${librarySearchRows.length}` : ""}
           {libraryReindexInfo ? ` | indexed_at=${libraryReindexInfo.updated_at}` : ""}
         </div>
       ) : null}
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 2fr", gap: 12, marginBottom: 12 }}>
         <div style={{ border: "1px solid #ddd", borderRadius: 8, maxHeight: 260, overflow: "auto" }}>
-          {libraryRows.length === 0 ? (
-            <div style={{ padding: 10, fontSize: 12, opacity: 0.8 }}>No library rows.</div>
+          {librarySearchLoading ? (
+            <div style={{ padding: 10, fontSize: 12, opacity: 0.8 }}>Searching...</div>
+          ) : visibleLibraryRows.length === 0 ? (
+            <div style={{ padding: 10, fontSize: 12, opacity: 0.8 }}>
+              {isLibrarySearchMode ? "No search results." : "No library rows."}
+            </div>
           ) : (
-            libraryRows.map((row) => (
+            visibleLibraryRows.map((row) => (
               <button
                 key={row.paper_key}
                 onClick={() => setSelectedPaperKey(row.paper_key)}
@@ -966,9 +1032,32 @@ export default function App() {
                 }}
               >
                 <div style={{ fontSize: 12, fontWeight: 600 }}>{row.canonical_id ?? row.paper_key}</div>
-                <div style={{ fontSize: 11 }}>status={row.last_status} kind={row.source_kind ?? "unknown"}</div>
+                <div style={{ fontSize: 11, opacity: 0.88 }}>{row.title ?? "(no title)"}</div>
+                <div style={{ fontSize: 11 }}>
+                  status={row.last_status}
+                  {row.score !== undefined ? ` score=${row.score}` : ""}
+                  {row.source_kind !== undefined ? ` kind=${row.source_kind ?? "unknown"}` : ""}
+                </div>
                 <div style={{ fontSize: 11, opacity: 0.8 }}>last_run={row.last_run_id ?? "-"}</div>
+                <div style={{ fontSize: 11, opacity: 0.8 }}>updated_at={row.updated_at ?? "-"}</div>
                 <div style={{ fontSize: 11, opacity: 0.75 }}>tags={(row.tags ?? []).join(", ") || "-"}</div>
+                {Array.isArray(row.highlights) && row.highlights.length > 0 ? (
+                  <div style={{ fontSize: 11, opacity: 0.75, marginTop: 3 }}>
+                    hit: {(row.highlights ?? []).slice(0, 2).map((h) => `${h.field}:${h.snippet}`).join(" | ")}
+                  </div>
+                ) : null}
+                <div style={{ marginTop: 6 }}>
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onOpenRunFromLibrary(row.last_run_id);
+                    }}
+                    disabled={!row.last_run_id}
+                    style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+                  >
+                    Open last run
+                  </button>
+                </div>
               </button>
             ))
           )}
