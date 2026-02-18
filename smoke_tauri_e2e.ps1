@@ -107,22 +107,8 @@ try {
   }
   Write-Host "tauri dev running (PID=$($script:tauriProc.Id))"
 
-  Write-Host "[5/8] run pipeline CLI directly and verify run artifacts"
+  Write-Host "[5/8] run desktop backend pipeline path and verify run artifacts"
   New-Item -Path $resolvedOutDir -ItemType Directory -Force | Out-Null
-
-  $pythonExe = Join-Path $resolvedPipeline ".venv\Scripts\python.exe"
-  if (-not (Test-Path $pythonExe)) {
-    $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
-    if (-not $pythonCmd) {
-      throw "python not found. Prepare pipeline venv or install python."
-    }
-    $pythonExe = $pythonCmd.Source
-  }
-
-  $cliPath = Join-Path $resolvedPipeline "jarvis_cli.py"
-  if (-not (Test-Path $cliPath)) {
-    throw "jarvis_cli.py not found under pipeline root: $resolvedPipeline"
-  }
 
   $beforeRuns = @{}
   Get-ChildItem -Path $resolvedOutDir -Directory -ErrorAction SilentlyContinue | ForEach-Object {
@@ -130,6 +116,7 @@ try {
   }
 
   $runDir = $null
+  $runId = $null
   $lastOutputText = ""
   $maxAttempts = 3
   # Retry transient API failures (429/timeout/needs_retry) but still fail hard on persistent issues.
@@ -137,18 +124,19 @@ try {
     Write-Host "  - pipeline attempt $attempt/$maxAttempts"
 
     $pipelineArgs = @(
-      $cliPath, "papers", "tree",
-      "--id", "arxiv:1706.03762",
-      "--depth", "1",
-      "--max-per-level", "5",
-      "--out", $resolvedOutDir,
-      "--out-run", "auto"
+      "run", "-q",
+      "--manifest-path", (Join-Path $desktopRoot "src-tauri\Cargo.toml"),
+      "--",
+      "--smoke-run-template-tree",
+      "arxiv:1706.03762",
+      "1",
+      "5"
     )
     $prevErrorAction = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
-    Push-Location $resolvedPipeline
+    Push-Location $desktopRoot
     try {
-      $cliOutput = & $pythonExe @pipelineArgs 2>&1
+      $cliOutput = & cargo @pipelineArgs 2>&1
       $cliExitCode = $LASTEXITCODE
     } finally {
       Pop-Location
@@ -160,15 +148,23 @@ try {
 
     $runDirFromOutput = $null
     $combinedLines = @($combined -split "`r?`n")
-    foreach ($line in $combinedLines) {
-      if ($line -match "^Run Dir:\s*(.+)$") {
-        $candidate = $Matches[1].Trim()
-        if ([System.IO.Path]::IsPathRooted($candidate)) {
-          $runDirFromOutput = $candidate
-        } else {
-          $runDirFromOutput = Join-Path $resolvedOutDir (Split-Path $candidate -Leaf)
+    $jsonLine = $combinedLines | Where-Object { $_.Trim().StartsWith("{") -and $_.Trim().EndsWith("}") } | Select-Object -Last 1
+    if ($jsonLine) {
+      try {
+        $runRes = $jsonLine | ConvertFrom-Json
+        if ($runRes.run_id) {
+          $runId = [string]$runRes.run_id
         }
-        break
+        if ($runRes.run_dir) {
+          $candidate = [string]$runRes.run_dir
+          if ([System.IO.Path]::IsPathRooted($candidate)) {
+            $runDirFromOutput = $candidate
+          } else {
+            $runDirFromOutput = Join-Path $resolvedOutDir (Split-Path $candidate -Leaf)
+          }
+        }
+      } catch {
+        # fall through to directory inference
       }
     }
 
@@ -216,7 +212,7 @@ try {
   }
 
   Write-Host "[6/9] verify run listing includes created run_id"
-  $runIdFromDir = Split-Path $runDir -Leaf
+  $runIdFromDir = if ($runId) { $runId } else { Split-Path $runDir -Leaf }
   $listedRunIds = Get-ChildItem -Path $resolvedOutDir -Directory -ErrorAction SilentlyContinue |
     Sort-Object LastWriteTime -Descending |
     Select-Object -ExpandProperty Name
@@ -259,25 +255,7 @@ try {
   }
 
   if (-not $hasDesktopContract) {
-    Write-Host "Desktop metadata missing in input.json (CLI sample path). Applying smoke mock contract." -ForegroundColor Yellow
-    $mockDesktop = [ordered]@{
-      template_id = "TEMPLATE_TREE"
-      canonical_id = "arxiv:1706.03762"
-      params = [ordered]@{ depth = 1; max_per_level = 5 }
-      created_by = "jarvis-desktop-smoke-mock"
-      version = "smoke"
-    }
-    if ($inputObj -is [System.Management.Automation.PSCustomObject]) {
-      $inputObj | Add-Member -NotePropertyName desktop -NotePropertyValue $mockDesktop -Force
-    } else {
-      $inputObj = [pscustomobject]@{ desktop = $mockDesktop }
-    }
-    $inputObj | ConvertTo-Json -Depth 20 | Out-File -FilePath $inputJsonPath -Encoding utf8
-
-    $inputObj2 = Get-Content $inputJsonPath -Raw | ConvertFrom-Json
-    if (-not $inputObj2.desktop -or [string]::IsNullOrWhiteSpace([string]$inputObj2.desktop.template_id) -or [string]::IsNullOrWhiteSpace([string]$inputObj2.desktop.canonical_id)) {
-      throw "input.json desktop metadata contract check failed"
-    }
+    throw "Desktop metadata missing in input.json (CLI sample path)."
   }
 
   Write-Host "[9/10] pipeline artifact verification passed"
