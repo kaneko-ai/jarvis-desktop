@@ -220,6 +220,81 @@ struct JobFilePayload {
     jobs: Vec<JobRecord>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum PipelineStepStatus {
+    Pending,
+    Running,
+    Succeeded,
+    Failed,
+    NeedsRetry,
+    Canceled,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum PipelineStatus {
+    Running,
+    Succeeded,
+    Failed,
+    NeedsRetry,
+    Canceled,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct PipelineStep {
+    step_id: String,
+    template_id: String,
+    params: serde_json::Value,
+    job_id: Option<String>,
+    status: PipelineStepStatus,
+    run_id: Option<String>,
+    started_at: Option<String>,
+    finished_at: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct PipelineRecord {
+    pipeline_id: String,
+    canonical_id: String,
+    name: String,
+    created_at: String,
+    updated_at: String,
+    steps: Vec<PipelineStep>,
+    current_step_index: usize,
+    status: PipelineStatus,
+    last_primary_viz: Option<PrimaryVizRef>,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct PipelineFilePayload {
+    pipelines: Vec<PipelineRecord>,
+}
+
+#[derive(Deserialize, Clone)]
+struct PipelineCreateStepInput {
+    template_id: String,
+    params: serde_json::Value,
+}
+
+#[derive(Deserialize, Default)]
+struct PipelineListFilter {
+    query: Option<String>,
+    status: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+struct PipelineSummary {
+    pipeline_id: String,
+    canonical_id: String,
+    name: String,
+    status: PipelineStatus,
+    current_step_index: usize,
+    total_steps: usize,
+    updated_at: String,
+    last_primary_viz: Option<PrimaryVizRef>,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 struct LibraryRunEntry {
     run_id: String,
@@ -903,6 +978,10 @@ fn jobs_file_path(out_dir: &Path) -> PathBuf {
     out_dir.join(".jarvis-desktop").join("jobs.json")
 }
 
+fn pipelines_file_path(out_dir: &Path) -> PathBuf {
+    out_dir.join(".jarvis-desktop").join("pipelines.json")
+}
+
 fn library_jsonl_path(out_dir: &Path) -> PathBuf {
     out_dir.join(".jarvis-desktop").join("library.jsonl")
 }
@@ -1489,6 +1568,64 @@ fn save_jobs_to_file(path: &Path, jobs: &[JobRecord]) -> Result<(), String> {
     let text = serde_json::to_string_pretty(&payload)
         .map_err(|e| format!("failed to serialize jobs payload: {e}"))?;
     atomic_write_text(path, &text)
+}
+
+fn load_pipelines_from_file(path: &Path) -> Result<Vec<PipelineRecord>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let raw = fs::read_to_string(path)
+        .map_err(|e| format!("failed to read pipelines file {}: {e}", path.display()))?;
+    let payload: PipelineFilePayload = serde_json::from_str(&raw)
+        .map_err(|e| format!("failed to parse pipelines file {}: {e}", path.display()))?;
+    Ok(payload.pipelines)
+}
+
+fn save_pipelines_to_file(path: &Path, pipelines: &[PipelineRecord]) -> Result<(), String> {
+    let payload = PipelineFilePayload {
+        pipelines: pipelines.to_vec(),
+    };
+    let text = serde_json::to_string_pretty(&payload)
+        .map_err(|e| format!("failed to serialize pipelines payload: {e}"))?;
+    atomic_write_text(path, &text)
+}
+
+fn pipeline_step_status_from_job(job: &JobRecord) -> PipelineStepStatus {
+    match job.status {
+        JobStatus::Queued | JobStatus::Running => PipelineStepStatus::Running,
+        JobStatus::Succeeded => PipelineStepStatus::Succeeded,
+        JobStatus::Failed => PipelineStepStatus::Failed,
+        JobStatus::NeedsRetry => PipelineStepStatus::NeedsRetry,
+        JobStatus::Canceled => PipelineStepStatus::Canceled,
+    }
+}
+
+fn is_pipeline_step_terminal(status: &PipelineStepStatus) -> bool {
+    matches!(
+        status,
+        PipelineStepStatus::Succeeded
+            | PipelineStepStatus::Failed
+            | PipelineStepStatus::NeedsRetry
+            | PipelineStepStatus::Canceled
+    )
+}
+
+fn parse_run_primary_viz(run_dir: &Path) -> Option<PrimaryVizRef> {
+    let input_path = run_dir.join("input.json");
+    let raw = fs::read_to_string(input_path).ok()?;
+    let v = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
+    parse_primary_viz_from_input(&v)
+}
+
+fn make_pipeline_id() -> String {
+    format!("pipe_{}_{}", now_epoch_ms(), make_run_id())
+}
+
+fn sanitize_step_id(template_id: &str, index: usize) -> String {
+    let t = template_id
+        .to_lowercase()
+        .replace(|c: char| !(c.is_ascii_alphanumeric() || c == '_'), "_");
+    format!("step_{:02}_{}", index + 1, t)
 }
 
 fn runtime_and_jobs_path() -> Result<(RuntimeConfig, PathBuf), String> {
@@ -2427,6 +2564,9 @@ fn apply_job_result(
             let _ = upsert_library_run(&runtime.out_base_dir, &run_id);
         }
     }
+
+    let _ = reconcile_pipelines_with_jobs(&runtime.out_base_dir, state, jobs_path, Some(job_id));
+    let _ = start_job_worker_if_needed();
 
     Ok(())
 }
@@ -3899,8 +4039,9 @@ fn list_task_templates() -> Vec<TaskTemplateDef> {
     template_registry()
 }
 
-#[tauri::command]
-fn enqueue_job(
+fn enqueue_job_internal(
+    state: &Arc<Mutex<JobRuntimeState>>,
+    jobs_path: &Path,
     template_id: String,
     canonical_id: String,
     params: serde_json::Value,
@@ -3915,7 +4056,6 @@ fn enqueue_job(
         return Err(format!("invalid canonical_id: {}", normalized.errors.join("; ")));
     }
 
-    let (state, jobs_path) = init_job_runtime()?;
     let job_id = format!("job_{}_{}", now_epoch_ms(), make_run_id());
     {
         let mut guard = state
@@ -3937,7 +4077,18 @@ fn enqueue_job(
             retry_at: None,
         });
     }
-    persist_state(&state, &jobs_path)?;
+    persist_state(state, jobs_path)?;
+    Ok(job_id)
+}
+
+#[tauri::command]
+fn enqueue_job(
+    template_id: String,
+    canonical_id: String,
+    params: serde_json::Value,
+) -> Result<String, String> {
+    let (state, jobs_path) = init_job_runtime()?;
+    let job_id = enqueue_job_internal(&state, &jobs_path, template_id, canonical_id, params)?;
     start_job_worker_if_needed()?;
     Ok(job_id)
 }
@@ -3989,6 +4140,9 @@ fn cancel_job(job_id: String) -> Result<JobRecord, String> {
         updated = guard.jobs[idx].clone();
     }
     persist_state(&state, &jobs_path)?;
+    if let Ok((runtime, _)) = runtime_and_jobs_path() {
+        let _ = reconcile_pipelines_with_jobs(&runtime.out_base_dir, &state, &jobs_path, Some(&job_id));
+    }
     Ok(updated)
 }
 
@@ -4030,6 +4184,9 @@ fn retry_job(job_id: String, force: Option<bool>) -> Result<JobRecord, String> {
         updated = guard.jobs[idx].clone();
     }
     persist_state(&state, &jobs_path)?;
+    if let Ok((runtime, _)) = runtime_and_jobs_path() {
+        let _ = reconcile_pipelines_with_jobs(&runtime.out_base_dir, &state, &jobs_path, Some(&job_id));
+    }
     start_job_worker_if_needed()?;
     Ok(updated)
 }
@@ -4050,6 +4207,383 @@ fn clear_finished_jobs() -> Result<usize, String> {
     }
     persist_state(&state, &jobs_path)?;
     Ok(removed)
+}
+
+fn reconcile_pipelines_with_jobs(
+    out_dir: &Path,
+    state: &Arc<Mutex<JobRuntimeState>>,
+    jobs_path: &Path,
+    only_job_id: Option<&str>,
+) -> Result<Vec<PipelineRecord>, String> {
+    let pipelines_path = pipelines_file_path(out_dir);
+    let mut pipelines = load_pipelines_from_file(&pipelines_path)?;
+    if pipelines.is_empty() {
+        return Ok(pipelines);
+    }
+
+    let jobs_snapshot = {
+        let mut guard = state
+            .lock()
+            .map_err(|_| "failed to lock job runtime for pipelines".to_string())?;
+        guard.jobs = load_jobs_from_file(jobs_path)?;
+        guard.jobs.clone()
+    };
+
+    let mut changed = false;
+    for pipeline in &mut pipelines {
+        if pipeline.steps.is_empty() {
+            if pipeline.status != PipelineStatus::Succeeded {
+                pipeline.status = PipelineStatus::Succeeded;
+                pipeline.updated_at = now_epoch_ms_string();
+                changed = true;
+            }
+            continue;
+        }
+        if pipeline.status != PipelineStatus::Running {
+            continue;
+        }
+
+        if pipeline.current_step_index >= pipeline.steps.len() {
+            pipeline.current_step_index = pipeline.steps.len().saturating_sub(1);
+            changed = true;
+        }
+
+        loop {
+            if pipeline.current_step_index >= pipeline.steps.len() {
+                pipeline.status = PipelineStatus::Succeeded;
+                pipeline.updated_at = now_epoch_ms_string();
+                changed = true;
+                break;
+            }
+
+            let idx = pipeline.current_step_index;
+            let terminal_status = {
+                let step = &pipeline.steps[idx];
+                if is_pipeline_step_terminal(&step.status) {
+                    Some(step.status.clone())
+                } else {
+                    None
+                }
+            };
+
+            if let Some(step_status) = terminal_status {
+                if step_status == PipelineStepStatus::Succeeded {
+                    if idx + 1 >= pipeline.steps.len() {
+                        pipeline.status = PipelineStatus::Succeeded;
+                        pipeline.updated_at = now_epoch_ms_string();
+                        changed = true;
+                        break;
+                    }
+                    pipeline.current_step_index = idx + 1;
+                    changed = true;
+                    continue;
+                }
+                pipeline.status = match step_status {
+                    PipelineStepStatus::NeedsRetry => PipelineStatus::NeedsRetry,
+                    PipelineStepStatus::Canceled => PipelineStatus::Canceled,
+                    _ => PipelineStatus::Failed,
+                };
+                pipeline.updated_at = now_epoch_ms_string();
+                changed = true;
+                break;
+            }
+
+            if pipeline.steps[idx].status == PipelineStepStatus::Pending {
+                let job_id = enqueue_job_internal(
+                    state,
+                    jobs_path,
+                    pipeline.steps[idx].template_id.clone(),
+                    pipeline.canonical_id.clone(),
+                    pipeline.steps[idx].params.clone(),
+                )?;
+                pipeline.steps[idx].job_id = Some(job_id);
+                pipeline.steps[idx].status = PipelineStepStatus::Running;
+                if pipeline.steps[idx].started_at.is_none() {
+                    pipeline.steps[idx].started_at = Some(now_epoch_ms_string());
+                }
+                pipeline.steps[idx].finished_at = None;
+                pipeline.status = PipelineStatus::Running;
+                pipeline.updated_at = now_epoch_ms_string();
+                changed = true;
+                break;
+            }
+
+            if pipeline.steps[idx].status == PipelineStepStatus::Running {
+                let job_id = pipeline.steps[idx].job_id.clone();
+                let Some(step_job_id) = job_id else {
+                    pipeline.steps[idx].status = PipelineStepStatus::Pending;
+                    pipeline.updated_at = now_epoch_ms_string();
+                    changed = true;
+                    continue;
+                };
+
+                if let Some(target) = only_job_id {
+                    if target != step_job_id {
+                        break;
+                    }
+                }
+
+                let Some(job) = jobs_snapshot.iter().find(|j| j.job_id == step_job_id) else {
+                    break;
+                };
+
+                let mapped = pipeline_step_status_from_job(job);
+                if mapped == PipelineStepStatus::Running {
+                    break;
+                }
+
+                pipeline.steps[idx].status = mapped.clone();
+                if pipeline.steps[idx].started_at.is_none() {
+                    pipeline.steps[idx].started_at = Some(now_epoch_ms_string());
+                }
+                pipeline.steps[idx].finished_at = Some(now_epoch_ms_string());
+                if pipeline.steps[idx].run_id.is_none() {
+                    pipeline.steps[idx].run_id = job.run_id.clone();
+                }
+                if let Some(run_id) = pipeline.steps[idx].run_id.as_ref() {
+                    let run_dir = out_dir.join(run_id);
+                    if let Some(pv) = parse_run_primary_viz(&run_dir) {
+                        pipeline.last_primary_viz = Some(pv);
+                    }
+                }
+                pipeline.updated_at = now_epoch_ms_string();
+                changed = true;
+                continue;
+            }
+
+            break;
+        }
+    }
+
+    if changed {
+        save_pipelines_to_file(&pipelines_path, &pipelines)?;
+    }
+    Ok(pipelines)
+}
+
+#[tauri::command]
+fn create_pipeline(
+    name: String,
+    canonical_id: String,
+    steps: Vec<PipelineCreateStepInput>,
+) -> Result<String, String> {
+    if steps.is_empty() {
+        return Err("pipeline must have at least one step".to_string());
+    }
+
+    let normalized = normalize_identifier_internal(&canonical_id);
+    if !normalized.errors.is_empty() {
+        return Err(format!("invalid canonical_id: {}", normalized.errors.join("; ")));
+    }
+    let canonical = normalized.canonical;
+
+    let (state, jobs_path) = init_job_runtime()?;
+    let (runtime, _) = runtime_and_jobs_path()?;
+    let pipelines_path = pipelines_file_path(&runtime.out_base_dir);
+    let mut pipelines = load_pipelines_from_file(&pipelines_path)?;
+
+    let mut out_steps = Vec::new();
+    for (idx, step) in steps.iter().enumerate() {
+        let tpl = find_template(&step.template_id)
+            .ok_or_else(|| format!("unknown template id: {}", step.template_id))?;
+        if !tpl.wired {
+            return Err(format!("template not wired: {}", tpl.id));
+        }
+        let _ = build_template_args(&step.template_id, &canonical, &step.params)?;
+
+        out_steps.push(PipelineStep {
+            step_id: sanitize_step_id(&step.template_id, idx),
+            template_id: step.template_id.clone(),
+            params: step.params.clone(),
+            job_id: None,
+            status: PipelineStepStatus::Pending,
+            run_id: None,
+            started_at: None,
+            finished_at: None,
+        });
+    }
+
+    let pipeline_id = make_pipeline_id();
+    let now = now_epoch_ms_string();
+    pipelines.push(PipelineRecord {
+        pipeline_id: pipeline_id.clone(),
+        canonical_id: canonical,
+        name: if name.trim().is_empty() {
+            "Analyze Paper".to_string()
+        } else {
+            name.trim().to_string()
+        },
+        created_at: now.clone(),
+        updated_at: now,
+        steps: out_steps,
+        current_step_index: 0,
+        status: PipelineStatus::Running,
+        last_primary_viz: None,
+    });
+    save_pipelines_to_file(&pipelines_path, &pipelines)?;
+
+    let _ = reconcile_pipelines_with_jobs(&runtime.out_base_dir, &state, &jobs_path, None)?;
+    start_job_worker_if_needed()?;
+    Ok(pipeline_id)
+}
+
+#[tauri::command]
+fn list_pipelines(filters: Option<PipelineListFilter>) -> Result<Vec<PipelineSummary>, String> {
+    let (state, jobs_path) = init_job_runtime()?;
+    let (runtime, _) = runtime_and_jobs_path()?;
+    let pipelines = reconcile_pipelines_with_jobs(&runtime.out_base_dir, &state, &jobs_path, None)?;
+
+    let f = filters.unwrap_or_default();
+    let q = f.query.unwrap_or_default().to_lowercase();
+    let status = f.status.unwrap_or_default().to_lowercase();
+
+    let mut out = Vec::new();
+    for p in pipelines {
+        if !q.is_empty() {
+            let hay = format!("{} {} {}", p.pipeline_id, p.name, p.canonical_id).to_lowercase();
+            if !hay.contains(&q) {
+                continue;
+            }
+        }
+        if !status.is_empty() && format!("{:?}", p.status).to_lowercase() != status {
+            continue;
+        }
+        out.push(PipelineSummary {
+            pipeline_id: p.pipeline_id,
+            canonical_id: p.canonical_id,
+            name: p.name,
+            status: p.status,
+            current_step_index: p.current_step_index,
+            total_steps: p.steps.len(),
+            updated_at: p.updated_at,
+            last_primary_viz: p.last_primary_viz,
+        });
+    }
+
+    out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then_with(|| a.pipeline_id.cmp(&b.pipeline_id)));
+    Ok(out)
+}
+
+#[tauri::command]
+fn get_pipeline(pipeline_id: String) -> Result<PipelineRecord, String> {
+    let (state, jobs_path) = init_job_runtime()?;
+    let (runtime, _) = runtime_and_jobs_path()?;
+    let pipelines = reconcile_pipelines_with_jobs(&runtime.out_base_dir, &state, &jobs_path, None)?;
+    pipelines
+        .into_iter()
+        .find(|p| p.pipeline_id == pipeline_id)
+        .ok_or_else(|| format!("pipeline not found: {pipeline_id}"))
+}
+
+#[tauri::command]
+fn start_pipeline(pipeline_id: String) -> Result<PipelineRecord, String> {
+    let (state, jobs_path) = init_job_runtime()?;
+    let (runtime, _) = runtime_and_jobs_path()?;
+    let pipelines_path = pipelines_file_path(&runtime.out_base_dir);
+    let mut pipelines = load_pipelines_from_file(&pipelines_path)?;
+    let idx = pipelines
+        .iter()
+        .position(|p| p.pipeline_id == pipeline_id)
+        .ok_or_else(|| format!("pipeline not found: {pipeline_id}"))?;
+    pipelines[idx].status = PipelineStatus::Running;
+    pipelines[idx].updated_at = now_epoch_ms_string();
+    save_pipelines_to_file(&pipelines_path, &pipelines)?;
+
+    let pipelines = reconcile_pipelines_with_jobs(&runtime.out_base_dir, &state, &jobs_path, None)?;
+    start_job_worker_if_needed()?;
+    pipelines
+        .into_iter()
+        .find(|p| p.pipeline_id == pipeline_id)
+        .ok_or_else(|| format!("pipeline not found after start: {pipeline_id}"))
+}
+
+#[tauri::command]
+fn cancel_pipeline(pipeline_id: String) -> Result<PipelineRecord, String> {
+    let (state, jobs_path) = init_job_runtime()?;
+    let (runtime, _) = runtime_and_jobs_path()?;
+    let pipelines_path = pipelines_file_path(&runtime.out_base_dir);
+    let mut pipelines = load_pipelines_from_file(&pipelines_path)?;
+    let idx = pipelines
+        .iter()
+        .position(|p| p.pipeline_id == pipeline_id)
+        .ok_or_else(|| format!("pipeline not found: {pipeline_id}"))?;
+
+    let current_idx = pipelines[idx].current_step_index;
+    if current_idx < pipelines[idx].steps.len() {
+        let step = &mut pipelines[idx].steps[current_idx];
+        if let Some(job_id) = step.job_id.clone() {
+            let _ = cancel_job(job_id);
+        }
+        if !is_pipeline_step_terminal(&step.status) {
+            step.status = PipelineStepStatus::Canceled;
+            step.finished_at = Some(now_epoch_ms_string());
+        }
+    }
+    pipelines[idx].status = PipelineStatus::Canceled;
+    pipelines[idx].updated_at = now_epoch_ms_string();
+    save_pipelines_to_file(&pipelines_path, &pipelines)?;
+
+    let pipelines = reconcile_pipelines_with_jobs(&runtime.out_base_dir, &state, &jobs_path, None)?;
+    pipelines
+        .into_iter()
+        .find(|p| p.pipeline_id == pipeline_id)
+        .ok_or_else(|| format!("pipeline not found after cancel: {pipeline_id}"))
+}
+
+#[tauri::command]
+fn retry_pipeline_step(
+    pipeline_id: String,
+    step_id: String,
+    force: Option<bool>,
+) -> Result<PipelineRecord, String> {
+    let _force = force.unwrap_or(false);
+    let (state, jobs_path) = init_job_runtime()?;
+    let (runtime, _) = runtime_and_jobs_path()?;
+    let pipelines_path = pipelines_file_path(&runtime.out_base_dir);
+    let mut pipelines = load_pipelines_from_file(&pipelines_path)?;
+    let pidx = pipelines
+        .iter()
+        .position(|p| p.pipeline_id == pipeline_id)
+        .ok_or_else(|| format!("pipeline not found: {pipeline_id}"))?;
+    let sidx = pipelines[pidx]
+        .steps
+        .iter()
+        .position(|s| s.step_id == step_id)
+        .ok_or_else(|| format!("step not found: {step_id}"))?;
+
+    let step_status = pipelines[pidx].steps[sidx].status.clone();
+    if !(step_status == PipelineStepStatus::Failed
+        || step_status == PipelineStepStatus::NeedsRetry
+        || step_status == PipelineStepStatus::Canceled
+        || _force)
+    {
+        return Err("step is not retryable".to_string());
+    }
+
+    for later in (sidx + 1)..pipelines[pidx].steps.len() {
+        pipelines[pidx].steps[later].job_id = None;
+        pipelines[pidx].steps[later].status = PipelineStepStatus::Pending;
+        pipelines[pidx].steps[later].run_id = None;
+        pipelines[pidx].steps[later].started_at = None;
+        pipelines[pidx].steps[later].finished_at = None;
+    }
+
+    pipelines[pidx].steps[sidx].job_id = None;
+    pipelines[pidx].steps[sidx].status = PipelineStepStatus::Pending;
+    pipelines[pidx].steps[sidx].run_id = None;
+    pipelines[pidx].steps[sidx].started_at = None;
+    pipelines[pidx].steps[sidx].finished_at = None;
+    pipelines[pidx].current_step_index = sidx;
+    pipelines[pidx].status = PipelineStatus::Running;
+    pipelines[pidx].updated_at = now_epoch_ms_string();
+    save_pipelines_to_file(&pipelines_path, &pipelines)?;
+
+    let pipelines = reconcile_pipelines_with_jobs(&runtime.out_base_dir, &state, &jobs_path, None)?;
+    start_job_worker_if_needed()?;
+    pipelines
+        .into_iter()
+        .find(|p| p.pipeline_id == pipeline_id)
+        .ok_or_else(|| format!("pipeline not found after retry: {pipeline_id}"))
 }
 
 #[tauri::command]
@@ -4286,8 +4820,22 @@ fn create_config_if_missing() -> Result<String, String> {
     Ok(path.to_string_lossy().to_string())
 }
 
+fn resume_pipelines_if_possible() {
+    let (runtime, _) = match runtime_and_jobs_path() {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let (state, jobs_path) = match init_job_runtime() {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let _ = reconcile_pipelines_with_jobs(&runtime.out_base_dir, &state, &jobs_path, None);
+    let _ = start_job_worker_if_needed();
+}
+
 fn main() {
     let _ = start_job_worker_if_needed();
+    resume_pipelines_if_possible();
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             run_papers_tree,
@@ -4296,6 +4844,12 @@ fn main() {
             list_jobs,
             cancel_job,
             retry_job,
+            create_pipeline,
+            list_pipelines,
+            get_pipeline,
+            start_pipeline,
+            cancel_pipeline,
+            retry_pipeline_step,
             clear_finished_jobs,
             library_reindex,
             library_reload,
@@ -4973,5 +5527,270 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w.contains("fallback summary mode")));
+    }
+
+    #[test]
+    fn pipeline_persistence_roundtrip() {
+        let out_dir = std::env::temp_dir().join(format!("jarvis_pipe_rt_{}", now_epoch_ms()));
+        let _ = fs::create_dir_all(out_dir.join(".jarvis-desktop"));
+        let path = pipelines_file_path(&out_dir);
+
+        let data = vec![PipelineRecord {
+            pipeline_id: "pipe_1".to_string(),
+            canonical_id: "arxiv:1706.03762".to_string(),
+            name: "Analyze Paper".to_string(),
+            created_at: now_epoch_ms_string(),
+            updated_at: now_epoch_ms_string(),
+            steps: vec![PipelineStep {
+                step_id: "step_01_template_tree".to_string(),
+                template_id: "TEMPLATE_TREE".to_string(),
+                params: serde_json::json!({"depth": 1, "max_per_level": 5}),
+                job_id: None,
+                status: PipelineStepStatus::Pending,
+                run_id: None,
+                started_at: None,
+                finished_at: None,
+            }],
+            current_step_index: 0,
+            status: PipelineStatus::Running,
+            last_primary_viz: None,
+        }];
+
+        save_pipelines_to_file(&path, &data).expect("save pipelines");
+        let loaded = load_pipelines_from_file(&path).expect("load pipelines");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].pipeline_id, "pipe_1");
+        assert_eq!(loaded[0].steps[0].template_id, "TEMPLATE_TREE");
+
+        let _ = fs::remove_dir_all(&out_dir);
+    }
+
+    #[test]
+    fn pipeline_transition_success_enqueues_next_step() {
+        let out_dir = std::env::temp_dir().join(format!("jarvis_pipe_success_{}", now_epoch_ms()));
+        let _ = fs::create_dir_all(out_dir.join(".jarvis-desktop"));
+        let state = Arc::new(Mutex::new(JobRuntimeState::default()));
+        let jobs_path = jobs_file_path(&out_dir);
+        save_jobs_to_file(&jobs_path, &[]).expect("save empty jobs");
+
+        let pipeline = PipelineRecord {
+            pipeline_id: "pipe_a".to_string(),
+            canonical_id: "arxiv:1706.03762".to_string(),
+            name: "Analyze".to_string(),
+            created_at: now_epoch_ms_string(),
+            updated_at: now_epoch_ms_string(),
+            steps: vec![
+                PipelineStep {
+                    step_id: "step_01_template_tree".to_string(),
+                    template_id: "TEMPLATE_TREE".to_string(),
+                    params: serde_json::json!({"depth": 1, "max_per_level": 5}),
+                    job_id: None,
+                    status: PipelineStepStatus::Pending,
+                    run_id: None,
+                    started_at: None,
+                    finished_at: None,
+                },
+                PipelineStep {
+                    step_id: "step_02_template_related".to_string(),
+                    template_id: "TEMPLATE_RELATED".to_string(),
+                    params: serde_json::json!({"depth": 1, "max_per_level": 20}),
+                    job_id: None,
+                    status: PipelineStepStatus::Pending,
+                    run_id: None,
+                    started_at: None,
+                    finished_at: None,
+                },
+            ],
+            current_step_index: 0,
+            status: PipelineStatus::Running,
+            last_primary_viz: None,
+        };
+        save_pipelines_to_file(&pipelines_file_path(&out_dir), &[pipeline]).expect("save pipeline");
+
+        let first = reconcile_pipelines_with_jobs(&out_dir, &state, &jobs_path, None).expect("reconcile first");
+        let first_job_id = first[0].steps[0].job_id.clone().expect("step1 job id");
+        let mut jobs = load_jobs_from_file(&jobs_path).expect("load jobs after first reconcile");
+        assert_eq!(jobs.len(), 1);
+        jobs[0].status = JobStatus::Succeeded;
+        jobs[0].run_id = Some("run_success_step1".to_string());
+        save_jobs_to_file(&jobs_path, &jobs).expect("save succeeded job");
+
+        let second = reconcile_pipelines_with_jobs(&out_dir, &state, &jobs_path, Some(&first_job_id))
+            .expect("reconcile second");
+        assert_eq!(second[0].steps[0].status, PipelineStepStatus::Succeeded);
+        assert_eq!(second[0].current_step_index, 1);
+        assert_eq!(second[0].steps[1].status, PipelineStepStatus::Running);
+        assert!(second[0].steps[1].job_id.is_some());
+
+        let _ = fs::remove_dir_all(&out_dir);
+    }
+
+    #[test]
+    fn pipeline_needs_retry_stops_without_continuation() {
+        let out_dir = std::env::temp_dir().join(format!("jarvis_pipe_retry_{}", now_epoch_ms()));
+        let _ = fs::create_dir_all(out_dir.join(".jarvis-desktop"));
+        let state = Arc::new(Mutex::new(JobRuntimeState::default()));
+        let jobs_path = jobs_file_path(&out_dir);
+
+        let job_id = "job_retry_1".to_string();
+        save_jobs_to_file(
+            &jobs_path,
+            &[JobRecord {
+                job_id: job_id.clone(),
+                template_id: "TEMPLATE_TREE".to_string(),
+                canonical_id: "arxiv:1706.03762".to_string(),
+                params: serde_json::json!({"depth": 1, "max_per_level": 5}),
+                status: JobStatus::NeedsRetry,
+                attempt: 1,
+                created_at: now_epoch_ms_string(),
+                updated_at: now_epoch_ms_string(),
+                run_id: Some("run_retry_step1".to_string()),
+                last_error: Some("429".to_string()),
+                retry_after_seconds: Some(3.0),
+                retry_at: Some((now_epoch_ms() + 3000).to_string()),
+            }],
+        )
+        .expect("save jobs");
+
+        let pipeline = PipelineRecord {
+            pipeline_id: "pipe_b".to_string(),
+            canonical_id: "arxiv:1706.03762".to_string(),
+            name: "Analyze".to_string(),
+            created_at: now_epoch_ms_string(),
+            updated_at: now_epoch_ms_string(),
+            steps: vec![
+                PipelineStep {
+                    step_id: "step_01_template_tree".to_string(),
+                    template_id: "TEMPLATE_TREE".to_string(),
+                    params: serde_json::json!({"depth": 1, "max_per_level": 5}),
+                    job_id: Some(job_id.clone()),
+                    status: PipelineStepStatus::Running,
+                    run_id: None,
+                    started_at: Some(now_epoch_ms_string()),
+                    finished_at: None,
+                },
+                PipelineStep {
+                    step_id: "step_02_template_graph".to_string(),
+                    template_id: "TEMPLATE_GRAPH".to_string(),
+                    params: serde_json::json!({"k": 40, "seed": 42}),
+                    job_id: None,
+                    status: PipelineStepStatus::Pending,
+                    run_id: None,
+                    started_at: None,
+                    finished_at: None,
+                },
+            ],
+            current_step_index: 0,
+            status: PipelineStatus::Running,
+            last_primary_viz: None,
+        };
+        save_pipelines_to_file(&pipelines_file_path(&out_dir), &[pipeline]).expect("save pipeline");
+
+        let rows = reconcile_pipelines_with_jobs(&out_dir, &state, &jobs_path, Some(&job_id))
+            .expect("reconcile needs_retry");
+        assert_eq!(rows[0].status, PipelineStatus::NeedsRetry);
+        assert_eq!(rows[0].steps[0].status, PipelineStepStatus::NeedsRetry);
+        assert_eq!(rows[0].steps[1].status, PipelineStepStatus::Pending);
+        assert!(rows[0].steps[1].job_id.is_none());
+
+        let _ = fs::remove_dir_all(&out_dir);
+    }
+
+    #[test]
+    fn pipeline_restart_resume_does_not_duplicate_enqueue() {
+        let out_dir = std::env::temp_dir().join(format!("jarvis_pipe_resume_{}", now_epoch_ms()));
+        let _ = fs::create_dir_all(out_dir.join(".jarvis-desktop"));
+        let state = Arc::new(Mutex::new(JobRuntimeState::default()));
+        let jobs_path = jobs_file_path(&out_dir);
+        save_jobs_to_file(&jobs_path, &[]).expect("save empty jobs");
+
+        let pipeline = PipelineRecord {
+            pipeline_id: "pipe_c".to_string(),
+            canonical_id: "arxiv:1706.03762".to_string(),
+            name: "Analyze".to_string(),
+            created_at: now_epoch_ms_string(),
+            updated_at: now_epoch_ms_string(),
+            steps: vec![PipelineStep {
+                step_id: "step_01_template_tree".to_string(),
+                template_id: "TEMPLATE_TREE".to_string(),
+                params: serde_json::json!({"depth": 1, "max_per_level": 5}),
+                job_id: None,
+                status: PipelineStepStatus::Pending,
+                run_id: None,
+                started_at: None,
+                finished_at: None,
+            }],
+            current_step_index: 0,
+            status: PipelineStatus::Running,
+            last_primary_viz: None,
+        };
+        save_pipelines_to_file(&pipelines_file_path(&out_dir), &[pipeline]).expect("save pipeline");
+
+        let _ = reconcile_pipelines_with_jobs(&out_dir, &state, &jobs_path, None).expect("first resume");
+        let jobs_first = load_jobs_from_file(&jobs_path).expect("load jobs after first");
+        assert_eq!(jobs_first.len(), 1);
+
+        let _ = reconcile_pipelines_with_jobs(&out_dir, &state, &jobs_path, None).expect("second resume");
+        let jobs_second = load_jobs_from_file(&jobs_path).expect("load jobs after second");
+        assert_eq!(jobs_second.len(), 1);
+
+        let _ = fs::remove_dir_all(&out_dir);
+    }
+
+    #[test]
+    fn pipeline_cancellation_propagates_correctly() {
+        let out_dir = std::env::temp_dir().join(format!("jarvis_pipe_cancel_{}", now_epoch_ms()));
+        let _ = fs::create_dir_all(out_dir.join(".jarvis-desktop"));
+        let state = Arc::new(Mutex::new(JobRuntimeState::default()));
+        let jobs_path = jobs_file_path(&out_dir);
+
+        let job_id = "job_cancel_1".to_string();
+        save_jobs_to_file(
+            &jobs_path,
+            &[JobRecord {
+                job_id: job_id.clone(),
+                template_id: "TEMPLATE_TREE".to_string(),
+                canonical_id: "arxiv:1706.03762".to_string(),
+                params: serde_json::json!({"depth": 1, "max_per_level": 5}),
+                status: JobStatus::Canceled,
+                attempt: 1,
+                created_at: now_epoch_ms_string(),
+                updated_at: now_epoch_ms_string(),
+                run_id: None,
+                last_error: Some("canceled".to_string()),
+                retry_after_seconds: None,
+                retry_at: None,
+            }],
+        )
+        .expect("save canceled job");
+
+        let pipeline = PipelineRecord {
+            pipeline_id: "pipe_d".to_string(),
+            canonical_id: "arxiv:1706.03762".to_string(),
+            name: "Analyze".to_string(),
+            created_at: now_epoch_ms_string(),
+            updated_at: now_epoch_ms_string(),
+            steps: vec![PipelineStep {
+                step_id: "step_01_template_tree".to_string(),
+                template_id: "TEMPLATE_TREE".to_string(),
+                params: serde_json::json!({"depth": 1, "max_per_level": 5}),
+                job_id: Some(job_id.clone()),
+                status: PipelineStepStatus::Running,
+                run_id: None,
+                started_at: Some(now_epoch_ms_string()),
+                finished_at: None,
+            }],
+            current_step_index: 0,
+            status: PipelineStatus::Running,
+            last_primary_viz: None,
+        };
+        save_pipelines_to_file(&pipelines_file_path(&out_dir), &[pipeline]).expect("save pipeline");
+
+        let rows = reconcile_pipelines_with_jobs(&out_dir, &state, &jobs_path, Some(&job_id))
+            .expect("reconcile cancel");
+        assert_eq!(rows[0].status, PipelineStatus::Canceled);
+        assert_eq!(rows[0].steps[0].status, PipelineStepStatus::Canceled);
+
+        let _ = fs::remove_dir_all(&out_dir);
     }
 }

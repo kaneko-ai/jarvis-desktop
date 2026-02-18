@@ -124,6 +124,27 @@ function toCanonicalLibraryQuery(node) {
   return candidates[0] ?? "";
 }
 
+function buildAnalyzePipelineSteps() {
+  return [
+    {
+      template_id: "TEMPLATE_TREE",
+      params: { depth: 2, max_per_level: 50 },
+    },
+    {
+      template_id: "TEMPLATE_RELATED",
+      params: { depth: 1, max_per_level: 30 },
+    },
+    {
+      template_id: "TEMPLATE_GRAPH",
+      params: { k: 40, seed: 42 },
+    },
+    {
+      template_id: "TEMPLATE_MAP",
+      params: { k: 24, seed: 42 },
+    },
+  ];
+}
+
 export default function App() {
   const [paperId, setPaperId] = useState("arxiv:1706.03762");
   const [templates, setTemplates] = useState([]);
@@ -178,6 +199,12 @@ export default function App() {
   const [jobsLoading, setJobsLoading] = useState(false);
   const [jobsError, setJobsError] = useState("");
   const [selectedJobId, setSelectedJobId] = useState("");
+  const [pipelines, setPipelines] = useState([]);
+  const [pipelinesLoading, setPipelinesLoading] = useState(false);
+  const [pipelinesError, setPipelinesError] = useState("");
+  const [selectedPipelineId, setSelectedPipelineId] = useState("");
+  const [pipelineDetail, setPipelineDetail] = useState(null);
+  const [pipelineDetailLoading, setPipelineDetailLoading] = useState(false);
   const [libraryRows, setLibraryRows] = useState([]);
   const [libraryLoading, setLibraryLoading] = useState(false);
   const [libraryError, setLibraryError] = useState("");
@@ -287,6 +314,87 @@ export default function App() {
       setJobs([]);
     } finally {
       setJobsLoading(false);
+    }
+  }
+
+  async function loadPipelines() {
+    setPipelinesLoading(true);
+    setPipelinesError("");
+    try {
+      const rows = await invoke("list_pipelines", {});
+      const list = Array.isArray(rows) ? rows : [];
+      setPipelines(list);
+      setSelectedPipelineId((prev) => {
+        if (prev && list.some((p) => p.pipeline_id === prev)) return prev;
+        return list[0]?.pipeline_id ?? "";
+      });
+    } catch (e) {
+      setPipelines([]);
+      setPipelinesError(String(e));
+    } finally {
+      setPipelinesLoading(false);
+    }
+  }
+
+  async function loadPipelineDetail(pipelineId) {
+    if (!pipelineId) {
+      setPipelineDetail(null);
+      return;
+    }
+    setPipelineDetailLoading(true);
+    try {
+      const detail = await invoke("get_pipeline", { pipelineId });
+      setPipelineDetail(detail ?? null);
+    } catch (e) {
+      setPipelineDetail(null);
+      setPipelinesError(String(e));
+    } finally {
+      setPipelineDetailLoading(false);
+    }
+  }
+
+  async function onRunAnalyzePipeline() {
+    const idForRun = normalized?.canonical?.trim() ? normalized.canonical : paperId;
+    try {
+      const pipelineId = await invoke("create_pipeline", {
+        name: "Analyze Paper",
+        canonicalId: idForRun,
+        steps: buildAnalyzePipelineSteps(),
+      });
+      await invoke("start_pipeline", { pipelineId });
+      await loadPipelines();
+      await loadJobs();
+      setSelectedPipelineId(pipelineId);
+    } catch (e) {
+      alert(String(e));
+    }
+  }
+
+  async function onCancelPipeline(pipelineId) {
+    if (!pipelineId) return;
+    try {
+      await invoke("cancel_pipeline", { pipelineId });
+      await loadPipelines();
+      await loadPipelineDetail(pipelineId);
+      await loadJobs();
+    } catch (e) {
+      alert(String(e));
+    }
+  }
+
+  async function onRetryPipelineStep(pipelineId, stepId, force = false) {
+    if (!pipelineId || !stepId) return;
+    try {
+      await invoke("retry_pipeline_step", {
+        pipelineId,
+        stepId,
+        force,
+      });
+      await loadPipelines();
+      await loadPipelineDetail(pipelineId);
+      await loadJobs();
+    } catch (e) {
+      alert(String(e));
     }
   }
 
@@ -632,6 +740,7 @@ export default function App() {
     loadTemplates();
     loadRuns();
     loadJobs();
+    loadPipelines();
     loadLibraryRows();
     loadLibraryStats();
   }, []);
@@ -639,9 +748,14 @@ export default function App() {
   useEffect(() => {
     const timer = setInterval(() => {
       loadJobs();
+      loadPipelines();
     }, 1500);
     return () => clearInterval(timer);
   }, []);
+
+  useEffect(() => {
+    loadPipelineDetail(selectedPipelineId);
+  }, [selectedPipelineId]);
 
   useEffect(() => {
     loadLibraryDetail(selectedPaperKey);
@@ -881,6 +995,10 @@ export default function App() {
     ? new Date(selectedRun.created_at_epoch_ms).toLocaleString()
     : "-";
   const selectedJob = jobs.find((j) => j.job_id === selectedJobId) ?? null;
+  const selectedPipelineSummary = pipelines.find((p) => p.pipeline_id === selectedPipelineId) ?? null;
+  const selectedPipeline = pipelineDetail && pipelineDetail.pipeline_id === selectedPipelineId
+    ? pipelineDetail
+    : null;
   const isLibrarySearchMode = String(librarySearchQuery ?? "").trim() !== "";
   const visibleLibraryRows = isLibrarySearchMode ? librarySearchRows : libraryRows;
   const artifactKind = artifactView?.kind ?? "";
@@ -1418,6 +1536,139 @@ export default function App() {
               Open run detail
             </button>
           </div>
+        </div>
+      </div>
+
+      <hr style={{ margin: "18px 0" }} />
+      <h3 style={{ marginBottom: 8 }}>Pipelines</h3>
+      <div style={{ display: "flex", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
+        <button
+          onClick={onRunAnalyzePipeline}
+          disabled={!canRunByNormalization || !canRunByPreflight}
+          style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+        >
+          Run Pipeline: Analyze Paper
+        </button>
+        <button
+          onClick={loadPipelines}
+          disabled={pipelinesLoading}
+          style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+        >
+          {pipelinesLoading ? "Refreshing..." : "Refresh pipelines"}
+        </button>
+      </div>
+      {pipelinesError ? <div style={{ color: "#a33", fontSize: 12, marginBottom: 8 }}>{pipelinesError}</div> : null}
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 2fr", gap: 12, marginBottom: 12 }}>
+        <div style={{ border: "1px solid #ddd", borderRadius: 8, maxHeight: 260, overflow: "auto" }}>
+          {pipelines.length === 0 ? (
+            <div style={{ padding: 10, fontSize: 12, opacity: 0.8 }}>No pipelines.</div>
+          ) : (
+            pipelines.map((p) => (
+              <button
+                key={p.pipeline_id}
+                onClick={() => setSelectedPipelineId(p.pipeline_id)}
+                style={{
+                  width: "100%",
+                  textAlign: "left",
+                  padding: 10,
+                  border: "none",
+                  borderBottom: "1px solid #eee",
+                  background: p.pipeline_id === selectedPipelineId ? "#eef5ff" : "white",
+                  cursor: "pointer",
+                }}
+              >
+                <div style={{ fontSize: 12, fontWeight: 600 }}>{p.name}</div>
+                <div style={{ fontSize: 11, opacity: 0.85 }}>status={p.status} step={Math.min((p.current_step_index ?? 0) + 1, p.total_steps ?? 0)}/{p.total_steps}</div>
+                <div style={{ fontSize: 11, opacity: 0.75 }}>{p.canonical_id}</div>
+                <div style={{ fontSize: 11, opacity: 0.75 }}>updated_at={p.updated_at}</div>
+              </button>
+            ))
+          )}
+        </div>
+
+        <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: 10 }}>
+          <div style={{ fontSize: 12, marginBottom: 4 }}>pipeline_id: <code>{selectedPipeline?.pipeline_id ?? selectedPipelineSummary?.pipeline_id ?? "-"}</code></div>
+          <div style={{ fontSize: 12, marginBottom: 4 }}>canonical_id: <code>{selectedPipeline?.canonical_id ?? selectedPipelineSummary?.canonical_id ?? "-"}</code></div>
+          <div style={{ fontSize: 12, marginBottom: 8 }}>status: <code>{selectedPipeline?.status ?? selectedPipelineSummary?.status ?? "-"}</code></div>
+          {pipelineDetailLoading ? <div style={{ fontSize: 12, marginBottom: 6 }}>Loading pipeline...</div> : null}
+
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
+            <button
+              onClick={() => onCancelPipeline(selectedPipelineId)}
+              disabled={!selectedPipelineId || !selectedPipeline || selectedPipeline.status !== "running"}
+              style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+            >
+              Cancel pipeline
+            </button>
+            <button
+              onClick={() => {
+                const q = String(selectedPipeline?.canonical_id ?? "").trim();
+                if (!q) return;
+                setLibrarySearchQuery(q);
+              }}
+              disabled={!selectedPipeline?.canonical_id}
+              style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+            >
+              Search in Library
+            </button>
+          </div>
+
+          {(selectedPipeline?.status === "succeeded" && selectedPipeline?.last_primary_viz) ? (
+            <div style={{ border: "1px solid #eee", borderRadius: 6, padding: 8, marginBottom: 8, background: "#fafafa" }}>
+              <div style={{ fontSize: 12, marginBottom: 6 }}>
+                final primary_viz: <code>{selectedPipeline.last_primary_viz.kind}:{selectedPipeline.last_primary_viz.name}</code>
+              </div>
+              <button
+                onClick={() => {
+                  const steps = Array.isArray(selectedPipeline?.steps) ? selectedPipeline.steps : [];
+                  const withRun = [...steps].reverse().find((s) => s?.run_id);
+                  if (withRun?.run_id && selectedPipeline?.last_primary_viz?.name) {
+                    onOpenNamedArtifactForRun(withRun.run_id, selectedPipeline.last_primary_viz.name);
+                  }
+                }}
+                style={{ padding: "6px 10px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+              >
+                Open final visualization
+              </button>
+            </div>
+          ) : null}
+
+          <details open>
+            <summary style={{ fontSize: 12, cursor: "pointer" }}>Steps</summary>
+            <div style={{ marginTop: 8, display: "grid", gap: 6 }}>
+              {(selectedPipeline?.steps ?? []).map((s) => (
+                <div key={s.step_id} style={{ border: "1px solid #eee", borderRadius: 6, padding: 8 }}>
+                  <div style={{ fontSize: 12, fontWeight: 600 }}>{s.step_id} ({s.template_id})</div>
+                  <div style={{ fontSize: 11 }}>status=<code>{s.status}</code> job_id=<code>{s.job_id ?? "-"}</code></div>
+                  <div style={{ fontSize: 11, opacity: 0.8 }}>started_at={s.started_at ?? "-"} finished_at={s.finished_at ?? "-"}</div>
+                  <div style={{ marginTop: 6, display: "flex", gap: 6, flexWrap: "wrap" }}>
+                    <button
+                      onClick={() => onOpenRunFromLibrary(s.run_id)}
+                      disabled={!s.run_id}
+                      style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+                    >
+                      Open run detail
+                    </button>
+                    <button
+                      onClick={() => onRetryPipelineStep(selectedPipeline.pipeline_id, s.step_id, false)}
+                      disabled={!(s.status === "failed" || s.status === "needs_retry" || s.status === "canceled")}
+                      style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+                    >
+                      Retry step
+                    </button>
+                    <button
+                      onClick={() => onRetryPipelineStep(selectedPipeline.pipeline_id, s.step_id, true)}
+                      disabled={!selectedPipeline?.pipeline_id}
+                      style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+                    >
+                      Retry step (force)
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </details>
         </div>
       </div>
 
