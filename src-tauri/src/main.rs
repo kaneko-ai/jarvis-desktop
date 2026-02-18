@@ -102,6 +102,12 @@ struct ArtifactItem {
     mtime_iso: Option<String>,
 }
 
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+struct PrimaryVizRef {
+    name: String,
+    kind: String,
+}
+
 #[derive(Serialize)]
 struct NamedArtifactView {
     kind: String,
@@ -115,6 +121,40 @@ struct ArtifactSpec {
     name: &'static str,
     rel_path: &'static str,
     legacy_key: &'static str,
+}
+
+#[derive(Serialize, Clone)]
+struct GraphNodeNormalized {
+    id: String,
+    label: Option<String>,
+    node_type: Option<String>,
+    year: Option<i32>,
+    score: Option<f64>,
+    raw: serde_json::Value,
+}
+
+#[derive(Serialize, Clone)]
+struct GraphEdgeNormalized {
+    source: String,
+    target: String,
+    edge_type: Option<String>,
+    weight: Option<f64>,
+    raw: serde_json::Value,
+}
+
+#[derive(Serialize, Clone)]
+struct GraphParseStats {
+    nodes_count: usize,
+    edges_count: usize,
+    top_level_keys: Vec<String>,
+}
+
+#[derive(Serialize, Clone)]
+struct GraphParseResult {
+    nodes: Vec<GraphNodeNormalized>,
+    edges: Vec<GraphEdgeNormalized>,
+    stats: GraphParseStats,
+    warnings: Vec<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -185,6 +225,7 @@ struct LibraryRunEntry {
     run_id: String,
     template_id: Option<String>,
     status: String,
+    primary_viz: Option<PrimaryVizRef>,
     created_at: String,
     updated_at: String,
 }
@@ -198,6 +239,7 @@ struct LibraryRecord {
     source_kind: Option<String>,
     tags: Vec<String>,
     runs: Vec<LibraryRunEntry>,
+    primary_viz: Option<PrimaryVizRef>,
     last_run_id: Option<String>,
     last_status: String,
     created_at: String,
@@ -217,6 +259,7 @@ struct LibraryRecordSummary {
     canonical_id: Option<String>,
     title: Option<String>,
     source_kind: Option<String>,
+    primary_viz: Option<PrimaryVizRef>,
     last_status: String,
     last_run_id: Option<String>,
     updated_at: String,
@@ -267,6 +310,7 @@ struct LibrarySearchResult {
     canonical_id: Option<String>,
     title: Option<String>,
     tags: Vec<String>,
+    primary_viz: Option<PrimaryVizRef>,
     last_status: String,
     last_run_id: Option<String>,
     score: i64,
@@ -334,18 +378,77 @@ fn template_registry() -> Vec<TaskTemplateDef> {
         TaskTemplateDef {
             id: "TEMPLATE_MAP".to_string(),
             title: "Paper Map".to_string(),
-            description: "Generate paper map (placeholder)".to_string(),
-            wired: false,
-            disabled_reason: "not wired".to_string(),
-            params: vec![],
+            description: "Generate 3D paper map artifacts (graph/json/html)".to_string(),
+            wired: true,
+            disabled_reason: "".to_string(),
+            params: vec![
+                TemplateParamDef {
+                    key: "k".to_string(),
+                    label: "Neighbors (k)".to_string(),
+                    param_type: "integer".to_string(),
+                    default_value: serde_json::json!(24),
+                    min: Some(10),
+                    max: Some(50),
+                },
+                TemplateParamDef {
+                    key: "seed".to_string(),
+                    label: "Random seed".to_string(),
+                    param_type: "integer".to_string(),
+                    default_value: serde_json::json!(42),
+                    min: Some(0),
+                    max: Some(2_147_483_647),
+                },
+            ],
         },
         TaskTemplateDef {
             id: "TEMPLATE_RELATED".to_string(),
             title: "Related Papers".to_string(),
-            description: "Find related papers (placeholder)".to_string(),
-            wired: false,
-            disabled_reason: "not wired".to_string(),
-            params: vec![],
+            description: "Expand related papers as a focused citation tree".to_string(),
+            wired: true,
+            disabled_reason: "".to_string(),
+            params: vec![
+                TemplateParamDef {
+                    key: "depth".to_string(),
+                    label: "Depth".to_string(),
+                    param_type: "integer".to_string(),
+                    default_value: serde_json::json!(1),
+                    min: Some(1),
+                    max: Some(2),
+                },
+                TemplateParamDef {
+                    key: "max_per_level".to_string(),
+                    label: "Max related per level".to_string(),
+                    param_type: "integer".to_string(),
+                    default_value: serde_json::json!(30),
+                    min: Some(1),
+                    max: Some(200),
+                },
+            ],
+        },
+        TaskTemplateDef {
+            id: "TEMPLATE_GRAPH".to_string(),
+            title: "Graph Explorer Seed".to_string(),
+            description: "Generate graph/map artifacts with larger neighborhood".to_string(),
+            wired: true,
+            disabled_reason: "".to_string(),
+            params: vec![
+                TemplateParamDef {
+                    key: "k".to_string(),
+                    label: "Neighbors (k)".to_string(),
+                    param_type: "integer".to_string(),
+                    default_value: serde_json::json!(40),
+                    min: Some(10),
+                    max: Some(50),
+                },
+                TemplateParamDef {
+                    key: "seed".to_string(),
+                    label: "Random seed".to_string(),
+                    param_type: "integer".to_string(),
+                    default_value: serde_json::json!(42),
+                    min: Some(0),
+                    max: Some(2_147_483_647),
+                },
+            ],
         },
         TaskTemplateDef {
             id: "TEMPLATE_SUMMARY".to_string(),
@@ -426,6 +529,81 @@ fn build_template_args(
             let normalized_params = serde_json::json!({
                 "depth": depth,
                 "max_per_level": max_per_level,
+            });
+
+            Ok((argv, normalized_params))
+        }
+        "TEMPLATE_RELATED" => {
+            let normalized = normalize_identifier_internal(canonical_id);
+            let pipeline_id = to_pipeline_identifier(&normalized)
+                .map_err(|e| format!("identifier normalize error: {e}"))?;
+
+            let obj = params.as_object();
+            let depth = json_i64_with_default(
+                obj.and_then(|m| m.get("depth")),
+                1,
+                1,
+                2,
+            )?;
+            let max_per_level = json_i64_with_default(
+                obj.and_then(|m| m.get("max_per_level")),
+                30,
+                1,
+                200,
+            )?;
+
+            let argv = vec![
+                "papers".to_string(),
+                "tree".to_string(),
+                "--id".to_string(),
+                pipeline_id,
+                "--depth".to_string(),
+                depth.to_string(),
+                "--max-per-level".to_string(),
+                max_per_level.to_string(),
+            ];
+
+            let normalized_params = serde_json::json!({
+                "depth": depth,
+                "max_per_level": max_per_level,
+            });
+
+            Ok((argv, normalized_params))
+        }
+        "TEMPLATE_MAP" | "TEMPLATE_GRAPH" => {
+            let normalized = normalize_identifier_internal(canonical_id);
+            let pipeline_id = to_pipeline_identifier(&normalized)
+                .map_err(|e| format!("identifier normalize error: {e}"))?;
+
+            let obj = params.as_object();
+            let default_k = if template_id == "TEMPLATE_GRAPH" { 40 } else { 24 };
+            let k = json_i64_with_default(
+                obj.and_then(|m| m.get("k")),
+                default_k,
+                10,
+                50,
+            )?;
+            let seed = json_i64_with_default(
+                obj.and_then(|m| m.get("seed")),
+                42,
+                0,
+                2_147_483_647,
+            )?;
+
+            let argv = vec![
+                "papers".to_string(),
+                "map3d".to_string(),
+                "--id".to_string(),
+                pipeline_id,
+                "--k".to_string(),
+                k.to_string(),
+                "--seed".to_string(),
+                seed.to_string(),
+            ];
+
+            let normalized_params = serde_json::json!({
+                "k": k,
+                "seed": seed,
             });
 
             Ok((argv, normalized_params))
@@ -982,6 +1160,28 @@ fn parse_known_year(v: &serde_json::Value) -> Option<i32> {
     None
 }
 
+fn parse_primary_viz_from_input(v: &serde_json::Value) -> Option<PrimaryVizRef> {
+    let pv = v
+        .get("desktop")
+        .and_then(|x| x.get("primary_viz"))
+        .and_then(|x| x.as_object())?;
+    let name = pv
+        .get("name")
+        .and_then(|x| x.as_str())
+        .map(|s| s.trim().to_string())?;
+    if name.is_empty() {
+        return None;
+    }
+    let kind = pv
+        .get("kind")
+        .and_then(|x| x.as_str())
+        .map(|s| s.trim().to_lowercase())?;
+    if kind != "html" && kind != "graph_json" {
+        return None;
+    }
+    Some(PrimaryVizRef { name, kind })
+}
+
 fn extract_run_for_library(run_dir: &Path) -> Option<(String, LibraryRunEntry, Option<String>, Option<String>, Option<i32>)> {
     let run_id = run_dir.file_name()?.to_string_lossy().to_string();
     let meta = fs::metadata(run_dir).ok()?;
@@ -1002,6 +1202,7 @@ fn extract_run_for_library(run_dir: &Path) -> Option<(String, LibraryRunEntry, O
 
     let mut canonical_id: Option<String> = None;
     let mut template_id: Option<String> = None;
+    let mut primary_viz: Option<PrimaryVizRef> = None;
     let mut title: Option<String> = None;
     let mut year: Option<i32> = None;
 
@@ -1025,6 +1226,9 @@ fn extract_run_for_library(run_dir: &Path) -> Option<(String, LibraryRunEntry, O
                     if !s.trim().is_empty() {
                         template_id = Some(s.trim().to_string());
                     }
+                }
+                if primary_viz.is_none() {
+                    primary_viz = parse_primary_viz_from_input(&v);
                 }
                 if canonical_id.is_none() {
                     for key in ["paper_id", "canonical_id", "id"] {
@@ -1082,6 +1286,7 @@ fn extract_run_for_library(run_dir: &Path) -> Option<(String, LibraryRunEntry, O
         run_id: run_id.clone(),
         template_id,
         status,
+        primary_viz,
         created_at,
         updated_at,
     };
@@ -1121,6 +1326,7 @@ fn build_library_records(out_dir: &Path, existing: &[LibraryRecord]) -> Result<V
             source_kind: canonical_kind(canonical_id.as_deref()),
             tags: existing_tags.get(&paper_key).cloned().unwrap_or_default(),
             runs: Vec::new(),
+            primary_viz: None,
             last_run_id: None,
             last_status: "unknown".to_string(),
             created_at: now.clone(),
@@ -1159,6 +1365,7 @@ fn build_library_records(out_dir: &Path, existing: &[LibraryRecord]) -> Result<V
                 .first()
                 .map(|r| r.updated_at.clone())
                 .unwrap_or_else(|| rec.updated_at.clone());
+            rec.primary_viz = rec.runs.first().and_then(|r| r.primary_viz.clone());
             rec.created_at = rec
                 .runs
                 .iter()
@@ -1189,6 +1396,7 @@ fn upsert_library_run(out_dir: &Path, run_id: &str) -> Result<(), String> {
     if let Some((paper_key, run, canonical_id, title, year)) = extract_run_for_library(&run_dir) {
         let now = Utc::now().to_rfc3339();
         let run_status = run.status.clone();
+        let run_primary_viz = run.primary_viz.clone();
         if let Some(rec) = records.iter_mut().find(|r| r.paper_key == paper_key) {
             rec.runs.push(run);
             rec.runs.sort_by(|a, b| {
@@ -1207,6 +1415,7 @@ fn upsert_library_run(out_dir: &Path, run_id: &str) -> Result<(), String> {
                 .first()
                 .map(|r| r.updated_at.clone())
                 .unwrap_or_else(|| now.clone());
+            rec.primary_viz = rec.runs.first().and_then(|r| r.primary_viz.clone());
             if rec.canonical_id.is_none() {
                 rec.canonical_id = canonical_id.clone();
             }
@@ -1226,6 +1435,7 @@ fn upsert_library_run(out_dir: &Path, run_id: &str) -> Result<(), String> {
                 source_kind: canonical_kind(canonical_id.as_deref()),
                 tags: Vec::new(),
                 runs: vec![run],
+                primary_viz: run_primary_viz,
                 last_run_id: Some(run_id.to_string()),
                 last_status: run_status,
                 created_at: now.clone(),
@@ -2320,6 +2530,7 @@ fn library_list(filters: Option<LibraryListFilter>) -> Result<Vec<LibraryRecordS
             canonical_id: rec.canonical_id,
             title: rec.title,
             source_kind: rec.source_kind,
+            primary_viz: rec.primary_viz,
             last_status: rec.last_status,
             last_run_id: rec.last_run_id,
             updated_at: rec.updated_at,
@@ -2372,6 +2583,7 @@ fn library_search(query: String, opts: Option<LibrarySearchOpts>) -> Result<Vec<
             canonical_id: rec.canonical_id,
             title: rec.title,
             tags: rec.tags,
+            primary_viz: rec.primary_viz,
             last_status: rec.last_status,
             last_run_id: rec.last_run_id,
             score,
@@ -2757,6 +2969,27 @@ fn classify_artifact_kind(path: &Path, name: &str, size_bytes: Option<u64>) -> S
     base
 }
 
+fn select_primary_viz_artifact(items: &[ArtifactItem]) -> Option<PrimaryVizRef> {
+    let mut cands: Vec<&ArtifactItem> = items
+        .iter()
+        .filter(|a| a.kind == "html" || a.kind == "graph_json")
+        .collect();
+
+    cands.sort_by(|a, b| {
+        let pa = if a.kind == "html" { 0 } else { 1 };
+        let pb = if b.kind == "html" { 0 } else { 1 };
+        pa.cmp(&pb)
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.rel_path.cmp(&b.rel_path))
+    });
+
+    let item = cands.first()?;
+    Some(PrimaryVizRef {
+        name: item.name.clone(),
+        kind: item.kind.clone(),
+    })
+}
+
 fn find_ascii_nocase(haystack: &str, needle: &str) -> Option<usize> {
     let h = haystack.as_bytes();
     let n = needle.as_bytes();
@@ -2854,6 +3087,218 @@ fn build_sandboxed_html(raw: &str) -> (String, Vec<String>) {
         without_scripts
     );
     (content, warnings)
+}
+
+fn as_stringish(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) => {
+            let t = s.trim();
+            if t.is_empty() { None } else { Some(t.to_string()) }
+        }
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        serde_json::Value::Object(m) => {
+            for key in ["id", "node_id", "key", "canonical_id"] {
+                if let Some(v) = m.get(key).and_then(as_stringish) {
+                    return Some(v);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn get_first_string_field<'a>(obj: &'a serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(v) = obj.get(*key).and_then(as_stringish) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+fn get_optional_i32_field(obj: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> Option<i32> {
+    for key in keys {
+        if let Some(v) = obj.get(*key) {
+            match v {
+                serde_json::Value::Number(n) => {
+                    if let Some(i) = n.as_i64() {
+                        if (1900..=2200).contains(&(i as i32)) {
+                            return Some(i as i32);
+                        }
+                    }
+                }
+                serde_json::Value::String(s) => {
+                    if let Ok(i) = s.trim().parse::<i32>() {
+                        if (1900..=2200).contains(&i) {
+                            return Some(i);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+fn get_optional_f64_field(obj: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> Option<f64> {
+    for key in keys {
+        if let Some(v) = obj.get(*key) {
+            match v {
+                serde_json::Value::Number(n) => {
+                    if let Some(f) = n.as_f64() {
+                        return Some(f);
+                    }
+                }
+                serde_json::Value::String(s) => {
+                    if let Ok(f) = s.trim().parse::<f64>() {
+                        return Some(f);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+fn extract_graph_arrays<'a>(root: &'a serde_json::Value) -> (Option<&'a Vec<serde_json::Value>>, Option<&'a Vec<serde_json::Value>>, Vec<String>) {
+    let mut warnings = Vec::new();
+
+    if let Some(obj) = root.as_object() {
+        let out_nodes = obj.get("nodes").and_then(|v| v.as_array());
+        let out_edges = obj.get("edges").and_then(|v| v.as_array());
+        if out_nodes.is_some() || out_edges.is_some() {
+            return (out_nodes, out_edges, warnings);
+        }
+
+        for container_key in ["data", "graph"] {
+            if let Some(container) = obj.get(container_key).and_then(|v| v.as_object()) {
+                let out_nodes = container.get("nodes").and_then(|v| v.as_array());
+                let out_edges = container.get("edges").and_then(|v| v.as_array());
+                if out_nodes.is_some() || out_edges.is_some() {
+                    warnings.push(format!("graph arrays detected in nested key `{container_key}`"));
+                    return (out_nodes, out_edges, warnings);
+                }
+            }
+        }
+    }
+
+    warnings.push("graph schema not recognized; fallback summary mode".to_string());
+    (None, None, warnings)
+}
+
+fn parse_graph_json_internal(content: &str) -> Result<GraphParseResult, String> {
+    let root: serde_json::Value = serde_json::from_str(content)
+        .map_err(|e| format!("invalid graph json: {e}"))?;
+
+    let mut top_level_keys = root
+        .as_object()
+        .map(|m| {
+            let mut keys: Vec<String> = m.keys().cloned().collect();
+            keys.sort();
+            keys
+        })
+        .unwrap_or_default();
+    if top_level_keys.is_empty() {
+        top_level_keys = vec!["<non-object-root>".to_string()];
+    }
+
+    let (nodes_raw, edges_raw, mut warnings) = extract_graph_arrays(&root);
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+
+    if let Some(arr) = nodes_raw {
+        for (idx, n) in arr.iter().enumerate() {
+            let (id, label, node_type, year, score) = if let Some(obj) = n.as_object() {
+                let id = get_first_string_field(
+                    obj,
+                    &["id", "node_id", "paper_id", "key", "canonical_id"],
+                )
+                .unwrap_or_else(|| format!("node:{idx}"));
+                let label = get_first_string_field(obj, &["label", "title", "name"]);
+                let node_type = get_first_string_field(obj, &["type", "kind", "node_type"]);
+                let year = get_optional_i32_field(obj, &["year", "publication_year", "published_year"]);
+                let score = get_optional_f64_field(obj, &["score", "weight", "rank"]);
+                (id, label, node_type, year, score)
+            } else {
+                (format!("node:{idx}"), None, None, None, None)
+            };
+
+            nodes.push(GraphNodeNormalized {
+                id,
+                label,
+                node_type,
+                year,
+                score,
+                raw: n.clone(),
+            });
+        }
+    }
+
+    if let Some(arr) = edges_raw {
+        for e in arr {
+            let Some(obj) = e.as_object() else {
+                warnings.push("edge item skipped: expected object".to_string());
+                continue;
+            };
+
+            let source = get_first_string_field(obj, &["source", "from", "src", "u", "tail"]);
+            let target = get_first_string_field(obj, &["target", "to", "dst", "v", "head"]);
+            let (Some(source), Some(target)) = (source, target) else {
+                warnings.push("edge item skipped: missing source/target".to_string());
+                continue;
+            };
+
+            let edge_type = get_first_string_field(obj, &["type", "kind", "edge_type"]);
+            let weight = get_optional_f64_field(obj, &["weight", "score", "value"]);
+            edges.push(GraphEdgeNormalized {
+                source,
+                target,
+                edge_type,
+                weight,
+                raw: e.clone(),
+            });
+        }
+    }
+
+    nodes.sort_by(|a, b| {
+        a.id.cmp(&b.id).then_with(|| {
+            a.label
+                .clone()
+                .unwrap_or_default()
+                .cmp(&b.label.clone().unwrap_or_default())
+        })
+    });
+    edges.sort_by(|a, b| {
+        a.source
+            .cmp(&b.source)
+            .then_with(|| a.target.cmp(&b.target))
+            .then_with(|| {
+                a.edge_type
+                    .clone()
+                    .unwrap_or_default()
+                    .cmp(&b.edge_type.clone().unwrap_or_default())
+            })
+    });
+
+    Ok(GraphParseResult {
+        nodes: nodes.clone(),
+        edges: edges.clone(),
+        stats: GraphParseStats {
+            nodes_count: nodes.len(),
+            edges_count: edges.len(),
+            top_level_keys,
+        },
+        warnings,
+    })
+}
+
+#[tauri::command]
+fn parse_graph_json(content: String) -> Result<GraphParseResult, String> {
+    parse_graph_json_internal(&content)
 }
 
 fn kind_priority(kind: &str) -> i32 {
@@ -3197,15 +3642,9 @@ fn merge_desktop_input_metadata(
     template_id: &str,
     canonical_id: &str,
     params: &serde_json::Value,
+    primary_viz: Option<&PrimaryVizRef>,
 ) -> Result<(), String> {
     let input_path = run_dir.join("input.json");
-    let desktop_meta = serde_json::json!({
-        "template_id": template_id,
-        "canonical_id": canonical_id,
-        "params": params,
-        "created_by": "jarvis-desktop",
-        "version": env!("CARGO_PKG_VERSION"),
-    });
 
     let merged = if input_path.exists() {
         let raw = fs::read_to_string(&input_path)
@@ -3213,22 +3652,69 @@ fn merge_desktop_input_metadata(
         match serde_json::from_str::<serde_json::Value>(&raw) {
             Ok(mut v) => {
                 if let Some(obj) = v.as_object_mut() {
-                    obj.insert("desktop".to_string(), desktop_meta);
+                    let desktop_obj = if let Some(existing) = obj.get_mut("desktop") {
+                        if let Some(d) = existing.as_object_mut() {
+                            d
+                        } else {
+                            *existing = serde_json::json!({});
+                            existing.as_object_mut().expect("desktop converted to object")
+                        }
+                    } else {
+                        obj.insert("desktop".to_string(), serde_json::json!({}));
+                        obj.get_mut("desktop")
+                            .and_then(|x| x.as_object_mut())
+                            .expect("desktop inserted")
+                    };
+
+                    desktop_obj.insert("template_id".to_string(), serde_json::json!(template_id));
+                    desktop_obj.insert("canonical_id".to_string(), serde_json::json!(canonical_id));
+                    desktop_obj.insert("params".to_string(), params.clone());
+                    desktop_obj.insert("created_by".to_string(), serde_json::json!("jarvis-desktop"));
+                    desktop_obj.insert("version".to_string(), serde_json::json!(env!("CARGO_PKG_VERSION")));
+                    if let Some(pv) = primary_viz {
+                        desktop_obj.insert(
+                            "primary_viz".to_string(),
+                            serde_json::json!({ "name": pv.name, "kind": pv.kind }),
+                        );
+                    } else {
+                        desktop_obj.remove("primary_viz");
+                    }
                     v
                 } else {
                     serde_json::json!({
                         "original": v,
-                        "desktop": desktop_meta,
+                        "desktop": {
+                            "template_id": template_id,
+                            "canonical_id": canonical_id,
+                            "params": params,
+                            "created_by": "jarvis-desktop",
+                            "version": env!("CARGO_PKG_VERSION"),
+                            "primary_viz": primary_viz.map(|pv| serde_json::json!({"name": pv.name, "kind": pv.kind})),
+                        },
                     })
                 }
             }
             Err(_) => serde_json::json!({
-                "desktop": desktop_meta,
+                "desktop": {
+                    "template_id": template_id,
+                    "canonical_id": canonical_id,
+                    "params": params,
+                    "created_by": "jarvis-desktop",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "primary_viz": primary_viz.map(|pv| serde_json::json!({"name": pv.name, "kind": pv.kind})),
+                },
             }),
         }
     } else {
         serde_json::json!({
-            "desktop": desktop_meta,
+            "desktop": {
+                "template_id": template_id,
+                "canonical_id": canonical_id,
+                "params": params,
+                "created_by": "jarvis-desktop",
+                "version": env!("CARGO_PKG_VERSION"),
+                "primary_viz": primary_viz.map(|pv| serde_json::json!({"name": pv.name, "kind": pv.kind})),
+            },
         })
     };
 
@@ -3379,11 +3865,15 @@ fn execute_pipeline_task(
     }
 
     if out.status.success() {
+        let primary_viz = list_run_artifacts_internal(&run_dir_abs)
+            .ok()
+            .and_then(|items| select_primary_viz_artifact(&items));
         let _ = merge_desktop_input_metadata(
             &run_dir_abs,
             &template_id,
             &canonical_id,
             &normalized_params,
+            primary_viz.as_ref(),
         );
     }
 
@@ -3820,6 +4310,7 @@ fn main() {
             read_run_artifact,
             list_run_artifacts,
             read_run_artifact_named,
+            parse_graph_json,
             normalize_identifier,
             preflight_check,
             get_runtime_config,
@@ -3977,6 +4468,132 @@ mod tests {
         assert_eq!(argv, expected);
         assert_eq!(normalized_params["depth"], serde_json::json!(1));
         assert_eq!(normalized_params["max_per_level"], serde_json::json!(5));
+    }
+
+    #[test]
+    fn template_build_args_for_map_related_graph_are_deterministic() {
+        let related_params = serde_json::json!({ "depth": 2, "max_per_level": 12 });
+        let (related_argv, related_normalized) =
+            build_template_args("TEMPLATE_RELATED", "doi:10.1000/abc", &related_params)
+                .expect("build related args failed");
+        assert_eq!(
+            related_argv,
+            vec![
+                "papers".to_string(),
+                "tree".to_string(),
+                "--id".to_string(),
+                "doi:10.1000/abc".to_string(),
+                "--depth".to_string(),
+                "2".to_string(),
+                "--max-per-level".to_string(),
+                "12".to_string(),
+            ]
+        );
+        assert_eq!(related_normalized, serde_json::json!({"depth": 2, "max_per_level": 12}));
+
+        let map_params = serde_json::json!({ "k": 22, "seed": 7 });
+        let (map_argv, map_normalized) =
+            build_template_args("TEMPLATE_MAP", "arxiv:1706.03762", &map_params)
+                .expect("build map args failed");
+        assert_eq!(
+            map_argv,
+            vec![
+                "papers".to_string(),
+                "map3d".to_string(),
+                "--id".to_string(),
+                "arxiv:1706.03762".to_string(),
+                "--k".to_string(),
+                "22".to_string(),
+                "--seed".to_string(),
+                "7".to_string(),
+            ]
+        );
+        assert_eq!(map_normalized, serde_json::json!({"k": 22, "seed": 7}));
+
+        let graph_defaults = serde_json::json!({});
+        let (graph_argv, graph_normalized) =
+            build_template_args("TEMPLATE_GRAPH", "pmid:12345678", &graph_defaults)
+                .expect("build graph args failed");
+        assert_eq!(
+            graph_argv,
+            vec![
+                "papers".to_string(),
+                "map3d".to_string(),
+                "--id".to_string(),
+                "pmid:12345678".to_string(),
+                "--k".to_string(),
+                "40".to_string(),
+                "--seed".to_string(),
+                "42".to_string(),
+            ]
+        );
+        assert_eq!(graph_normalized, serde_json::json!({"k": 40, "seed": 42}));
+    }
+
+    #[test]
+    fn primary_viz_selection_prefers_html_then_graph_json() {
+        let items = vec![
+            ArtifactItem {
+                name: "z_graph.json".to_string(),
+                rel_path: "z_graph.json".to_string(),
+                kind: "graph_json".to_string(),
+                size_bytes: Some(10),
+                mtime_iso: None,
+            },
+            ArtifactItem {
+                name: "b_map.html".to_string(),
+                rel_path: "nested/b_map.html".to_string(),
+                kind: "html".to_string(),
+                size_bytes: Some(10),
+                mtime_iso: None,
+            },
+            ArtifactItem {
+                name: "a_map.html".to_string(),
+                rel_path: "a_map.html".to_string(),
+                kind: "html".to_string(),
+                size_bytes: Some(10),
+                mtime_iso: None,
+            },
+        ];
+
+        let picked = select_primary_viz_artifact(&items).expect("primary viz should exist");
+        assert_eq!(picked.kind, "html");
+        assert_eq!(picked.name, "a_map.html");
+    }
+
+    #[test]
+    fn merge_input_metadata_is_non_destructive() {
+        let base = std::env::temp_dir().join(format!("jarvis_input_merge_{}", now_epoch_ms()));
+        let run_dir = base.join("run_1");
+        let _ = fs::create_dir_all(&run_dir);
+        fs::write(
+            run_dir.join("input.json"),
+            r#"{"title":"A","request":{"id":"x"},"desktop":{"custom":"keep"}}"#,
+        )
+        .expect("write input");
+
+        let pv = PrimaryVizRef {
+            name: "map.html".to_string(),
+            kind: "html".to_string(),
+        };
+        merge_desktop_input_metadata(
+            &run_dir,
+            "TEMPLATE_MAP",
+            "arxiv:1706.03762",
+            &serde_json::json!({"k": 24, "seed": 42}),
+            Some(&pv),
+        )
+        .expect("merge input metadata");
+
+        let updated_raw = fs::read_to_string(run_dir.join("input.json")).expect("read merged input");
+        let updated: serde_json::Value = serde_json::from_str(&updated_raw).expect("parse merged input");
+        assert_eq!(updated.get("title"), Some(&serde_json::json!("A")));
+        assert_eq!(updated.get("request").and_then(|v| v.get("id")), Some(&serde_json::json!("x")));
+        assert_eq!(updated.get("desktop").and_then(|v| v.get("custom")), Some(&serde_json::json!("keep")));
+        assert_eq!(updated.get("desktop").and_then(|v| v.get("template_id")), Some(&serde_json::json!("TEMPLATE_MAP")));
+        assert_eq!(updated.get("desktop").and_then(|v| v.get("primary_viz")).and_then(|v| v.get("kind")), Some(&serde_json::json!("html")));
+
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -4146,6 +4763,7 @@ mod tests {
             source_kind: Some("arxiv".to_string()),
             tags: vec!["old".to_string()],
             runs: vec![],
+            primary_viz: None,
             last_run_id: None,
             last_status: "unknown".to_string(),
             created_at: Utc::now().to_rfc3339(),
@@ -4178,9 +4796,11 @@ mod tests {
                 run_id: "20260218_abc".to_string(),
                 template_id: Some("TEMPLATE_TREE".to_string()),
                 status: "succeeded".to_string(),
+                primary_viz: None,
                 created_at: now.clone(),
                 updated_at: now.clone(),
             }],
+            primary_viz: None,
             last_run_id: Some("20260218_abc".to_string()),
             last_status: "succeeded".to_string(),
             created_at: now.clone(),
@@ -4299,5 +4919,59 @@ mod tests {
         assert!(!safe.to_lowercase().contains("<script"));
         assert!(warnings.iter().any(|w| w.contains("scripts were removed")));
         assert!(warnings.iter().any(|w| w.contains("external refs detected")));
+    }
+
+    fn degree_map_for_test(edges: &[GraphEdgeNormalized]) -> std::collections::BTreeMap<String, usize> {
+        let mut out = std::collections::BTreeMap::new();
+        for e in edges {
+            *out.entry(e.source.clone()).or_insert(0) += 1;
+            *out.entry(e.target.clone()).or_insert(0) += 1;
+        }
+        out
+    }
+
+    #[test]
+    fn parse_graph_json_top_level_nodes_edges() {
+        let raw = r#"{"nodes":[{"id":"n1","label":"A"},{"id":"n2"}],"edges":[{"source":"n1","target":"n2"}]}"#;
+        let parsed = parse_graph_json_internal(raw).expect("parse graph top level");
+        assert_eq!(parsed.nodes.len(), 2);
+        assert_eq!(parsed.edges.len(), 1);
+        assert_eq!(parsed.nodes[0].id, "n1");
+        assert!(parsed.stats.top_level_keys.contains(&"edges".to_string()));
+        assert!(parsed.stats.top_level_keys.contains(&"nodes".to_string()));
+    }
+
+    #[test]
+    fn parse_graph_json_nested_graph_variant() {
+        let raw = r#"{"graph":{"nodes":[{"id":"x"}],"edges":[{"from":"x","to":"x"}]}}"#;
+        let parsed = parse_graph_json_internal(raw).expect("parse nested graph");
+        assert_eq!(parsed.nodes.len(), 1);
+        assert_eq!(parsed.edges.len(), 1);
+        assert!(parsed
+            .warnings
+            .iter()
+            .any(|w| w.contains("nested key `graph`")));
+    }
+
+    #[test]
+    fn degree_computation_is_stable() {
+        let raw = r#"{"nodes":[{"id":"a"},{"id":"b"},{"id":"c"}],"edges":[{"source":"a","target":"b"},{"source":"a","target":"c"}]}"#;
+        let parsed = parse_graph_json_internal(raw).expect("parse for degree");
+        let degree = degree_map_for_test(&parsed.edges);
+        assert_eq!(degree.get("a"), Some(&2));
+        assert_eq!(degree.get("b"), Some(&1));
+        assert_eq!(degree.get("c"), Some(&1));
+    }
+
+    #[test]
+    fn parse_graph_json_unknown_schema_fallback() {
+        let raw = r#"{"items":[1,2,3],"meta":{"x":1}}"#;
+        let parsed = parse_graph_json_internal(raw).expect("parse unknown schema");
+        assert_eq!(parsed.nodes.len(), 0);
+        assert_eq!(parsed.edges.len(), 0);
+        assert!(parsed
+            .warnings
+            .iter()
+            .any(|w| w.contains("fallback summary mode")));
     }
 }

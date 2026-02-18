@@ -81,6 +81,49 @@ function renderMarkdownToHtml(md) {
   return html.join("\n");
 }
 
+function toCanonicalLibraryQuery(node) {
+  if (!node) return "";
+  const candidates = [];
+  const raw = node.raw ?? {};
+  const push = (v) => {
+    const text = String(v ?? "").trim();
+    if (text) candidates.push(text);
+  };
+
+  push(node.id);
+  push(raw.canonical_id);
+  push(raw.paper_id);
+  push(raw.id);
+  push(raw.doi);
+  push(raw.pmid);
+  push(raw.arxiv);
+  push(raw.s2);
+
+  const ext = raw.externalIds;
+  if (ext && typeof ext === "object") {
+    push(ext.DOI);
+    push(ext.PubMed);
+    push(ext.ArXiv);
+  }
+
+  for (const c of candidates) {
+    const lower = c.toLowerCase();
+    if (
+      lower.startsWith("doi:")
+      || lower.startsWith("pmid:")
+      || lower.startsWith("arxiv:")
+      || lower.startsWith("s2:")
+    ) {
+      return c;
+    }
+    if (/^10\.[^\s]+/.test(c)) return `doi:${c}`;
+    if (/^\d{6,12}$/.test(c)) return `pmid:${c}`;
+    if (/^\d{4}\.\d{4,5}(v\d+)?$/i.test(c)) return `arxiv:${c}`;
+  }
+
+  return candidates[0] ?? "";
+}
+
 export default function App() {
   const [paperId, setPaperId] = useState("arxiv:1706.03762");
   const [templates, setTemplates] = useState([]);
@@ -118,6 +161,15 @@ export default function App() {
   const [artifactView, setArtifactView] = useState(null);
   const [artifactWarnings, setArtifactWarnings] = useState([]);
   const [artifactWrap, setArtifactWrap] = useState(true);
+  const [graphParsed, setGraphParsed] = useState(null);
+  const [graphParseLoading, setGraphParseLoading] = useState(false);
+  const [graphParseError, setGraphParseError] = useState("");
+  const [graphQuery, setGraphQuery] = useState("");
+  const [graphTypeFilter, setGraphTypeFilter] = useState("all");
+  const [graphYearFrom, setGraphYearFrom] = useState("");
+  const [graphYearTo, setGraphYearTo] = useState("");
+  const [graphHasEdgesOnly, setGraphHasEdgesOnly] = useState(false);
+  const [selectedGraphNodeId, setSelectedGraphNodeId] = useState("");
   const [runArtifactCatalog, setRunArtifactCatalog] = useState([]);
   const [runArtifactCatalogLoading, setRunArtifactCatalogLoading] = useState(false);
   const [runArtifactCatalogError, setRunArtifactCatalogError] = useState("");
@@ -654,6 +706,41 @@ export default function App() {
   }, [selectedRunId]);
 
   useEffect(() => {
+    const kind = artifactView?.kind ?? "";
+    if (kind !== "graph_json" || !artifactView?.content) {
+      setGraphParsed(null);
+      setGraphParseLoading(false);
+      setGraphParseError("");
+      setSelectedGraphNodeId("");
+      return;
+    }
+
+    let alive = true;
+    setGraphParseLoading(true);
+    setGraphParseError("");
+    invoke("parse_graph_json", { content: artifactView.content })
+      .then((parsed) => {
+        if (!alive) return;
+        setGraphParsed(parsed ?? null);
+        const firstId = Array.isArray(parsed?.nodes) && parsed.nodes.length > 0 ? parsed.nodes[0].id : "";
+        setSelectedGraphNodeId(firstId);
+      })
+      .catch((e) => {
+        if (!alive) return;
+        setGraphParsed(null);
+        setGraphParseError(String(e));
+      })
+      .finally(() => {
+        if (!alive) return;
+        setGraphParseLoading(false);
+      });
+
+    return () => {
+      alive = false;
+    };
+  }, [artifactView?.kind, artifactView?.content]);
+
+  useEffect(() => {
     const searchMode = String(librarySearchQuery ?? "").trim() !== "";
     const rows = Array.isArray(searchMode ? librarySearchRows : libraryRows)
       ? searchMode
@@ -799,22 +886,86 @@ export default function App() {
   const artifactKind = artifactView?.kind ?? "";
   const isHtmlArtifact = artifactKind === "html";
   const isGraphJsonArtifact = artifactKind === "graph_json";
-  const graphSummary = useMemo(() => {
-    if (!isGraphJsonArtifact || !artifactView?.content) {
-      return null;
+  const graphNodes = Array.isArray(graphParsed?.nodes) ? graphParsed.nodes : [];
+  const graphEdges = Array.isArray(graphParsed?.edges) ? graphParsed.edges : [];
+  const graphTypes = useMemo(() => {
+    const set = new Set();
+    for (const n of graphNodes) {
+      const t = String(n?.node_type ?? "").trim();
+      if (t) set.add(t);
     }
-    try {
-      const parsed = JSON.parse(artifactView.content);
-      const topKeys = parsed && typeof parsed === "object" && !Array.isArray(parsed)
-        ? Object.keys(parsed)
-        : [];
-      const nodesCount = Array.isArray(parsed?.nodes) ? parsed.nodes.length : null;
-      const edgesCount = Array.isArray(parsed?.edges) ? parsed.edges.length : null;
-      return { topKeys, nodesCount, edgesCount };
-    } catch {
-      return { topKeys: [], nodesCount: null, edgesCount: null };
+    return ["all", ...Array.from(set).sort((a, b) => a.localeCompare(b))];
+  }, [graphNodes]);
+  const graphNodeById = useMemo(() => {
+    const map = new Map();
+    for (const n of graphNodes) {
+      map.set(n.id, n);
     }
-  }, [isGraphJsonArtifact, artifactView?.content]);
+    return map;
+  }, [graphNodes]);
+  const graphDegreeMap = useMemo(() => {
+    const degree = new Map();
+    for (const e of graphEdges) {
+      const s = String(e?.source ?? "");
+      const t = String(e?.target ?? "");
+      if (s) degree.set(s, (degree.get(s) ?? 0) + 1);
+      if (t) degree.set(t, (degree.get(t) ?? 0) + 1);
+    }
+    return degree;
+  }, [graphEdges]);
+  const graphAdjacency = useMemo(() => {
+    const adj = new Map();
+    for (const e of graphEdges) {
+      const s = String(e?.source ?? "");
+      const t = String(e?.target ?? "");
+      if (!s || !t) continue;
+      if (!adj.has(s)) adj.set(s, new Set());
+      if (!adj.has(t)) adj.set(t, new Set());
+      adj.get(s).add(t);
+      adj.get(t).add(s);
+    }
+    return adj;
+  }, [graphEdges]);
+  const filteredGraphNodes = useMemo(() => {
+    const q = String(graphQuery ?? "").trim().toLowerCase();
+    const yFrom = String(graphYearFrom ?? "").trim() === "" ? null : Number(graphYearFrom);
+    const yTo = String(graphYearTo ?? "").trim() === "" ? null : Number(graphYearTo);
+
+    const rows = graphNodes.filter((n) => {
+      const id = String(n?.id ?? "");
+      const label = String(n?.label ?? "");
+      if (q) {
+        const hay = `${id.toLowerCase()} ${label.toLowerCase()}`;
+        if (!hay.includes(q)) return false;
+      }
+      if (graphTypeFilter !== "all" && String(n?.node_type ?? "") !== graphTypeFilter) return false;
+      if (Number.isFinite(yFrom) && Number(n?.year ?? NaN) < yFrom) return false;
+      if (Number.isFinite(yTo) && Number(n?.year ?? NaN) > yTo) return false;
+      if (graphHasEdgesOnly && (graphDegreeMap.get(id) ?? 0) <= 0) return false;
+      return true;
+    });
+
+    rows.sort((a, b) => {
+      const da = graphDegreeMap.get(a.id) ?? 0;
+      const db = graphDegreeMap.get(b.id) ?? 0;
+      return db - da || String(a.id).localeCompare(String(b.id));
+    });
+    return rows;
+  }, [graphNodes, graphQuery, graphTypeFilter, graphYearFrom, graphYearTo, graphHasEdgesOnly, graphDegreeMap]);
+  const selectedGraphNode = selectedGraphNodeId ? graphNodeById.get(selectedGraphNodeId) : null;
+  const selectedGraphNeighbors = useMemo(() => {
+    if (!selectedGraphNode) return [];
+    const ids = Array.from(graphAdjacency.get(selectedGraphNode.id) ?? []);
+    const nodes = ids
+      .map((id) => graphNodeById.get(id))
+      .filter(Boolean)
+      .sort((a, b) => {
+        const da = graphDegreeMap.get(a.id) ?? 0;
+        const db = graphDegreeMap.get(b.id) ?? 0;
+        return db - da || String(a.id).localeCompare(String(b.id));
+      });
+    return nodes.slice(0, 50);
+  }, [selectedGraphNode, graphAdjacency, graphNodeById, graphDegreeMap]);
 
   function renderRowArtifactButtons(row) {
     const runIdFromRow = row?.last_run_id;
@@ -823,8 +974,15 @@ export default function App() {
     const hasName = (name) => !!catalog?.names?.[name];
     const hasLogs = hasName("stdout.log") || hasName("stderr.log");
     const logTarget = hasName("stdout.log") ? "stdout.log" : "stderr.log";
-    const viewTarget = (catalog?.items ?? []).find((i) => i.kind === "html")
+    const preferredViz = row?.primary_viz && row.primary_viz.name
+      ? { name: String(row.primary_viz.name), kind: String(row.primary_viz.kind ?? "") }
+      : null;
+    const primaryViewTarget = preferredViz
+      ? (catalog?.items ?? []).find((i) => i.name === preferredViz.name)
+      : null;
+    const fallbackViewTarget = (catalog?.items ?? []).find((i) => i.kind === "html")
       || (catalog?.items ?? []).find((i) => i.kind === "graph_json");
+    const viewTarget = primaryViewTarget || fallbackViewTarget;
 
     const makeDisabled = (name) => {
       if (!runIdFromRow) return true;
@@ -1569,6 +1727,9 @@ export default function App() {
                 </div>
               ) : isGraphJsonArtifact && artifactView.exists ? (
                 <div>
+                  {graphParseLoading ? <div style={{ fontSize: 12 }}>Parsing graph...</div> : null}
+                  {graphParseError ? <div style={{ color: "#a33", fontSize: 12 }}>{graphParseError}</div> : null}
+
                   <div
                     style={{
                       border: "1px solid #eee",
@@ -1579,23 +1740,178 @@ export default function App() {
                       background: "#fafafa",
                     }}
                   >
-                    <div>nodes={graphSummary?.nodesCount ?? "-"} edges={graphSummary?.edgesCount ?? "-"}</div>
-                    <div>top_keys={(graphSummary?.topKeys ?? []).join(", ") || "-"}</div>
+                    <div>nodes={graphParsed?.stats?.nodes_count ?? 0} edges={graphParsed?.stats?.edges_count ?? 0}</div>
+                    <div>top_keys={(graphParsed?.stats?.top_level_keys ?? []).join(", ") || "-"}</div>
+                    {(graphParsed?.warnings ?? []).length > 0 ? (
+                      <div style={{ color: "#8a4200" }}>warnings={(graphParsed?.warnings ?? []).join(" | ")}</div>
+                    ) : null}
+                    {(graphParsed?.stats?.nodes_count ?? 0) > 10000 ? (
+                      <div style={{ color: "#8a4200" }}>
+                        large graph mode: neighbors capped to 50 for safety/performance
+                      </div>
+                    ) : null}
                   </div>
-                  <textarea
-                    readOnly
-                    value={artifactView.content ?? ""}
-                    wrap={artifactWrap ? "soft" : "off"}
-                    style={{
-                      width: "100%",
-                      height: 280,
-                      padding: 10,
-                      borderRadius: 8,
-                      border: "1px solid #ccc",
-                      fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
-                      fontSize: 12,
-                    }}
-                  />
+
+                  {(graphParsed?.stats?.nodes_count ?? 0) > 0 ? (
+                    <div style={{ marginBottom: 8, display: "grid", gap: 8 }}>
+                      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                        <input
+                          placeholder="search node id/label"
+                          value={graphQuery}
+                          onChange={(e) => setGraphQuery(e.target.value)}
+                          style={{ padding: 8, borderRadius: 6, border: "1px solid #ccc", minWidth: 220 }}
+                        />
+                        <select
+                          value={graphTypeFilter}
+                          onChange={(e) => setGraphTypeFilter(e.target.value)}
+                          style={{ padding: 8, borderRadius: 6, border: "1px solid #ccc" }}
+                        >
+                          {graphTypes.map((t) => (
+                            <option key={t} value={t}>{t === "all" ? "type: all" : t}</option>
+                          ))}
+                        </select>
+                        <input
+                          placeholder="year from"
+                          value={graphYearFrom}
+                          onChange={(e) => setGraphYearFrom(e.target.value)}
+                          style={{ padding: 8, borderRadius: 6, border: "1px solid #ccc", width: 100 }}
+                        />
+                        <input
+                          placeholder="year to"
+                          value={graphYearTo}
+                          onChange={(e) => setGraphYearTo(e.target.value)}
+                          style={{ padding: 8, borderRadius: 6, border: "1px solid #ccc", width: 90 }}
+                        />
+                        <label style={{ fontSize: 12, display: "flex", alignItems: "center", gap: 4 }}>
+                          <input
+                            type="checkbox"
+                            checked={graphHasEdgesOnly}
+                            onChange={(e) => setGraphHasEdgesOnly(e.target.checked)}
+                          />
+                          has edges only
+                        </label>
+                      </div>
+
+                      <div style={{ display: "grid", gridTemplateColumns: "1.2fr 1fr", gap: 8 }}>
+                        <div style={{ border: "1px solid #eee", borderRadius: 6, maxHeight: 260, overflow: "auto" }}>
+                          {filteredGraphNodes.length === 0 ? (
+                            <div style={{ padding: 8, fontSize: 12, opacity: 0.8 }}>No matching nodes.</div>
+                          ) : (
+                            filteredGraphNodes.slice(0, 1200).map((n) => (
+                              <button
+                                key={n.id}
+                                onClick={() => setSelectedGraphNodeId(n.id)}
+                                style={{
+                                  width: "100%",
+                                  textAlign: "left",
+                                  border: "none",
+                                  borderBottom: "1px solid #f0f0f0",
+                                  padding: 8,
+                                  background: n.id === selectedGraphNodeId ? "#eef5ff" : "white",
+                                  cursor: "pointer",
+                                  fontSize: 11,
+                                }}
+                              >
+                                <div style={{ fontWeight: 600 }}>{n.label ?? n.id}</div>
+                                <div>id={n.id} type={n.node_type ?? "-"} year={n.year ?? "-"} degree={graphDegreeMap.get(n.id) ?? 0}</div>
+                              </button>
+                            ))
+                          )}
+                        </div>
+
+                        <div style={{ border: "1px solid #eee", borderRadius: 6, padding: 8 }}>
+                          <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>Node detail</div>
+                          {selectedGraphNode ? (
+                            <>
+                              <div style={{ fontSize: 11, marginBottom: 4 }}>id={selectedGraphNode.id}</div>
+                              <div style={{ fontSize: 11, marginBottom: 4 }}>label={selectedGraphNode.label ?? "-"}</div>
+                              <div style={{ fontSize: 11, marginBottom: 4 }}>type={selectedGraphNode.node_type ?? "-"}</div>
+                              <div style={{ fontSize: 11, marginBottom: 4 }}>year={selectedGraphNode.year ?? "-"}</div>
+                              <div style={{ fontSize: 11, marginBottom: 6 }}>
+                                degree={graphDegreeMap.get(selectedGraphNode.id) ?? 0} neighbors={selectedGraphNeighbors.length}
+                              </div>
+
+                              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 6 }}>
+                                <button
+                                  onClick={() => {
+                                    const q = toCanonicalLibraryQuery(selectedGraphNode);
+                                    if (q) setLibrarySearchQuery(q);
+                                  }}
+                                  style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+                                >
+                                  Search in Library
+                                </button>
+                                <button
+                                  onClick={() => {
+                                    if (artifactView?.run_id) setSelectedRunId(artifactView.run_id);
+                                  }}
+                                  style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+                                >
+                                  Open Run Detail
+                                </button>
+                              </div>
+
+                              <details>
+                                <summary style={{ fontSize: 11, cursor: "pointer" }}>Neighbors (max 50)</summary>
+                                <div style={{ maxHeight: 120, overflow: "auto", marginTop: 4 }}>
+                                  {selectedGraphNeighbors.map((nb) => (
+                                    <button
+                                      key={nb.id}
+                                      onClick={() => setSelectedGraphNodeId(nb.id)}
+                                      style={{
+                                        width: "100%",
+                                        textAlign: "left",
+                                        border: "none",
+                                        borderBottom: "1px solid #f0f0f0",
+                                        padding: "4px 0",
+                                        background: "transparent",
+                                        cursor: "pointer",
+                                        fontSize: 11,
+                                      }}
+                                    >
+                                      {nb.label ?? nb.id} ({nb.id})
+                                    </button>
+                                  ))}
+                                </div>
+                              </details>
+
+                              <textarea
+                                readOnly
+                                value={JSON.stringify(selectedGraphNode.raw ?? {}, null, 2)}
+                                style={{
+                                  width: "100%",
+                                  height: 120,
+                                  marginTop: 6,
+                                  padding: 8,
+                                  borderRadius: 6,
+                                  border: "1px solid #ddd",
+                                  fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+                                  fontSize: 11,
+                                }}
+                              />
+                            </>
+                          ) : (
+                            <div style={{ fontSize: 12, opacity: 0.8 }}>Select a node.</div>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    <textarea
+                      readOnly
+                      value={artifactView.content ?? ""}
+                      wrap={artifactWrap ? "soft" : "off"}
+                      style={{
+                        width: "100%",
+                        height: 280,
+                        padding: 10,
+                        borderRadius: 8,
+                        border: "1px solid #ccc",
+                        fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+                        fontSize: 12,
+                      }}
+                    />
+                  )}
                 </div>
               ) : (
                 <div>
