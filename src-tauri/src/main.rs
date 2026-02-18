@@ -107,13 +107,13 @@ struct NamedArtifactView {
     kind: String,
     content: String,
     truncated: bool,
+    warnings: Vec<String>,
 }
 
 #[derive(Clone)]
 struct ArtifactSpec {
     name: &'static str,
     rel_path: &'static str,
-    kind: &'static str,
     legacy_key: &'static str,
 }
 
@@ -2649,31 +2649,26 @@ fn known_artifact_specs() -> Vec<ArtifactSpec> {
         ArtifactSpec {
             name: "tree.md",
             rel_path: "paper_graph/tree/tree.md",
-            kind: "markdown",
             legacy_key: "tree_md",
         },
         ArtifactSpec {
             name: "result.json",
             rel_path: "result.json",
-            kind: "json",
             legacy_key: "result_json",
         },
         ArtifactSpec {
             name: "input.json",
             rel_path: "input.json",
-            kind: "json",
             legacy_key: "input_json",
         },
         ArtifactSpec {
             name: "stdout.log",
             rel_path: "stdout.log",
-            kind: "text",
             legacy_key: "stdout_log",
         },
         ArtifactSpec {
             name: "stderr.log",
             rel_path: "stderr.log",
-            kind: "text",
             legacy_key: "stderr_log",
         },
     ]
@@ -2706,6 +2701,8 @@ fn detect_artifact_kind_by_name(name: &str) -> String {
     let lower = name.to_lowercase();
     if lower.ends_with(".md") {
         "markdown".to_string()
+    } else if lower.ends_with(".html") || lower.ends_with(".htm") {
+        "html".to_string()
     } else if lower.ends_with(".json") {
         "json".to_string()
     } else if lower.ends_with(".log") || lower.ends_with(".txt") {
@@ -2715,12 +2712,158 @@ fn detect_artifact_kind_by_name(name: &str) -> String {
     }
 }
 
+fn is_probable_graph_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.contains("graph") || lower.contains("map") || lower.contains("viz")
+}
+
+fn is_probable_graph_json(path: &Path, name: &str, size_bytes: Option<u64>) -> bool {
+    if !name.to_lowercase().ends_with(".json") {
+        return false;
+    }
+    if is_probable_graph_name(name) {
+        return true;
+    }
+
+    let size = size_bytes.unwrap_or(0);
+    if size == 0 || size > 256 * 1024 {
+        return false;
+    }
+    let raw = match fs::read_to_string(path) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let v = match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    match v {
+        serde_json::Value::Object(map) => {
+            let has_nodes = map.contains_key("nodes");
+            let has_edges = map.contains_key("edges");
+            let has_map = map.contains_key("map") || map.contains_key("graph");
+            (has_nodes && has_edges) || has_map
+        }
+        _ => false,
+    }
+}
+
+fn classify_artifact_kind(path: &Path, name: &str, size_bytes: Option<u64>) -> String {
+    let base = detect_artifact_kind_by_name(name);
+    if base == "json" && is_probable_graph_json(path, name, size_bytes) {
+        return "graph_json".to_string();
+    }
+    base
+}
+
+fn find_ascii_nocase(haystack: &str, needle: &str) -> Option<usize> {
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() || h.len() < n.len() {
+        return None;
+    }
+    for i in 0..=h.len() - n.len() {
+        let mut ok = true;
+        for j in 0..n.len() {
+            if !h[i + j].eq_ignore_ascii_case(&n[j]) {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn strip_script_tags(html: &str) -> (String, bool) {
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    let mut removed = false;
+
+    loop {
+        let Some(start) = find_ascii_nocase(rest, "<script") else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..start]);
+        let after_start = &rest[start..];
+        if let Some(end_rel) = find_ascii_nocase(after_start, "</script>") {
+            let cut = end_rel + "</script>".len();
+            rest = &after_start[cut..];
+            removed = true;
+        } else {
+            removed = true;
+            break;
+        }
+    }
+
+    (out, removed)
+}
+
+fn contains_external_refs(html: &str) -> bool {
+    let lower = html.to_lowercase();
+    [
+        "src=\"http://",
+        "src=\"https://",
+        "src=\"//",
+        "src='http://",
+        "src='https://",
+        "src='//",
+        "href=\"http://",
+        "href=\"https://",
+        "href=\"//",
+        "href='http://",
+        "href='https://",
+        "href='//",
+        "href=\"javascript:",
+        "href='javascript:",
+    ]
+    .iter()
+    .any(|p| lower.contains(p))
+}
+
+fn build_sandboxed_html(raw: &str) -> (String, Vec<String>) {
+    let (without_scripts, removed_scripts) = strip_script_tags(raw);
+    let has_external_refs = contains_external_refs(&without_scripts);
+
+    let mut warnings = Vec::new();
+    if removed_scripts {
+        warnings.push("scripts were removed for safe preview".to_string());
+    }
+    if has_external_refs {
+        warnings.push("external refs detected; CSP blocks network/navigation".to_string());
+    }
+
+    let csp = "default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'none'; connect-src 'none'; frame-ancestors 'none'; form-action 'none'; navigate-to 'none'";
+    let banner = if warnings.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<div style=\"padding:8px;border:1px solid #d6b36a;background:#fff8e6;color:#6f4a00;font:12px sans-serif;\">{}</div>",
+            warnings.join(" | ")
+        )
+    };
+
+    let content = format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"{}\"></head><body>{}{}</body></html>",
+        csp,
+        banner,
+        without_scripts
+    );
+    (content, warnings)
+}
+
 fn kind_priority(kind: &str) -> i32 {
     match kind {
         "markdown" => 0,
-        "json" => 1,
-        "text" => 2,
-        _ => 3,
+        "html" => 1,
+        "graph_json" => 2,
+        "json" => 3,
+        "text" => 4,
+        _ => 5,
     }
 }
 
@@ -2753,7 +2896,7 @@ fn list_run_artifacts_internal(run_dir: &Path) -> Result<Vec<ArtifactItem>, Stri
         out.push(ArtifactItem {
             name: spec.name.to_string(),
             rel_path: spec.rel_path.to_string(),
-            kind: spec.kind.to_string(),
+            kind: classify_artifact_kind(&canonical, spec.name, size_bytes),
             size_bytes,
             mtime_iso,
         });
@@ -2801,7 +2944,7 @@ fn list_run_artifacts_internal(run_dir: &Path) -> Result<Vec<ArtifactItem>, Stri
             out.push(ArtifactItem {
                 name: name.clone(),
                 rel_path: rel,
-                kind: detect_artifact_kind_by_name(&name),
+                kind: classify_artifact_kind(&canonical, &name, size_bytes),
                 size_bytes,
                 mtime_iso,
             });
@@ -2860,13 +3003,24 @@ fn read_artifact_content_internal(run_dir: &Path, item: &ArtifactItem) -> Result
                 MAX_ARTIFACT_READ_BYTES
             ),
             truncated: true,
+            warnings: vec!["artifact exceeds preview size limit".to_string()],
         });
     }
 
     let raw = fs::read_to_string(&canonical)
         .map_err(|e| format!("failed to read artifact {}: {e}", canonical.display()))?;
 
-    if item.kind == "json" {
+    if item.kind == "html" {
+        let (safe_html, warnings) = build_sandboxed_html(&raw);
+        return Ok(NamedArtifactView {
+            kind: item.kind.clone(),
+            content: safe_html,
+            truncated: false,
+            warnings,
+        });
+    }
+
+    if item.kind == "json" || item.kind == "graph_json" {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
             let pretty = serde_json::to_string_pretty(&v)
                 .map_err(|e| format!("failed to pretty print json {}: {e}", canonical.display()))?;
@@ -2874,6 +3028,7 @@ fn read_artifact_content_internal(run_dir: &Path, item: &ArtifactItem) -> Result
                 kind: item.kind.clone(),
                 content: pretty,
                 truncated: false,
+                warnings: Vec::new(),
             });
         }
     }
@@ -2882,6 +3037,7 @@ fn read_artifact_content_internal(run_dir: &Path, item: &ArtifactItem) -> Result
         kind: item.kind.clone(),
         content: raw,
         truncated: false,
+        warnings: Vec::new(),
     })
 }
 
@@ -4114,5 +4270,34 @@ mod tests {
         assert!(view.content.to_lowercase().contains("too large"));
 
         let _ = fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn classify_graph_json_by_name_and_structure() {
+        let run_dir = std::env::temp_dir().join(format!("jarvis_artifacts_graph_kind_{}", now_epoch_ms()));
+        let _ = fs::create_dir_all(&run_dir);
+
+        let named = run_dir.join("my_graph_payload.json");
+        fs::write(&named, r#"{"x":1}"#).expect("write named graph");
+        let kind_named = classify_artifact_kind(&named, "my_graph_payload.json", Some(7));
+        assert_eq!(kind_named, "graph_json");
+
+        let structured = run_dir.join("payload.json");
+        fs::write(&structured, r#"{"nodes":[],"edges":[]}"#).expect("write structured graph");
+        let size = fs::metadata(&structured).expect("meta structured").len();
+        let kind_structured = classify_artifact_kind(&structured, "payload.json", Some(size));
+        assert_eq!(kind_structured, "graph_json");
+
+        let _ = fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn sandboxed_html_inserts_csp_and_removes_scripts() {
+        let raw = r#"<html><head><script>alert(1)</script></head><body><a href="https://example.com">x</a></body></html>"#;
+        let (safe, warnings) = build_sandboxed_html(raw);
+        assert!(safe.to_lowercase().contains("content-security-policy"));
+        assert!(!safe.to_lowercase().contains("<script"));
+        assert!(warnings.iter().any(|w| w.contains("scripts were removed")));
+        assert!(warnings.iter().any(|w| w.contains("external refs detected")));
     }
 }

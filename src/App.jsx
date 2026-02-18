@@ -116,6 +116,7 @@ export default function App() {
   const [artifactLoading, setArtifactLoading] = useState(false);
   const [artifactError, setArtifactError] = useState("");
   const [artifactView, setArtifactView] = useState(null);
+  const [artifactWarnings, setArtifactWarnings] = useState([]);
   const [artifactWrap, setArtifactWrap] = useState(true);
   const [runArtifactCatalog, setRunArtifactCatalog] = useState([]);
   const [runArtifactCatalogLoading, setRunArtifactCatalogLoading] = useState(false);
@@ -240,6 +241,7 @@ export default function App() {
   async function loadArtifact(runId, artifactKey) {
     if (!runId) {
       setArtifactView(null);
+      setArtifactWarnings([]);
       return;
     }
     setArtifactLoading(true);
@@ -250,8 +252,10 @@ export default function App() {
         artifact: artifactKey,
       });
       setArtifactView(res);
+      setArtifactWarnings([]);
     } catch (e) {
       setArtifactView(null);
+      setArtifactWarnings([]);
       setArtifactError(String(e));
     } finally {
       setArtifactLoading(false);
@@ -502,6 +506,7 @@ export default function App() {
     const key = mapArtifactNameToLegacyKey(item.name);
     if (key) {
       setSelectedArtifact(key);
+      setArtifactWarnings([]);
       return;
     }
 
@@ -517,11 +522,52 @@ export default function App() {
         artifact: item.name,
         path: item.rel_path,
         exists: true,
+        kind: named?.kind ?? item.kind ?? "text",
         content: named?.content ?? "",
         parse_status: named?.truncated ? "truncated" : "ok",
       });
+      setArtifactWarnings(Array.isArray(named?.warnings) ? named.warnings : []);
     } catch (e) {
       setArtifactView(null);
+      setArtifactWarnings([]);
+      setArtifactError(String(e));
+    } finally {
+      setArtifactLoading(false);
+    }
+  }
+
+  async function onOpenNamedArtifactForRun(runIdFromRow, itemName) {
+    if (!runIdFromRow || !itemName) return;
+    await loadRuns();
+    setSelectedRunId(runIdFromRow);
+
+    const key = mapArtifactNameToLegacyKey(itemName);
+    if (key) {
+      setSelectedArtifact(key);
+      setArtifactWarnings([]);
+      return;
+    }
+
+    setArtifactLoading(true);
+    setArtifactError("");
+    try {
+      const named = await invoke("read_run_artifact_named", {
+        runId: runIdFromRow,
+        name: itemName,
+      });
+      setArtifactView({
+        run_id: runIdFromRow,
+        artifact: itemName,
+        path: itemName,
+        exists: true,
+        kind: named?.kind ?? "text",
+        content: named?.content ?? "",
+        parse_status: named?.truncated ? "truncated" : "ok",
+      });
+      setArtifactWarnings(Array.isArray(named?.warnings) ? named.warnings : []);
+    } catch (e) {
+      setArtifactView(null);
+      setArtifactWarnings([]);
       setArtifactError(String(e));
     } finally {
       setArtifactLoading(false);
@@ -750,6 +796,25 @@ export default function App() {
   const selectedJob = jobs.find((j) => j.job_id === selectedJobId) ?? null;
   const isLibrarySearchMode = String(librarySearchQuery ?? "").trim() !== "";
   const visibleLibraryRows = isLibrarySearchMode ? librarySearchRows : libraryRows;
+  const artifactKind = artifactView?.kind ?? "";
+  const isHtmlArtifact = artifactKind === "html";
+  const isGraphJsonArtifact = artifactKind === "graph_json";
+  const graphSummary = useMemo(() => {
+    if (!isGraphJsonArtifact || !artifactView?.content) {
+      return null;
+    }
+    try {
+      const parsed = JSON.parse(artifactView.content);
+      const topKeys = parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        ? Object.keys(parsed)
+        : [];
+      const nodesCount = Array.isArray(parsed?.nodes) ? parsed.nodes.length : null;
+      const edgesCount = Array.isArray(parsed?.edges) ? parsed.edges.length : null;
+      return { topKeys, nodesCount, edgesCount };
+    } catch {
+      return { topKeys: [], nodesCount: null, edgesCount: null };
+    }
+  }, [isGraphJsonArtifact, artifactView?.content]);
 
   function renderRowArtifactButtons(row) {
     const runIdFromRow = row?.last_run_id;
@@ -758,6 +823,8 @@ export default function App() {
     const hasName = (name) => !!catalog?.names?.[name];
     const hasLogs = hasName("stdout.log") || hasName("stderr.log");
     const logTarget = hasName("stdout.log") ? "stdout.log" : "stderr.log";
+    const viewTarget = (catalog?.items ?? []).find((i) => i.kind === "html")
+      || (catalog?.items ?? []).find((i) => i.kind === "graph_json");
 
     const makeDisabled = (name) => {
       if (!runIdFromRow) return true;
@@ -818,6 +885,19 @@ export default function App() {
           style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
         >
           Logs
+        </button>
+        <button
+          title={!runIdFromRow ? "not available" : (!loaded ? "checking availability..." : (viewTarget ? `Open ${viewTarget.name}` : "not available"))}
+          onClick={(e) => {
+            e.stopPropagation();
+            if (viewTarget?.name) {
+              onOpenNamedArtifactForRun(runIdFromRow, viewTarget.name);
+            }
+          }}
+          disabled={!runIdFromRow || !loaded || !viewTarget}
+          style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+        >
+          View
         </button>
         <button
           onClick={(e) => {
@@ -1449,6 +1529,11 @@ export default function App() {
 
           {artifactLoading ? <div style={{ fontSize: 12 }}>Loading artifact...</div> : null}
           {artifactError ? <div style={{ color: "#a33", fontSize: 12 }}>{artifactError}</div> : null}
+          {artifactWarnings.length > 0 ? (
+            <div style={{ color: "#8a4200", fontSize: 12, marginBottom: 6 }}>
+              {artifactWarnings.join(" | ")}
+            </div>
+          ) : null}
           {artifactIsMissing ? (
             <div style={{ color: "#a33", fontSize: 12, marginBottom: 6 }}>
               missing: {artifactView.path}
@@ -1473,6 +1558,45 @@ export default function App() {
                   }}
                   dangerouslySetInnerHTML={{ __html: renderMarkdownToHtml(artifactView.content) }}
                 />
+              ) : isHtmlArtifact && artifactView.exists ? (
+                <div style={{ border: "1px solid #eee", borderRadius: 6, overflow: "hidden" }}>
+                  <iframe
+                    title="artifact-html-viewer"
+                    sandbox="allow-forms"
+                    srcDoc={artifactView.content ?? ""}
+                    style={{ width: "100%", height: 420, border: "none", background: "#fff" }}
+                  />
+                </div>
+              ) : isGraphJsonArtifact && artifactView.exists ? (
+                <div>
+                  <div
+                    style={{
+                      border: "1px solid #eee",
+                      borderRadius: 6,
+                      padding: 8,
+                      marginBottom: 8,
+                      fontSize: 12,
+                      background: "#fafafa",
+                    }}
+                  >
+                    <div>nodes={graphSummary?.nodesCount ?? "-"} edges={graphSummary?.edgesCount ?? "-"}</div>
+                    <div>top_keys={(graphSummary?.topKeys ?? []).join(", ") || "-"}</div>
+                  </div>
+                  <textarea
+                    readOnly
+                    value={artifactView.content ?? ""}
+                    wrap={artifactWrap ? "soft" : "off"}
+                    style={{
+                      width: "100%",
+                      height: 280,
+                      padding: 10,
+                      borderRadius: 8,
+                      border: "1px solid #ccc",
+                      fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+                      fontSize: 12,
+                    }}
+                  />
+                </div>
               ) : (
                 <div>
                   <div style={{ display: "flex", gap: 8, marginBottom: 6 }}>
