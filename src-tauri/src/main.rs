@@ -10,6 +10,8 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{fs, io::Write};
 use chrono::{DateTime, Utc};
+use sha2::{Digest, Sha256};
+use zip::write::SimpleFileOptions;
 
 const MAX_ARTIFACT_READ_BYTES: u64 = 3 * 1024 * 1024;
 const SCHEMA_VERSION: u32 = 1;
@@ -419,6 +421,38 @@ struct DiagnosticSummary {
     total_included_bytes: u64,
     max_file_bytes: u64,
     max_total_bytes: u64,
+    zip_path: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct ManifestIncludedEntry {
+    path: String,
+    size_bytes: u64,
+    sha256: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct ManifestSkippedEntry {
+    path: String,
+    size_bytes: u64,
+    reason: String,
+    pointer_path: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct ManifestRedactionEntry {
+    path: String,
+    rule: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct DiagnosticManifest {
+    schema_version: u32,
+    created_at: String,
+    diag_id: String,
+    included: Vec<ManifestIncludedEntry>,
+    skipped: Vec<ManifestSkippedEntry>,
+    redactions: Vec<ManifestRedactionEntry>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -4426,6 +4460,219 @@ fn render_diag_report(summary: &DiagnosticSummary) -> String {
     out
 }
 
+fn is_text_like_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".md")
+        || lower.ends_with(".json")
+        || lower.ends_with(".jsonl")
+        || lower.ends_with(".log")
+        || lower.ends_with(".txt")
+        || lower.ends_with(".yaml")
+        || lower.ends_with(".yml")
+}
+
+fn redact_token_like_sequences(input: &str) -> (String, bool) {
+    let mut out = String::with_capacity(input.len());
+    let mut token = String::new();
+    let mut changed = false;
+
+    let flush = |token_buf: &mut String, out_buf: &mut String, changed_flag: &mut bool| {
+        if token_buf.is_empty() {
+            return;
+        }
+        let mut has_alpha = false;
+        let mut has_digit = false;
+        for ch in token_buf.chars() {
+            if ch.is_ascii_alphabetic() {
+                has_alpha = true;
+            }
+            if ch.is_ascii_digit() {
+                has_digit = true;
+            }
+        }
+        if token_buf.len() >= 40 && has_alpha && has_digit {
+            out_buf.push_str("[REDACTED_TOKEN]");
+            *changed_flag = true;
+        } else {
+            out_buf.push_str(token_buf);
+        }
+        token_buf.clear();
+    };
+
+    for ch in input.chars() {
+        let is_token_char = ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '=';
+        if is_token_char {
+            token.push(ch);
+        } else {
+            flush(&mut token, &mut out, &mut changed);
+            out.push(ch);
+        }
+    }
+    flush(&mut token, &mut out, &mut changed);
+    (out, changed)
+}
+
+fn redact_text_for_zip(input: &str) -> (String, Vec<String>) {
+    let mut rules = Vec::<String>::new();
+    let mut lines_out = Vec::new();
+
+    for line in input.lines() {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("authorization:") {
+            if let Some(idx) = line.find(':') {
+                lines_out.push(format!("{}: ********", &line[..idx]));
+            } else {
+                lines_out.push("authorization: ********".to_string());
+            }
+            if !rules.iter().any(|r| r == "authorization_header") {
+                rules.push("authorization_header".to_string());
+            }
+            continue;
+        }
+        if lower.contains("api_key") || lower.contains("s2_api_key") {
+            if let Some(idx) = line.find(':') {
+                lines_out.push(format!("{}: ********", &line[..idx]));
+            } else {
+                lines_out.push("api_key: ********".to_string());
+            }
+            if !rules.iter().any(|r| r == "api_key_field") {
+                rules.push("api_key_field".to_string());
+            }
+            continue;
+        }
+        let (masked, changed) = redact_token_like_sequences(line);
+        if changed && !rules.iter().any(|r| r == "token_like_string") {
+            rules.push("token_like_string".to_string());
+        }
+        lines_out.push(masked);
+    }
+
+    (lines_out.join("\n"), rules)
+}
+
+fn to_sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let out = hasher.finalize();
+    out.iter().map(|b| format!("{:02x}", b)).collect::<String>()
+}
+
+fn build_manifest_and_payloads(
+    diag_id: &str,
+    diag_dir: &Path,
+    summary: &DiagnosticSummary,
+) -> Result<(DiagnosticManifest, Vec<(String, Vec<u8>)>), String> {
+    let mut payloads: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut included = Vec::<ManifestIncludedEntry>::new();
+    let mut skipped = Vec::<ManifestSkippedEntry>::new();
+    let mut redactions = Vec::<ManifestRedactionEntry>::new();
+
+    let mut rels = vec!["diag_report.md".to_string(), "diag_summary.json".to_string()];
+    for f in &summary.files {
+        if f.included {
+            rels.push(f.rel_path.clone());
+        } else {
+            skipped.push(ManifestSkippedEntry {
+                path: f.rel_path.clone(),
+                size_bytes: f.size_bytes,
+                reason: if matches!(f.reason.as_deref(), Some("file_too_large") | Some("total_limit_exceeded")) {
+                    "too_large".to_string()
+                } else {
+                    f.reason.clone().unwrap_or_else(|| "skipped".to_string())
+                },
+                pointer_path: f.source_path.clone(),
+            });
+        }
+    }
+
+    rels.sort();
+    rels.dedup();
+
+    for rel in rels {
+        let src = diag_dir.join(rel_path_to_pathbuf(&rel));
+        if !src.exists() || !src.is_file() {
+            skipped.push(ManifestSkippedEntry {
+                path: rel,
+                size_bytes: 0,
+                reason: "missing".to_string(),
+                pointer_path: src.to_string_lossy().to_string(),
+            });
+            continue;
+        }
+
+        let bytes = fs::read(&src)
+            .map_err(|e| format!("failed to read diagnostic payload {}: {e}", src.display()))?;
+        let mut final_bytes = bytes.clone();
+        if is_text_like_path(&rel) {
+            if let Ok(text) = String::from_utf8(bytes) {
+                let (redacted, rules) = redact_text_for_zip(&text);
+                for rule in rules {
+                    redactions.push(ManifestRedactionEntry {
+                        path: rel.clone(),
+                        rule,
+                    });
+                }
+                final_bytes = redacted.into_bytes();
+            }
+        }
+
+        included.push(ManifestIncludedEntry {
+            path: rel.clone(),
+            size_bytes: final_bytes.len() as u64,
+            sha256: to_sha256_hex(&final_bytes),
+        });
+        payloads.push((rel, final_bytes));
+    }
+
+    included.sort_by(|a, b| a.path.cmp(&b.path));
+    skipped.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.pointer_path.cmp(&b.pointer_path)));
+    redactions.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.rule.cmp(&b.rule)));
+    redactions.dedup_by(|a, b| a.path == b.path && a.rule == b.rule);
+
+    let manifest = DiagnosticManifest {
+        schema_version: 1,
+        created_at: Utc::now().to_rfc3339(),
+        diag_id: diag_id.to_string(),
+        included,
+        skipped,
+        redactions,
+    };
+
+    Ok((manifest, payloads))
+}
+
+fn write_deterministic_zip(
+    zip_path: &Path,
+    mut payloads: Vec<(String, Vec<u8>)>,
+) -> Result<(), String> {
+    let file = fs::File::create(zip_path)
+        .map_err(|e| format!("failed to create diagnostic zip {}: {e}", zip_path.display()))?;
+    let mut writer = zip::ZipWriter::new(file);
+    payloads.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let fixed_ts = zip::DateTime::from_date_and_time(1980, 1, 1, 0, 0, 0)
+        .unwrap_or_default();
+    let options = SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Stored)
+        .last_modified_time(fixed_ts)
+        .unix_permissions(0o644);
+
+    for (rel, bytes) in payloads {
+        let zip_rel = rel.replace('\\', "/");
+        writer
+            .start_file(zip_rel, options)
+            .map_err(|e| format!("failed to append file to zip: {e}"))?;
+        writer
+            .write_all(&bytes)
+            .map_err(|e| format!("failed to write file content to zip: {e}"))?;
+    }
+
+    writer
+        .finish()
+        .map_err(|e| format!("failed to finalize diagnostic zip {}: {e}", zip_path.display()))?;
+    Ok(())
+}
+
 fn directory_size_bytes(path: &Path) -> u64 {
     let mut total = 0u64;
     let rd = match fs::read_dir(path) {
@@ -4519,6 +4766,12 @@ fn collect_diagnostics_internal(
     let gate_commands = extract_gate_commands_from_checklist(root);
 
     let python_path = choose_python(root, &runtime.pipeline_root).0;
+    let zip_path_opt = if include_zip {
+        Some(diag_dir.join("bundle.zip").to_string_lossy().to_string())
+    } else {
+        None
+    };
+
     let summary = DiagnosticSummary {
         diag_id: diag_id.clone(),
         created_at: Utc::now().to_rfc3339(),
@@ -4541,6 +4794,7 @@ fn collect_diagnostics_internal(
         total_included_bytes,
         max_file_bytes: DIAG_MAX_FILE_BYTES,
         max_total_bytes: DIAG_MAX_TOTAL_BYTES,
+        zip_path: zip_path_opt.clone(),
     };
 
     let summary_path = diag_dir.join("diag_summary.json");
@@ -4552,11 +4806,23 @@ fn collect_diagnostics_internal(
     let report_text = render_diag_report(&summary);
     atomic_write_text(&report_path, &report_text)?;
 
+    let (manifest, mut payloads) = build_manifest_and_payloads(&diag_id, &diag_dir, &summary)?;
+    let manifest_path = diag_dir.join("manifest.json");
+    let manifest_text = serde_json::to_string_pretty(&manifest)
+        .map_err(|e| format!("failed to serialize manifest.json: {e}"))?;
+    atomic_write_text(&manifest_path, &manifest_text)?;
+    payloads.push(("manifest.json".to_string(), manifest_text.into_bytes()));
+
+    if include_zip {
+        let zip_path = diag_dir.join("bundle.zip");
+        write_deterministic_zip(&zip_path, payloads)?;
+    }
+
     Ok(DiagnosticsCollectResult {
         diag_id,
         diag_dir: diag_dir.to_string_lossy().to_string(),
         report_path: report_path.to_string_lossy().to_string(),
-        zip_path: None,
+        zip_path: zip_path_opt,
     })
 }
 
@@ -4652,6 +4918,98 @@ fn open_diagnostic_folder(diag_id: String) -> Result<String, String> {
         .spawn()
         .map_err(|e| format!("Failed to open diagnostic folder in explorer: {e}"))?;
     Ok(canonical.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn open_diagnostic_zip(diag_id: String) -> Result<String, String> {
+    let root = repo_root();
+    let runtime = resolve_runtime_config(&root)?;
+    let diag_id = validate_diag_id_component(&diag_id)?;
+    let diag_root = diagnostics_root(&runtime.out_base_dir);
+    let root_canonical = canonicalize_existing_dir(&diag_root, "RULE_DIAG_ROOT_INVALID")?;
+    let zip = diag_root.join(&diag_id).join("bundle.zip");
+    if !zip.exists() || !zip.is_file() {
+        return Err(format!("diagnostic zip not found: {}", zip.display()));
+    }
+    let canonical = zip
+        .canonicalize()
+        .map_err(|e| format!("failed to canonicalize diagnostic zip {}: {e}", zip.display()))?;
+    if !canonical.starts_with(&root_canonical) {
+        return Err("diagnostic zip is outside diagnostics root".to_string());
+    }
+    Command::new("explorer")
+        .arg(&canonical)
+        .spawn()
+        .map_err(|e| format!("Failed to open diagnostic zip in explorer: {e}"))?;
+    Ok(canonical.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn read_manifest(diag_id: String) -> Result<String, String> {
+    let root = repo_root();
+    let runtime = resolve_runtime_config(&root)?;
+    let diag_id = validate_diag_id_component(&diag_id)?;
+    let diag_root = diagnostics_root(&runtime.out_base_dir);
+    let root_canonical = canonicalize_existing_dir(&diag_root, "RULE_DIAG_ROOT_INVALID")?;
+    let target = diag_root.join(&diag_id).join("manifest.json");
+    if !target.exists() || !target.is_file() {
+        return Err(format!("manifest not found: {}", target.display()));
+    }
+    let canonical = target
+        .canonicalize()
+        .map_err(|e| format!("failed to canonicalize manifest {}: {e}", target.display()))?;
+    if !canonical.starts_with(&root_canonical) {
+        return Err("manifest path is outside diagnostics root".to_string());
+    }
+    let raw = fs::read_to_string(&canonical)
+        .map_err(|e| format!("failed to read manifest {}: {e}", canonical.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("failed to parse manifest {}: {e}", canonical.display()))?;
+    serde_json::to_string_pretty(&value)
+        .map_err(|e| format!("failed to format manifest {}: {e}", canonical.display()))
+}
+
+#[tauri::command]
+fn create_diagnostic_zip(diag_id: String) -> Result<DiagnosticsCollectResult, String> {
+    let root = repo_root();
+    let runtime = resolve_runtime_config(&root)?;
+    let diag_id = validate_diag_id_component(&diag_id)?;
+    let diag_dir = diagnostics_root(&runtime.out_base_dir).join(&diag_id);
+    let report_path = diag_dir.join("diag_report.md");
+    let summary_path = diag_dir.join("diag_summary.json");
+    if !diag_dir.exists() || !diag_dir.is_dir() {
+        return Err(format!("diagnostic folder not found: {}", diag_dir.display()));
+    }
+    if !report_path.exists() || !summary_path.exists() {
+        return Err("diagnostic report or summary is missing".to_string());
+    }
+
+    let summary_raw = fs::read_to_string(&summary_path)
+        .map_err(|e| format!("failed to read diagnostic summary {}: {e}", summary_path.display()))?;
+    let mut summary: DiagnosticSummary = serde_json::from_str(&summary_raw)
+        .map_err(|e| format!("failed to parse diagnostic summary {}: {e}", summary_path.display()))?;
+
+    let zip_path = diag_dir.join("bundle.zip");
+    summary.zip_path = Some(zip_path.to_string_lossy().to_string());
+    let summary_text = serde_json::to_string_pretty(&summary)
+        .map_err(|e| format!("failed to serialize diagnostic summary: {e}"))?;
+    atomic_write_text(&summary_path, &summary_text)?;
+
+    let (manifest, mut payloads) = build_manifest_and_payloads(&diag_id, &diag_dir, &summary)?;
+    let manifest_path = diag_dir.join("manifest.json");
+    let manifest_text = serde_json::to_string_pretty(&manifest)
+        .map_err(|e| format!("failed to serialize manifest.json: {e}"))?;
+    atomic_write_text(&manifest_path, &manifest_text)?;
+    payloads.push(("manifest.json".to_string(), manifest_text.into_bytes()));
+
+    write_deterministic_zip(&zip_path, payloads)?;
+
+    Ok(DiagnosticsCollectResult {
+        diag_id,
+        diag_dir: diag_dir.to_string_lossy().to_string(),
+        report_path: report_path.to_string_lossy().to_string(),
+        zip_path: Some(zip_path.to_string_lossy().to_string()),
+    })
 }
 
 #[tauri::command]
@@ -6009,6 +6367,9 @@ fn main() {
             list_diagnostics,
             read_diagnostic_report,
             open_diagnostic_folder,
+            open_diagnostic_zip,
+            read_manifest,
+            create_diagnostic_zip,
             read_run_artifact,
             list_run_artifacts,
             read_run_artifact_named,
@@ -7187,12 +7548,47 @@ mod tests {
         assert!(diag_dir.exists());
         assert!(diag_dir.join("diag_report.md").exists());
         assert!(diag_dir.join("diag_summary.json").exists());
+        assert!(diag_dir.join("manifest.json").exists());
+        assert!(result.zip_path.is_some());
+
+        let zip_path = PathBuf::from(result.zip_path.clone().unwrap_or_default());
+        assert!(zip_path.exists());
 
         let summary_raw = fs::read_to_string(diag_dir.join("diag_summary.json")).expect("read summary");
         let summary: DiagnosticSummary = serde_json::from_str(&summary_raw).expect("parse summary");
         assert!(!summary.jobs.is_empty());
         assert!(!summary.pipelines.is_empty());
-        assert!(summary.files.iter().any(|f| !f.included && f.reason.as_deref() == Some("file_too_large")));
+        assert!(summary.zip_path.is_some());
+
+        let manifest_raw = fs::read_to_string(diag_dir.join("manifest.json")).expect("read manifest");
+        let manifest: DiagnosticManifest = serde_json::from_str(&manifest_raw).expect("parse manifest");
+        assert!(!manifest.included.is_empty());
+        assert!(manifest
+            .skipped
+            .iter()
+            .any(|s| s.reason == "too_large"));
+        let sorted_paths = manifest
+            .included
+            .iter()
+            .map(|e| e.path.clone())
+            .collect::<Vec<_>>();
+        let mut expected_paths = sorted_paths.clone();
+        expected_paths.sort();
+        assert_eq!(sorted_paths, expected_paths);
+
+        let zip_file = fs::File::open(&zip_path).expect("open zip");
+        let mut archive = zip::ZipArchive::new(zip_file).expect("read zip archive");
+        let mut names = Vec::new();
+        for i in 0..archive.len() {
+            let f = archive.by_index(i).expect("zip entry");
+            names.push(f.name().to_string());
+        }
+        assert!(names.iter().any(|n| n == "diag_report.md"));
+        assert!(names.iter().any(|n| n == "diag_summary.json"));
+        assert!(names.iter().any(|n| n == "manifest.json"));
+        let mut names_sorted = names.clone();
+        names_sorted.sort();
+        assert_eq!(names, names_sorted);
 
         let _ = fs::remove_dir_all(&base);
     }

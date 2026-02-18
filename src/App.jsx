@@ -474,6 +474,24 @@ export default function App() {
     }
   }
 
+  async function onOpenDiagnosticZip(diagId) {
+    if (!diagId) return;
+    try {
+      await invoke("open_diagnostic_zip", { diagId });
+    } catch (e) {
+      alert(String(e));
+    }
+  }
+
+  async function onCopyZipPath(zipPath) {
+    if (!zipPath) return;
+    try {
+      await navigator.clipboard?.writeText(zipPath);
+    } catch (e) {
+      alert(String(e));
+    }
+  }
+
   async function loadPipelineDetail(pipelineId) {
     if (!pipelineId) {
       setPipelineDetail(null);
@@ -2521,6 +2539,7 @@ export default function App() {
                   <div key={d.diag_id} style={{ border: "1px solid #eee", borderRadius: 6, padding: 8 }}>
                     <div style={{ fontSize: 12, fontWeight: 600 }}>{d.diag_id}</div>
                     <div style={{ fontSize: 11 }}>created_at={d.created_at} size={d.size_bytes} bytes</div>
+                    <div style={{ fontSize: 11 }}>bundle.zip={d.zip_path || "(none)"}</div>
                     <div style={{ display: "flex", gap: 6, marginTop: 6, flexWrap: "wrap" }}>
                       <button
                         onClick={() => setSelectedDiagId(d.diag_id)}
@@ -2535,11 +2554,18 @@ export default function App() {
                         Open folder
                       </button>
                       <button
-                        onClick={() => onOpenDiagnosticFolder(d.diag_id)}
+                        onClick={() => onOpenDiagnosticZip(d.diag_id)}
                         disabled={!d.zip_path}
                         style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
                       >
                         Open zip
+                      </button>
+                      <button
+                        onClick={() => onCopyZipPath(d.zip_path)}
+                        disabled={!d.zip_path}
+                        style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+                      >
+                        Copy zip path
                       </button>
                     </div>
                   </div>
