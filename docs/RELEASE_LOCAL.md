@@ -43,5 +43,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\release_win.ps1 -P
 - 推奨: `installers/` 内の MSI または EXE インストーラーを実行
 - 代替: `bin/` の EXE を直接起動（配布形態によっては依存不足の可能性あり）
 
+## インストール後の起動確認（必須チェック）
+1. Start Menu から `jarvis-desktop` を起動する
+2. Setup 画面（または Ops 画面）で `デスクトップにショートカットを作成` を実行する
+3. Desktop に `jarvis-desktop.lnk` が生成される
+4. `.lnk` をダブルクリックしてアプリが起動する
+
+期待結果:
+- ターミナルを開かずに起動できる
+- ショートカット作成失敗時は UI に次アクション（権限/セキュリティ設定確認）が表示される
+
 ## SmartScreen にブロックされた場合
 未署名ローカルビルドでは SmartScreen 警告が出る場合があります。組織ポリシーに従って確認し、信頼できるビルドのみを実行してください。

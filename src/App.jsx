@@ -205,7 +205,10 @@ export default function App() {
   const [selectedPipelineId, setSelectedPipelineId] = useState("");
   const [pipelineDetail, setPipelineDetail] = useState(null);
   const [pipelineDetailLoading, setPipelineDetailLoading] = useState(false);
-  const [activeScreen, setActiveScreen] = useState("main");
+  const [activeScreen, setActiveScreen] = useState("setup");
+  const [shortcutBusy, setShortcutBusy] = useState(false);
+  const [shortcutStatus, setShortcutStatus] = useState(null);
+  const [shortcutError, setShortcutError] = useState("");
   const [opsNeedsAttentionOnly, setOpsNeedsAttentionOnly] = useState(false);
   const [opsAutoRetryPendingOnly, setOpsAutoRetryPendingOnly] = useState(false);
   const [desktopSettings, setDesktopSettings] = useState(null);
@@ -403,6 +406,49 @@ export default function App() {
       await invoke("open_audit_log");
     } catch (e) {
       alert(String(e));
+    }
+  }
+
+  function formatShortcutError(raw) {
+    const text = String(raw ?? "").trim();
+    const lower = text.toLowerCase();
+    if (lower.includes("unsupported")) {
+      return "この機能は Windows でのみ利用できます。";
+    }
+    if (lower.includes("userprofile") || lower.includes("desktop folder")) {
+      return "Desktop パスを取得できませんでした。Windows ユーザープロファイルを確認してください。";
+    }
+    if (lower.includes("access") || lower.includes("denied") || lower.includes("permission")) {
+      return "ショートカット作成権限がありません。権限設定やセキュリティソフトの制限を確認してください。";
+    }
+    if (lower.includes("powershell")) {
+      return "PowerShell 実行に失敗しました。ExecutionPolicy やセキュリティ設定を確認してください。";
+    }
+    return text || "ショートカット作成に失敗しました。";
+  }
+
+  async function onCreateDesktopShortcut(dryRun = false) {
+    setShortcutBusy(true);
+    setShortcutError("");
+    try {
+      const res = await invoke("create_desktop_shortcut", { dryRun });
+      setShortcutStatus(res ?? null);
+      if (!res?.ok) {
+        setShortcutError(formatShortcutError(res?.error));
+      }
+    } catch (e) {
+      setShortcutStatus(null);
+      setShortcutError(formatShortcutError(String(e)));
+    } finally {
+      setShortcutBusy(false);
+    }
+  }
+
+  async function onOpenDesktopFolder() {
+    try {
+      await invoke("open_desktop_folder");
+    } catch (e) {
+      setShortcutError(formatShortcutError(String(e)));
     }
   }
 
@@ -1541,6 +1587,17 @@ export default function App() {
 
       <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
         <button
+          onClick={() => setActiveScreen("setup")}
+          style={{
+            padding: "8px 12px",
+            borderRadius: 8,
+            border: "1px solid #333",
+            background: activeScreen === "setup" ? "#eef5ff" : "white",
+          }}
+        >
+          Setup
+        </button>
+        <button
           onClick={() => setActiveScreen("main")}
           style={{
             padding: "8px 12px",
@@ -1564,7 +1621,57 @@ export default function App() {
         </button>
       </div>
 
-      {activeScreen === "main" ? (
+      {activeScreen === "setup" ? (
+      <div style={{ border: "1px solid #ddd", borderRadius: 10, padding: 12, background: "#fafafa" }}>
+        <div style={{ fontWeight: 600, marginBottom: 8 }}>Setup completion</div>
+        <div style={{ fontSize: 12, marginBottom: 6 }}>
+          config: <code>{runtimeCfg?.ok ? "ok" : "error"}</code>
+          <span style={{ marginLeft: 10 }}>
+            preflight: <code>{preflight?.ok ? "ok" : "ng"}</code>
+          </span>
+        </div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
+          <button
+            onClick={() => onCreateDesktopShortcut(false)}
+            disabled={shortcutBusy}
+            style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+          >
+            {shortcutBusy ? "Creating..." : "デスクトップにショートカットを作成"}
+          </button>
+          <button
+            onClick={() => onCreateDesktopShortcut(true)}
+            disabled={shortcutBusy}
+            style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+          >
+            Dry-run
+          </button>
+          <button
+            onClick={onOpenDesktopFolder}
+            disabled={shortcutBusy}
+            style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+          >
+            Open Desktop
+          </button>
+        </div>
+        {shortcutStatus?.ok ? (
+          <div style={{ fontSize: 12, color: "#1f6f3f" }}>
+            {shortcutStatus?.dry_run ? "Dry-run OK: " : "作成成功: "}
+            <code>{shortcutStatus.link_path}</code>
+          </div>
+        ) : null}
+        {shortcutError ? (
+          <div style={{ fontSize: 12, color: "#a33", marginTop: 4 }}>{shortcutError}</div>
+        ) : null}
+        <div style={{ marginTop: 10, display: "flex", gap: 8 }}>
+          <button
+            onClick={() => setActiveScreen("main")}
+            style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+          >
+            Continue to Main
+          </button>
+        </div>
+      </div>
+      ) : activeScreen === "main" ? (
       <>
 
       <div
@@ -2596,6 +2703,20 @@ export default function App() {
             >
               Open audit log
             </button>
+            <button
+              onClick={() => onCreateDesktopShortcut(false)}
+              disabled={shortcutBusy}
+              style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+            >
+              {shortcutBusy ? "Creating shortcut..." : "Create desktop shortcut"}
+            </button>
+            <button
+              onClick={onOpenDesktopFolder}
+              disabled={shortcutBusy}
+              style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+            >
+              Open Desktop
+            </button>
             <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
               <input
                 type="checkbox"
@@ -2622,6 +2743,14 @@ export default function App() {
               Auto-retry enabled
             </label>
           </div>
+          {shortcutStatus?.ok ? (
+            <div style={{ fontSize: 12, color: "#1f6f3f", marginBottom: 8 }}>
+              shortcut created: <code>{shortcutStatus.link_path}</code>
+            </div>
+          ) : null}
+          {shortcutError ? (
+            <div style={{ fontSize: 12, color: "#a33", marginBottom: 8 }}>{shortcutError}</div>
+          ) : null}
 
           <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: 10, marginBottom: 12, fontSize: 12 }}>
             <div style={{ fontWeight: 600, marginBottom: 6 }}>Auto-retry policy</div>
