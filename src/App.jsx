@@ -212,6 +212,14 @@ export default function App() {
   const [settingsLoading, setSettingsLoading] = useState(false);
   const [settingsError, setSettingsError] = useState("");
   const [tickResult, setTickResult] = useState(null);
+  const [diagnosticsRows, setDiagnosticsRows] = useState([]);
+  const [diagnosticsLoading, setDiagnosticsLoading] = useState(false);
+  const [diagnosticsError, setDiagnosticsError] = useState("");
+  const [collectingDiagnostics, setCollectingDiagnostics] = useState(false);
+  const [selectedDiagId, setSelectedDiagId] = useState("");
+  const [diagReport, setDiagReport] = useState("");
+  const [diagReportLoading, setDiagReportLoading] = useState(false);
+  const [diagReportError, setDiagReportError] = useState("");
   const autoRetryTickBusyRef = useRef(false);
   const [libraryRows, setLibraryRows] = useState([]);
   const [libraryLoading, setLibraryLoading] = useState(false);
@@ -398,6 +406,71 @@ export default function App() {
       setTickResult({ acted: false, reason: String(e) });
     } finally {
       autoRetryTickBusyRef.current = false;
+    }
+  }
+
+  async function loadDiagnostics() {
+    setDiagnosticsLoading(true);
+    setDiagnosticsError("");
+    try {
+      const rows = await invoke("list_diagnostics");
+      const list = Array.isArray(rows) ? rows : [];
+      setDiagnosticsRows(list);
+      setSelectedDiagId((prev) => {
+        if (prev && list.some((r) => r.diag_id === prev)) return prev;
+        return list[0]?.diag_id ?? "";
+      });
+    } catch (e) {
+      setDiagnosticsRows([]);
+      setDiagnosticsError(String(e));
+    } finally {
+      setDiagnosticsLoading(false);
+    }
+  }
+
+  async function onCollectDiagnostics() {
+    setCollectingDiagnostics(true);
+    setDiagnosticsError("");
+    try {
+      const res = await invoke("collect_diagnostics", {
+        opts: {
+          include_audit: true,
+          include_recent_runs: true,
+          include_zip: true,
+        },
+      });
+      await loadDiagnostics();
+      if (res?.diag_id) {
+        setSelectedDiagId(res.diag_id);
+      }
+    } catch (e) {
+      setDiagnosticsError(String(e));
+    } finally {
+      setCollectingDiagnostics(false);
+    }
+  }
+
+  async function onLoadDiagnosticReport(diagId) {
+    if (!diagId) return;
+    setDiagReportLoading(true);
+    setDiagReportError("");
+    try {
+      const report = await invoke("read_diagnostic_report", { diagId });
+      setDiagReport(String(report ?? ""));
+    } catch (e) {
+      setDiagReport("");
+      setDiagReportError(String(e));
+    } finally {
+      setDiagReportLoading(false);
+    }
+  }
+
+  async function onOpenDiagnosticFolder(diagId) {
+    if (!diagId) return;
+    try {
+      await invoke("open_diagnostic_folder", { diagId });
+    } catch (e) {
+      alert(String(e));
     }
   }
 
@@ -834,6 +907,7 @@ export default function App() {
     loadJobs();
     loadPipelines();
     loadSettings();
+    loadDiagnostics();
     loadLibraryRows();
     loadLibraryStats();
   }, []);
@@ -849,6 +923,7 @@ export default function App() {
   useEffect(() => {
     if (activeScreen !== "ops") return;
     tickAutoRetry();
+    loadDiagnostics();
     const timer = setInterval(() => {
       tickAutoRetry();
     }, 2000);
@@ -858,6 +933,15 @@ export default function App() {
   useEffect(() => {
     loadPipelineDetail(selectedPipelineId);
   }, [selectedPipelineId]);
+
+  useEffect(() => {
+    if (!selectedDiagId) {
+      setDiagReport("");
+      setDiagReportError("");
+      return;
+    }
+    onLoadDiagnosticReport(selectedDiagId);
+  }, [selectedDiagId]);
 
   useEffect(() => {
     loadLibraryDetail(selectedPaperKey);
@@ -2356,6 +2440,7 @@ export default function App() {
                 await loadJobs();
                 await loadRuns();
                 await loadSettings();
+                await loadDiagnostics();
               }}
               style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
             >
@@ -2407,6 +2492,75 @@ export default function App() {
               tick={tickResult?.reason ?? "-"} acted={tickResult?.acted ? "yes" : "no"}
             </div>
             {settingsError ? <div style={{ marginTop: 4, color: "#c00" }}>{settingsError}</div> : null}
+          </div>
+
+          <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: 10, marginBottom: 12 }}>
+            <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8, flexWrap: "wrap" }}>
+              <div style={{ fontWeight: 600 }}>Diagnostics</div>
+              <button
+                onClick={onCollectDiagnostics}
+                disabled={collectingDiagnostics}
+                style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+              >
+                {collectingDiagnostics ? "Collecting..." : "Collect Diagnostics"}
+              </button>
+              <button
+                onClick={loadDiagnostics}
+                disabled={diagnosticsLoading}
+                style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+              >
+                Reload list
+              </button>
+            </div>
+            {diagnosticsError ? <div style={{ color: "#c00", fontSize: 12, marginBottom: 6 }}>{diagnosticsError}</div> : null}
+            {diagnosticsRows.length === 0 ? (
+              <div style={{ fontSize: 12, opacity: 0.8 }}>No diagnostic bundles.</div>
+            ) : (
+              <div style={{ display: "grid", gap: 6, marginBottom: 8 }}>
+                {diagnosticsRows.map((d) => (
+                  <div key={d.diag_id} style={{ border: "1px solid #eee", borderRadius: 6, padding: 8 }}>
+                    <div style={{ fontSize: 12, fontWeight: 600 }}>{d.diag_id}</div>
+                    <div style={{ fontSize: 11 }}>created_at={d.created_at} size={d.size_bytes} bytes</div>
+                    <div style={{ display: "flex", gap: 6, marginTop: 6, flexWrap: "wrap" }}>
+                      <button
+                        onClick={() => setSelectedDiagId(d.diag_id)}
+                        style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+                      >
+                        View report
+                      </button>
+                      <button
+                        onClick={() => onOpenDiagnosticFolder(d.diag_id)}
+                        style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+                      >
+                        Open folder
+                      </button>
+                      <button
+                        onClick={() => onOpenDiagnosticFolder(d.diag_id)}
+                        disabled={!d.zip_path}
+                        style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+                      >
+                        Open zip
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+            {selectedDiagId ? (
+              <div style={{ border: "1px solid #eee", borderRadius: 6, padding: 8 }}>
+                <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>Report: {selectedDiagId}</div>
+                {diagReportLoading ? (
+                  <div style={{ fontSize: 12, opacity: 0.8 }}>Loading report...</div>
+                ) : diagReportError ? (
+                  <div style={{ color: "#c00", fontSize: 12 }}>{diagReportError}</div>
+                ) : (
+                  <div
+                    style={{ fontSize: 12, lineHeight: 1.5 }}
+                    dangerouslySetInnerHTML={{ __html: renderMarkdownToHtml(diagReport || "") }}
+                  />
+                )}
+              </div>
+            ) : null}
           </div>
 
           <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: 10, marginBottom: 12 }}>

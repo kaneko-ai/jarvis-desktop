@@ -12,6 +12,11 @@ use std::{fs, io::Write};
 use chrono::{DateTime, Utc};
 
 const MAX_ARTIFACT_READ_BYTES: u64 = 3 * 1024 * 1024;
+const SCHEMA_VERSION: u32 = 1;
+const DIAG_MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
+const DIAG_MAX_TOTAL_BYTES: u64 = 30 * 1024 * 1024;
+const DIAG_AUDIT_TAIL_LINES: usize = 200;
+const DIAG_MAX_RECENT_ITEMS: usize = 20;
 
 #[derive(Serialize)]
 struct RunResult {
@@ -227,6 +232,7 @@ struct JobRuntimeState {
 
 #[derive(Serialize, Deserialize)]
 struct JobFilePayload {
+    schema_version: u32,
     jobs: Vec<JobRecord>,
 }
 
@@ -320,7 +326,99 @@ struct AutoRetryTickResult {
 
 #[derive(Serialize, Deserialize, Default)]
 struct PipelineFilePayload {
+    schema_version: u32,
     pipelines: Vec<PipelineRecord>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SettingsFilePayload {
+    schema_version: u32,
+    settings: DesktopSettings,
+}
+
+#[derive(Deserialize, Default)]
+struct DiagnosticsCollectOptions {
+    include_audit: Option<bool>,
+    include_recent_runs: Option<bool>,
+    include_zip: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct DiagnosticsCollectResult {
+    diag_id: String,
+    diag_dir: String,
+    report_path: String,
+    zip_path: Option<String>,
+}
+
+#[derive(Serialize)]
+struct DiagnosticListItem {
+    diag_id: String,
+    created_at: String,
+    size_bytes: u64,
+    zip_path: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct DiagnosticFileEntry {
+    rel_path: String,
+    source_path: String,
+    included: bool,
+    size_bytes: u64,
+    reason: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct DiagnosticJobSummary {
+    job_id: String,
+    status: String,
+    attempt: u32,
+    updated_at: String,
+    retry_at: Option<String>,
+    auto_retry_attempt_count: u32,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct DiagnosticPipelineSummary {
+    pipeline_id: String,
+    status: String,
+    current_step_index: usize,
+    total_steps: usize,
+    updated_at: String,
+    canonical_id: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct DiagnosticRunSummary {
+    run_id: String,
+    status: String,
+    mtime_epoch_ms: u64,
+    canonical_id: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct DiagnosticSummary {
+    diag_id: String,
+    created_at: String,
+    app_version: Option<String>,
+    os: String,
+    arch: String,
+    out_dir: String,
+    pipeline_root: String,
+    python_path: String,
+    include_audit: bool,
+    include_recent_runs: bool,
+    include_zip: bool,
+    smoke_script_path: String,
+    gate_commands: Vec<String>,
+    jobs: Vec<DiagnosticJobSummary>,
+    pipelines: Vec<DiagnosticPipelineSummary>,
+    runs: Vec<DiagnosticRunSummary>,
+    audit_tail: Vec<String>,
+    files: Vec<DiagnosticFileEntry>,
+    total_included_bytes: u64,
+    max_file_bytes: u64,
+    max_total_bytes: u64,
 }
 
 #[derive(Deserialize, Clone)]
@@ -1610,19 +1708,116 @@ fn atomic_write_text(path: &Path, content: &str) -> Result<(), String> {
         .map_err(|e| format!("failed to move temp file to {}: {e}", path.display()))
 }
 
+fn subsystem_display_name(subsystem: &str) -> &str {
+    match subsystem {
+        "jobs" => "jobs.json",
+        "pipelines" => "pipelines.json",
+        "settings" => "settings.json",
+        _ => subsystem,
+    }
+}
+
+fn parse_schema_version(value: &serde_json::Value) -> Result<u32, String> {
+    if let Some(n) = value
+        .get("schema_version")
+        .and_then(|v| v.as_u64())
+    {
+        return u32::try_from(n)
+            .map_err(|_| "schema_version is out of supported range".to_string());
+    }
+    Ok(1)
+}
+
+fn migrate_schema_value(
+    _subsystem: &str,
+    from_version: u32,
+    to_version: u32,
+    value: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    match (from_version, to_version) {
+        (1, 2) => Ok(value),
+        _ => Err(format!(
+            "no migration path from schema_version={from_version} to {to_version}"
+        )),
+    }
+}
+
+fn load_with_migration<T, F>(path: &Path, subsystem: &str, decode: F) -> Result<T, String>
+where
+    F: FnOnce(serde_json::Value) -> Result<T, String>,
+{
+    let raw = fs::read_to_string(path)
+        .map_err(|e| format!("failed to read {} {}: {e}", subsystem_display_name(subsystem), path.display()))?;
+    let mut value: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("failed to parse {} {}: {e}", subsystem_display_name(subsystem), path.display()))?;
+    if !value.is_object() {
+        return Err(format!(
+            "invalid {} {}: root must be an object",
+            subsystem_display_name(subsystem),
+            path.display()
+        ));
+    }
+
+    let mut version = parse_schema_version(&value)?;
+    if version > SCHEMA_VERSION {
+        return Err(format!(
+            "{} has unsupported schema_version={} (supported={}); subsystem is read-only",
+            subsystem_display_name(subsystem),
+            version,
+            SCHEMA_VERSION
+        ));
+    }
+
+    while version < SCHEMA_VERSION {
+        let next = version + 1;
+        value = migrate_schema_value(subsystem, version, next, value)?;
+        version = next;
+    }
+
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "schema_version".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(SCHEMA_VERSION as u64)),
+        );
+    }
+    decode(value)
+}
+
+fn ensure_schema_writable(path: &Path, subsystem: &str) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let raw = fs::read_to_string(path)
+        .map_err(|e| format!("failed to read {} {}: {e}", subsystem_display_name(subsystem), path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("failed to parse {} {}: {e}", subsystem_display_name(subsystem), path.display()))?;
+    let version = parse_schema_version(&value)?;
+    if version > SCHEMA_VERSION {
+        return Err(format!(
+            "{} has unsupported schema_version={} (supported={}); refusing to modify",
+            subsystem_display_name(subsystem),
+            version,
+            SCHEMA_VERSION
+        ));
+    }
+    Ok(())
+}
+
 fn load_jobs_from_file(path: &Path) -> Result<Vec<JobRecord>, String> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let raw = fs::read_to_string(path)
-        .map_err(|e| format!("failed to read jobs file {}: {e}", path.display()))?;
-    let payload: JobFilePayload = serde_json::from_str(&raw)
-        .map_err(|e| format!("failed to parse jobs file {}: {e}", path.display()))?;
+    let payload: JobFilePayload = load_with_migration(path, "jobs", |value| {
+        serde_json::from_value::<JobFilePayload>(value)
+            .map_err(|e| format!("failed to decode jobs file {}: {e}", path.display()))
+    })?;
     Ok(payload.jobs)
 }
 
 fn save_jobs_to_file(path: &Path, jobs: &[JobRecord]) -> Result<(), String> {
+    ensure_schema_writable(path, "jobs")?;
     let payload = JobFilePayload {
+        schema_version: SCHEMA_VERSION,
         jobs: jobs.to_vec(),
     };
     let text = serde_json::to_string_pretty(&payload)
@@ -1634,15 +1829,17 @@ fn load_pipelines_from_file(path: &Path) -> Result<Vec<PipelineRecord>, String> 
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let raw = fs::read_to_string(path)
-        .map_err(|e| format!("failed to read pipelines file {}: {e}", path.display()))?;
-    let payload: PipelineFilePayload = serde_json::from_str(&raw)
-        .map_err(|e| format!("failed to parse pipelines file {}: {e}", path.display()))?;
+    let payload: PipelineFilePayload = load_with_migration(path, "pipelines", |value| {
+        serde_json::from_value::<PipelineFilePayload>(value)
+            .map_err(|e| format!("failed to decode pipelines file {}: {e}", path.display()))
+    })?;
     Ok(payload.pipelines)
 }
 
 fn save_pipelines_to_file(path: &Path, pipelines: &[PipelineRecord]) -> Result<(), String> {
+    ensure_schema_writable(path, "pipelines")?;
     let payload = PipelineFilePayload {
+        schema_version: SCHEMA_VERSION,
         pipelines: pipelines.to_vec(),
     };
     let text = serde_json::to_string_pretty(&payload)
@@ -1657,15 +1854,25 @@ fn load_settings(out_dir: &Path) -> Result<DesktopSettings, String> {
         save_settings(out_dir, &defaults)?;
         return Ok(defaults);
     }
-    let raw = fs::read_to_string(&path)
-        .map_err(|e| format!("failed to read settings file {}: {e}", path.display()))?;
-    serde_json::from_str::<DesktopSettings>(&raw)
-        .map_err(|e| format!("failed to parse settings file {}: {e}", path.display()))
+    load_with_migration(&path, "settings", |value| {
+        if value.get("settings").is_some() {
+            let payload = serde_json::from_value::<SettingsFilePayload>(value)
+                .map_err(|e| format!("failed to decode settings file {}: {e}", path.display()))?;
+            return Ok(payload.settings);
+        }
+        serde_json::from_value::<DesktopSettings>(value)
+            .map_err(|e| format!("failed to parse legacy settings file {}: {e}", path.display()))
+    })
 }
 
 fn save_settings(out_dir: &Path, settings: &DesktopSettings) -> Result<(), String> {
     let path = settings_file_path(out_dir);
-    let text = serde_json::to_string_pretty(settings)
+    ensure_schema_writable(&path, "settings")?;
+    let payload = SettingsFilePayload {
+        schema_version: SCHEMA_VERSION,
+        settings: settings.clone(),
+    };
+    let text = serde_json::to_string_pretty(&payload)
         .map_err(|e| format!("failed to serialize settings: {e}"))?;
     atomic_write_text(&path, &text)
 }
@@ -3919,6 +4126,534 @@ fn get_run_status(run_id: String) -> Result<String, String> {
     Ok(parse_status_from_result(&run_dir.join("result.json")))
 }
 
+fn diagnostics_root(out_dir: &Path) -> PathBuf {
+    out_dir.join(".jarvis-desktop").join("diag")
+}
+
+fn validate_diag_id_component(diag_id: &str) -> Result<String, String> {
+    let trimmed = diag_id.trim();
+    if trimmed.is_empty() {
+        return Err("diag_id is empty".to_string());
+    }
+    if trimmed == "." || trimmed == ".." {
+        return Err("diag_id is invalid".to_string());
+    }
+    if trimmed.contains('\\') || trimmed.contains('/') {
+        return Err("diag_id must not contain path separators".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+fn make_diag_id() -> String {
+    let ts = Utc::now().format("%Y%m%d_%H%M%S").to_string();
+    let short = make_run_id()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(8)
+        .collect::<String>();
+    format!("{}_{}", ts, short)
+}
+
+fn read_app_version(repo_root: &Path) -> Option<String> {
+    let path = repo_root.join("package.json");
+    let raw = fs::read_to_string(path).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
+    value
+        .get("version")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string())
+}
+
+fn redact_sensitive_text(line: &str) -> String {
+    let lowered = line.to_lowercase();
+    if lowered.contains("api_key")
+        || lowered.contains("token")
+        || lowered.contains("authorization")
+        || lowered.contains("password")
+    {
+        if let Some(idx) = line.find(':') {
+            return format!("{}: ********", &line[..idx]);
+        }
+        return "********".to_string();
+    }
+    line.to_string()
+}
+
+fn read_tail_lines(path: &Path, max_lines: usize) -> Vec<String> {
+    let raw = match fs::read_to_string(path) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let mut lines: Vec<String> = raw.lines().map(redact_sensitive_text).collect();
+    if lines.len() > max_lines {
+        lines = lines.split_off(lines.len() - max_lines);
+    }
+    lines
+}
+
+fn extract_gate_commands_from_checklist(repo_root: &Path) -> Vec<String> {
+    let path = repo_root.join("scripts").join("clean_machine_checklist.md");
+    let raw = match fs::read_to_string(path) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let lower = t.to_lowercase();
+        if lower.contains("npm run build")
+            || lower.contains("cargo test")
+            || lower.contains("smoke_tauri_e2e")
+            || lower.contains("collect_diag.ps1")
+        {
+            out.push(t.to_string());
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn collect_recent_run_summaries(out_dir: &Path, limit: usize) -> Vec<DiagnosticRunSummary> {
+    let mut entries: Vec<(PathBuf, u64)> = Vec::new();
+    let read = match fs::read_dir(out_dir) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    for entry in read.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        entries.push((path.clone(), modified_epoch_ms(&path)));
+    }
+    entries.sort_by(|a, b| {
+        b.1.cmp(&a.1).then_with(|| {
+            a.0.file_name()
+                .map(|v| v.to_string_lossy().to_string())
+                .unwrap_or_default()
+                .cmp(
+                    &b.0.file_name()
+                        .map(|v| v.to_string_lossy().to_string())
+                        .unwrap_or_default(),
+                )
+        })
+    });
+
+    let mut out = Vec::new();
+    for (run_dir, ts) in entries.into_iter().take(limit) {
+        let run_id = run_dir
+            .file_name()
+            .map(|v| v.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        out.push(DiagnosticRunSummary {
+            run_id,
+            status: parse_status_from_result(&run_dir.join("result.json")),
+            mtime_epoch_ms: ts,
+            canonical_id: parse_paper_id_from_input(&run_dir.join("input.json")),
+        });
+    }
+    out
+}
+
+fn collect_candidate_diag_files(
+    runtime: &RuntimeConfig,
+    include_audit: bool,
+    include_recent_runs: bool,
+) -> Vec<(PathBuf, String)> {
+    let mut candidates: Vec<(PathBuf, String)> = Vec::new();
+    let jobs = jobs_file_path(&runtime.out_base_dir);
+    candidates.push((jobs, "state/jobs.json".to_string()));
+    let pipelines = pipelines_file_path(&runtime.out_base_dir);
+    candidates.push((pipelines, "state/pipelines.json".to_string()));
+    let settings = settings_file_path(&runtime.out_base_dir);
+    candidates.push((settings, "state/settings.json".to_string()));
+    if include_audit {
+        let audit = audit_jsonl_path(&runtime.out_base_dir);
+        candidates.push((audit, "state/audit.jsonl".to_string()));
+    }
+
+    if include_recent_runs {
+        let runs = collect_recent_run_summaries(&runtime.out_base_dir, 5);
+        for run in runs {
+            let run_path = runtime.out_base_dir.join(run.run_id.clone());
+            let run_id = run.run_id;
+            for (src_rel, dst_rel) in [
+                ("input.json", "input.json"),
+                ("result.json", "result.json"),
+                ("paper_graph/tree/tree.md", "tree.md"),
+                ("stdout.log", "stdout.log"),
+                ("stderr.log", "stderr.log"),
+            ] {
+                let src = run_path.join(rel_path_to_pathbuf(src_rel));
+                let rel = format!("runs/{run_id}/{dst_rel}");
+                candidates.push((src, rel));
+            }
+        }
+    }
+
+    candidates.sort_by(|a, b| {
+        a.0.to_string_lossy()
+            .cmp(&b.0.to_string_lossy())
+            .then_with(|| a.1.cmp(&b.1))
+    });
+    candidates
+}
+
+fn copy_diagnostic_files_with_caps(
+    diag_dir: &Path,
+    candidates: &[(PathBuf, String)],
+) -> Result<(Vec<DiagnosticFileEntry>, u64), String> {
+    let mut entries = Vec::new();
+    let mut total: u64 = 0;
+
+    for (src, rel) in candidates {
+        let source_path = src.to_string_lossy().to_string();
+        if !src.exists() {
+            entries.push(DiagnosticFileEntry {
+                rel_path: rel.clone(),
+                source_path,
+                included: false,
+                size_bytes: 0,
+                reason: Some("missing".to_string()),
+            });
+            continue;
+        }
+        let meta = fs::metadata(src)
+            .map_err(|e| format!("failed to stat diagnostic source {}: {e}", src.display()))?;
+        if !meta.is_file() {
+            entries.push(DiagnosticFileEntry {
+                rel_path: rel.clone(),
+                source_path,
+                included: false,
+                size_bytes: 0,
+                reason: Some("not_a_file".to_string()),
+            });
+            continue;
+        }
+        let size = meta.len();
+        if size > DIAG_MAX_FILE_BYTES {
+            entries.push(DiagnosticFileEntry {
+                rel_path: rel.clone(),
+                source_path,
+                included: false,
+                size_bytes: size,
+                reason: Some("file_too_large".to_string()),
+            });
+            continue;
+        }
+        if total.saturating_add(size) > DIAG_MAX_TOTAL_BYTES {
+            entries.push(DiagnosticFileEntry {
+                rel_path: rel.clone(),
+                source_path,
+                included: false,
+                size_bytes: size,
+                reason: Some("total_limit_exceeded".to_string()),
+            });
+            continue;
+        }
+
+        let dst = diag_dir.join(rel_path_to_pathbuf(rel));
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create diagnostic directory {}: {e}", parent.display()))?;
+        }
+        fs::copy(src, &dst)
+            .map_err(|e| format!("failed to copy diagnostic file {} -> {}: {e}", src.display(), dst.display()))?;
+
+        total = total.saturating_add(size);
+        entries.push(DiagnosticFileEntry {
+            rel_path: rel.clone(),
+            source_path,
+            included: true,
+            size_bytes: size,
+            reason: None,
+        });
+    }
+
+    Ok((entries, total))
+}
+
+fn render_diag_report(summary: &DiagnosticSummary) -> String {
+    let mut out = String::new();
+    out.push_str("# Diagnostics Report\n\n");
+    out.push_str(&format!("- diag_id: {}\n", summary.diag_id));
+    out.push_str(&format!("- created_at: {}\n", summary.created_at));
+    out.push_str(&format!("- app_version: {}\n", summary.app_version.clone().unwrap_or_else(|| "unknown".to_string())));
+    out.push_str(&format!("\n- os: {}\n- arch: {}\n", summary.os, summary.arch));
+    out.push_str("\n## Resolved Config\n");
+    out.push_str(&format!("- out_dir: {}\n", summary.out_dir));
+    out.push_str(&format!("- pipeline_root: {}\n", summary.pipeline_root));
+    out.push_str(&format!("- python_path: {}\n", summary.python_path));
+    out.push_str("\n## Gates from Checklist\n");
+    if summary.gate_commands.is_empty() {
+        out.push_str("- (none)\n");
+    } else {
+        for cmd in &summary.gate_commands {
+            out.push_str(&format!("- {}\n", cmd));
+        }
+    }
+
+    out.push_str("\n## State Summary\n");
+    out.push_str(&format!("- pipelines: {}\n", summary.pipelines.len()));
+    out.push_str(&format!("- jobs: {}\n", summary.jobs.len()));
+    out.push_str(&format!("- runs: {}\n", summary.runs.len()));
+    out.push_str(&format!(
+        "- copied_bytes: {} / {}\n",
+        summary.total_included_bytes,
+        summary.max_total_bytes
+    ));
+
+    out.push_str("\n## Skipped Files\n");
+    let mut skipped = 0usize;
+    for f in &summary.files {
+        if !f.included {
+            skipped += 1;
+            out.push_str(&format!(
+                "- {} (reason={}, source={})\n",
+                f.rel_path,
+                f.reason.clone().unwrap_or_else(|| "unknown".to_string()),
+                f.source_path
+            ));
+        }
+    }
+    if skipped == 0 {
+        out.push_str("- (none)\n");
+    }
+    out
+}
+
+fn directory_size_bytes(path: &Path) -> u64 {
+    let mut total = 0u64;
+    let rd = match fs::read_dir(path) {
+        Ok(v) => v,
+        Err(_) => return 0,
+    };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            total = total.saturating_add(directory_size_bytes(&p));
+        } else if let Ok(m) = fs::metadata(&p) {
+            total = total.saturating_add(m.len());
+        }
+    }
+    total
+}
+
+fn collect_diagnostics_internal(
+    root: &Path,
+    runtime: &RuntimeConfig,
+    opts: DiagnosticsCollectOptions,
+) -> Result<DiagnosticsCollectResult, String> {
+    let options = opts;
+    let include_audit = options.include_audit.unwrap_or(true);
+    let include_recent_runs = options.include_recent_runs.unwrap_or(true);
+    let include_zip = options.include_zip.unwrap_or(true);
+
+    let diag_root = diagnostics_root(&runtime.out_base_dir);
+    fs::create_dir_all(&diag_root)
+        .map_err(|e| format!("failed to create diagnostics root {}: {e}", diag_root.display()))?;
+
+    let diag_id = make_diag_id();
+    let diag_dir = diag_root.join(&diag_id);
+    fs::create_dir_all(&diag_dir)
+        .map_err(|e| format!("failed to create diagnostic dir {}: {e}", diag_dir.display()))?;
+
+    let mut jobs = load_jobs_from_file(&jobs_file_path(&runtime.out_base_dir))?;
+    sort_jobs_for_display(&mut jobs);
+    if jobs.len() > DIAG_MAX_RECENT_ITEMS {
+        jobs.truncate(DIAG_MAX_RECENT_ITEMS);
+    }
+    let job_rows = jobs
+        .into_iter()
+        .map(|j| DiagnosticJobSummary {
+            job_id: j.job_id,
+            status: format!("{:?}", j.status).to_lowercase(),
+            attempt: j.attempt,
+            updated_at: j.updated_at,
+            retry_at: j.retry_at,
+            auto_retry_attempt_count: j.auto_retry_attempt_count,
+        })
+        .collect::<Vec<_>>();
+
+    let mut pipelines = load_pipelines_from_file(&pipelines_file_path(&runtime.out_base_dir))?;
+    pipelines.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then_with(|| a.pipeline_id.cmp(&b.pipeline_id)));
+    if pipelines.len() > DIAG_MAX_RECENT_ITEMS {
+        pipelines.truncate(DIAG_MAX_RECENT_ITEMS);
+    }
+    let pipeline_rows = pipelines
+        .into_iter()
+        .map(|p| DiagnosticPipelineSummary {
+            pipeline_id: p.pipeline_id,
+            status: format!("{:?}", p.status).to_lowercase(),
+            current_step_index: p.current_step_index,
+            total_steps: p.steps.len(),
+            updated_at: p.updated_at,
+            canonical_id: p.canonical_id,
+        })
+        .collect::<Vec<_>>();
+
+    let mut run_rows = if include_recent_runs {
+        collect_recent_run_summaries(&runtime.out_base_dir, DIAG_MAX_RECENT_ITEMS)
+    } else {
+        Vec::new()
+    };
+    run_rows.sort_by(|a, b| b.mtime_epoch_ms.cmp(&a.mtime_epoch_ms).then_with(|| a.run_id.cmp(&b.run_id)));
+
+    let audit_tail = if include_audit {
+        read_tail_lines(&audit_jsonl_path(&runtime.out_base_dir), DIAG_AUDIT_TAIL_LINES)
+    } else {
+        Vec::new()
+    };
+
+    let candidates = collect_candidate_diag_files(runtime, include_audit, include_recent_runs);
+    let (files, total_included_bytes) = copy_diagnostic_files_with_caps(&diag_dir, &candidates)?;
+
+    let smoke_script_path = root
+        .join("smoke_tauri_e2e.ps1")
+        .to_string_lossy()
+        .to_string();
+    let gate_commands = extract_gate_commands_from_checklist(root);
+
+    let python_path = choose_python(root, &runtime.pipeline_root).0;
+    let summary = DiagnosticSummary {
+        diag_id: diag_id.clone(),
+        created_at: Utc::now().to_rfc3339(),
+        app_version: read_app_version(root),
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        out_dir: runtime.out_base_dir.to_string_lossy().to_string(),
+        pipeline_root: runtime.pipeline_root.to_string_lossy().to_string(),
+        python_path,
+        include_audit,
+        include_recent_runs,
+        include_zip,
+        smoke_script_path,
+        gate_commands,
+        jobs: job_rows,
+        pipelines: pipeline_rows,
+        runs: run_rows,
+        audit_tail,
+        files,
+        total_included_bytes,
+        max_file_bytes: DIAG_MAX_FILE_BYTES,
+        max_total_bytes: DIAG_MAX_TOTAL_BYTES,
+    };
+
+    let summary_path = diag_dir.join("diag_summary.json");
+    let summary_text = serde_json::to_string_pretty(&summary)
+        .map_err(|e| format!("failed to serialize diag summary: {e}"))?;
+    atomic_write_text(&summary_path, &summary_text)?;
+
+    let report_path = diag_dir.join("diag_report.md");
+    let report_text = render_diag_report(&summary);
+    atomic_write_text(&report_path, &report_text)?;
+
+    Ok(DiagnosticsCollectResult {
+        diag_id,
+        diag_dir: diag_dir.to_string_lossy().to_string(),
+        report_path: report_path.to_string_lossy().to_string(),
+        zip_path: None,
+    })
+}
+
+#[tauri::command]
+fn collect_diagnostics(opts: Option<DiagnosticsCollectOptions>) -> Result<DiagnosticsCollectResult, String> {
+    let root = repo_root();
+    let runtime = resolve_runtime_config(&root)?;
+    collect_diagnostics_internal(&root, &runtime, opts.unwrap_or_default())
+}
+
+#[tauri::command]
+fn list_diagnostics() -> Result<Vec<DiagnosticListItem>, String> {
+    let root = repo_root();
+    let runtime = resolve_runtime_config(&root)?;
+    let diag_root = diagnostics_root(&runtime.out_base_dir);
+    if !diag_root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut out = Vec::new();
+    for entry in fs::read_dir(&diag_root)
+        .map_err(|e| format!("failed to read diagnostics root {}: {e}", diag_root.display()))?
+    {
+        let entry = match entry {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let diag_id = match path.file_name().map(|v| v.to_string_lossy().to_string()) {
+            Some(v) => v,
+            None => continue,
+        };
+        let modified = fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .map(to_iso_from_system_time)
+            .unwrap_or_else(|| Utc::now().to_rfc3339());
+        let zip = path.join("bundle.zip");
+        out.push(DiagnosticListItem {
+            diag_id,
+            created_at: modified,
+            size_bytes: directory_size_bytes(&path),
+            zip_path: if zip.exists() {
+                Some(zip.to_string_lossy().to_string())
+            } else {
+                None
+            },
+        });
+    }
+
+    out.sort_by(|a, b| b.diag_id.cmp(&a.diag_id).then_with(|| a.created_at.cmp(&b.created_at)));
+    Ok(out)
+}
+
+#[tauri::command]
+fn read_diagnostic_report(diag_id: String) -> Result<String, String> {
+    let root = repo_root();
+    let runtime = resolve_runtime_config(&root)?;
+    let diag_id = validate_diag_id_component(&diag_id)?;
+    let diag_root = diagnostics_root(&runtime.out_base_dir);
+    let root_canonical = canonicalize_existing_dir(&diag_root, "RULE_DIAG_ROOT_INVALID")?;
+    let target = diag_root.join(&diag_id).join("diag_report.md");
+    if !target.exists() {
+        return Err(format!("diagnostic report not found: {}", target.display()));
+    }
+    let canonical = target
+        .canonicalize()
+        .map_err(|e| format!("failed to canonicalize diagnostic report {}: {e}", target.display()))?;
+    if !canonical.starts_with(&root_canonical) {
+        return Err("diagnostic report path is outside diagnostics root".to_string());
+    }
+    fs::read_to_string(&canonical)
+        .map_err(|e| format!("failed to read diagnostic report {}: {e}", canonical.display()))
+}
+
+#[tauri::command]
+fn open_diagnostic_folder(diag_id: String) -> Result<String, String> {
+    let root = repo_root();
+    let runtime = resolve_runtime_config(&root)?;
+    let diag_id = validate_diag_id_component(&diag_id)?;
+    let diag_root = diagnostics_root(&runtime.out_base_dir);
+    let root_canonical = canonicalize_existing_dir(&diag_root, "RULE_DIAG_ROOT_INVALID")?;
+    let target = diag_root.join(&diag_id);
+    let canonical = canonicalize_existing_dir(&target, "RULE_DIAG_DIR_INVALID")?;
+    if !canonical.starts_with(&root_canonical) {
+        return Err("diagnostic folder is outside diagnostics root".to_string());
+    }
+    Command::new("explorer")
+        .arg(&canonical)
+        .spawn()
+        .map_err(|e| format!("Failed to open diagnostic folder in explorer: {e}"))?;
+    Ok(canonical.to_string_lossy().to_string())
+}
+
 #[tauri::command]
 fn read_run_artifact(run_id: String, artifact: String) -> Result<RunArtifactView, String> {
     let root = repo_root();
@@ -5270,6 +6005,10 @@ fn main() {
             list_task_templates,
             list_runs,
             get_run_status,
+            collect_diagnostics,
+            list_diagnostics,
+            read_diagnostic_report,
+            open_diagnostic_folder,
             read_run_artifact,
             list_run_artifacts,
             read_run_artifact_named,
@@ -6352,6 +7091,163 @@ mod tests {
         let invalid = Some("not-a-number".to_string());
         assert_eq!(parse_retry_at_ms(invalid.as_ref()), None);
         assert_eq!(parse_retry_at_ms(None), None);
+    }
+
+    #[test]
+    fn diagnostics_bundle_generation_creates_report_and_summary_with_skips() {
+        let base = std::env::temp_dir().join(format!("jarvis_diag_bundle_{}", now_epoch_ms()));
+        let repo_root = base.join("repo");
+        let pipeline_root = base.join("pipeline");
+        let out_dir = base.join("out");
+        let _ = fs::create_dir_all(repo_root.join("scripts"));
+        let _ = fs::create_dir_all(&pipeline_root);
+        let _ = fs::create_dir_all(pipeline_root.join("jarvis_core"));
+        let _ = fs::create_dir_all(&out_dir);
+
+        fs::write(repo_root.join("package.json"), r#"{"version":"0.0.1"}"#).expect("write package");
+        fs::write(repo_root.join("smoke_tauri_e2e.ps1"), "# smoke").expect("write smoke");
+        fs::write(
+            repo_root.join("scripts").join("clean_machine_checklist.md"),
+            "- npm run build\n- cargo test\n- smoke_tauri_e2e.ps1\n- scripts\\collect_diag.ps1\n",
+        )
+        .expect("write checklist");
+
+        fs::write(pipeline_root.join("pyproject.toml"), "[tool.poetry]").expect("write pyproject");
+        fs::write(pipeline_root.join("jarvis_cli.py"), "print('ok')").expect("write cli");
+
+        let jobs_path = jobs_file_path(&out_dir);
+        let pipelines_path = pipelines_file_path(&out_dir);
+        save_jobs_to_file(
+            &jobs_path,
+            &[JobRecord {
+                job_id: "job_1".to_string(),
+                template_id: "TEMPLATE_TREE".to_string(),
+                canonical_id: "arxiv:1706.03762".to_string(),
+                params: serde_json::json!({}),
+                status: JobStatus::NeedsRetry,
+                attempt: 1,
+                created_at: now_epoch_ms_string(),
+                updated_at: now_epoch_ms_string(),
+                run_id: Some("run_1".to_string()),
+                last_error: Some("429".to_string()),
+                retry_after_seconds: Some(3.0),
+                retry_at: Some(now_epoch_ms_string()),
+                auto_retry_attempt_count: 0,
+            }],
+        )
+        .expect("save jobs");
+        save_pipelines_to_file(
+            &pipelines_path,
+            &[PipelineRecord {
+                pipeline_id: "pipe_1".to_string(),
+                canonical_id: "arxiv:1706.03762".to_string(),
+                name: "Analyze".to_string(),
+                created_at: now_epoch_ms_string(),
+                updated_at: now_epoch_ms_string(),
+                steps: vec![],
+                current_step_index: 0,
+                status: PipelineStatus::NeedsRetry,
+                last_primary_viz: None,
+                auto_retry_attempt_count: 0,
+            }],
+        )
+        .expect("save pipelines");
+
+        save_settings(&out_dir, &DesktopSettings::default()).expect("save settings");
+        let _ = fs::write(audit_jsonl_path(&out_dir), "{\"kind\":\"auto_retry\"}\n");
+
+        let run_dir = out_dir.join("run_1");
+        let _ = fs::create_dir_all(run_dir.join("paper_graph").join("tree"));
+        fs::write(run_dir.join("input.json"), r#"{"desktop":{"canonical_id":"arxiv:1706.03762"}}"#)
+            .expect("write input");
+        fs::write(run_dir.join("result.json"), r#"{"status":"needs_retry"}"#)
+            .expect("write result");
+        fs::write(run_dir.join("paper_graph").join("tree").join("tree.md"), "# tree")
+            .expect("write tree");
+        fs::write(
+            run_dir.join("stdout.log"),
+            "X".repeat((DIAG_MAX_FILE_BYTES + 1024) as usize),
+        )
+        .expect("write huge stdout");
+
+        let runtime = RuntimeConfig {
+            config_file_path: repo_root.join("config.json"),
+            config_file_loaded: false,
+            pipeline_root,
+            out_base_dir: out_dir.clone(),
+            s2_api_key: None,
+            s2_min_interval_ms: None,
+            s2_max_retries: None,
+            s2_backoff_base_sec: None,
+        };
+
+        let result = collect_diagnostics_internal(&repo_root, &runtime, DiagnosticsCollectOptions::default())
+            .expect("collect diagnostics");
+        let diag_dir = PathBuf::from(&result.diag_dir);
+        assert!(diag_dir.exists());
+        assert!(diag_dir.join("diag_report.md").exists());
+        assert!(diag_dir.join("diag_summary.json").exists());
+
+        let summary_raw = fs::read_to_string(diag_dir.join("diag_summary.json")).expect("read summary");
+        let summary: DiagnosticSummary = serde_json::from_str(&summary_raw).expect("parse summary");
+        assert!(!summary.jobs.is_empty());
+        assert!(!summary.pipelines.is_empty());
+        assert!(summary.files.iter().any(|f| !f.included && f.reason.as_deref() == Some("file_too_large")));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn schema_version_missing_defaults_to_v1_for_jobs() {
+        let out_dir = std::env::temp_dir().join(format!("jarvis_schema_missing_{}", now_epoch_ms()));
+        let _ = fs::create_dir_all(out_dir.join(".jarvis-desktop"));
+        let path = jobs_file_path(&out_dir);
+        fs::write(
+            &path,
+            r#"{"jobs":[{"job_id":"job_1","template_id":"TEMPLATE_TREE","canonical_id":"arxiv:1","params":{},"status":"queued","attempt":0,"created_at":"1","updated_at":"1","run_id":null,"last_error":null,"retry_after_seconds":null,"retry_at":null}]}"#,
+        )
+        .expect("write legacy jobs");
+
+        let rows = load_jobs_from_file(&path).expect("load legacy jobs");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].job_id, "job_1");
+
+        let _ = fs::remove_dir_all(&out_dir);
+    }
+
+    #[test]
+    fn schema_version_higher_refuses_read_and_write() {
+        let out_dir = std::env::temp_dir().join(format!("jarvis_schema_high_{}", now_epoch_ms()));
+        let _ = fs::create_dir_all(out_dir.join(".jarvis-desktop"));
+        let path = pipelines_file_path(&out_dir);
+        fs::write(&path, r#"{"schema_version":99,"pipelines":[]}"#).expect("write high schema");
+
+        let load_err = match load_pipelines_from_file(&path) {
+            Ok(_) => panic!("must fail on high schema load"),
+            Err(e) => e,
+        };
+        assert!(load_err.contains("unsupported schema_version"));
+
+        let write_err = save_pipelines_to_file(&path, &[]).expect_err("must fail on high schema write");
+        assert!(write_err.contains("refusing to modify"));
+
+        let _ = fs::remove_dir_all(&out_dir);
+    }
+
+    #[test]
+    fn atomic_write_keeps_no_tmp_file_for_settings() {
+        let out_dir = std::env::temp_dir().join(format!("jarvis_atomic_settings_{}", now_epoch_ms()));
+        let _ = fs::create_dir_all(out_dir.join(".jarvis-desktop"));
+        save_settings(&out_dir, &DesktopSettings::default()).expect("save settings");
+        let path = settings_file_path(&out_dir);
+        let tmp = path.with_extension("json.tmp");
+        assert!(path.exists());
+        assert!(!tmp.exists());
+
+        let raw = fs::read_to_string(&path).expect("read settings");
+        assert!(raw.contains("schema_version"));
+
+        let _ = fs::remove_dir_all(&out_dir);
     }
 
     #[test]
