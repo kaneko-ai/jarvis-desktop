@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::{fs, io::Write};
+use std::{fs, io::{Read, Write}};
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use zip::write::SimpleFileOptions;
@@ -453,6 +453,76 @@ struct DiagnosticManifest {
     included: Vec<ManifestIncludedEntry>,
     skipped: Vec<ManifestSkippedEntry>,
     redactions: Vec<ManifestRedactionEntry>,
+}
+
+#[derive(Deserialize, Default)]
+struct ExportWorkspaceOptions {
+    include_audit: Option<bool>,
+    include_diag: Option<bool>,
+    audit_max_lines: Option<usize>,
+    redact: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct ExportWorkspaceResult {
+    export_id: String,
+    zip_path: String,
+    manifest_path: String,
+}
+
+#[derive(Deserialize, Default)]
+struct ImportWorkspaceOptions {
+    zip_path: String,
+    mode: Option<String>,
+    dry_run: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct ImportWorkspaceResult {
+    import_id: String,
+    applied: bool,
+    warnings: Vec<String>,
+    report_path: String,
+}
+
+#[derive(Serialize)]
+struct WorkspaceHistoryItem {
+    id: String,
+    created_at: String,
+    dir_path: String,
+    zip_path: Option<String>,
+    report_path: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct WorkspaceManifestIncluded {
+    path: String,
+    size_bytes: u64,
+    sha256: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct WorkspaceManifestSkipped {
+    path: String,
+    size_bytes: u64,
+    reason: String,
+    pointer_path: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct WorkspaceManifestRedaction {
+    path: String,
+    rule: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct WorkspaceExportManifest {
+    schema_version: u32,
+    created_at: String,
+    export_id: String,
+    included: Vec<WorkspaceManifestIncluded>,
+    skipped: Vec<WorkspaceManifestSkipped>,
+    redactions: Vec<WorkspaceManifestRedaction>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -4673,6 +4743,808 @@ fn write_deterministic_zip(
     Ok(())
 }
 
+fn workspace_state_root(out_dir: &Path) -> PathBuf {
+    out_dir.join(".jarvis-desktop")
+}
+
+fn workspace_exports_root(out_dir: &Path) -> PathBuf {
+    workspace_state_root(out_dir).join("exports")
+}
+
+fn workspace_imports_root(out_dir: &Path) -> PathBuf {
+    workspace_state_root(out_dir).join("imports")
+}
+
+fn workspace_backups_root(out_dir: &Path) -> PathBuf {
+    workspace_state_root(out_dir).join("backups")
+}
+
+fn make_workspace_transfer_id() -> String {
+    let ts = Utc::now().format("%Y%m%d_%H%M%S").to_string();
+    let short = make_run_id()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(8)
+        .collect::<String>();
+    format!("{}_{}", ts, short)
+}
+
+fn is_safe_archive_relpath(path: &str) -> bool {
+    let t = path.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if t.starts_with('/') || t.starts_with('\\') {
+        return false;
+    }
+    if t.contains(':') {
+        return false;
+    }
+    let normalized = t.replace('\\', "/");
+    !normalized.split('/').any(|part| part == "..")
+}
+
+fn is_allowed_workspace_entry(rel: &str) -> bool {
+    matches!(rel, "settings.json" | "jobs.json" | "pipelines.json" | "audit.jsonl")
+        || rel.starts_with("diag/")
+}
+
+fn maybe_redact_text_bytes(path: &str, bytes: Vec<u8>, redact: bool) -> (Vec<u8>, Vec<WorkspaceManifestRedaction>) {
+    if !redact || !is_text_like_path(path) {
+        return (bytes, Vec::new());
+    }
+    let text = match String::from_utf8(bytes) {
+        Ok(v) => v,
+        Err(e) => return (e.into_bytes(), Vec::new()),
+    };
+    let (masked, rules) = redact_text_for_zip(&text);
+    let redactions = rules
+        .into_iter()
+        .map(|rule| WorkspaceManifestRedaction {
+            path: path.to_string(),
+            rule,
+        })
+        .collect::<Vec<_>>();
+    (masked.into_bytes(), redactions)
+}
+
+fn list_state_files_recursive(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::<PathBuf>::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let rd = match fs::read_dir(&dir) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.is_file() {
+                out.push(p);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn encode_jobs_with_schema(jobs: &[JobRecord]) -> Result<String, String> {
+    serde_json::to_string_pretty(&JobFilePayload {
+        schema_version: SCHEMA_VERSION,
+        jobs: jobs.to_vec(),
+    })
+    .map_err(|e| format!("failed to serialize jobs payload: {e}"))
+}
+
+fn encode_pipelines_with_schema(pipelines: &[PipelineRecord]) -> Result<String, String> {
+    serde_json::to_string_pretty(&PipelineFilePayload {
+        schema_version: SCHEMA_VERSION,
+        pipelines: pipelines.to_vec(),
+    })
+    .map_err(|e| format!("failed to serialize pipelines payload: {e}"))
+}
+
+fn encode_settings_with_schema(settings: &DesktopSettings) -> Result<String, String> {
+    serde_json::to_string_pretty(&SettingsFilePayload {
+        schema_version: SCHEMA_VERSION,
+        settings: settings.clone(),
+    })
+    .map_err(|e| format!("failed to serialize settings payload: {e}"))
+}
+
+fn import_value_to_current_schema(subsystem: &str, mut value: serde_json::Value) -> Result<serde_json::Value, String> {
+    if !value.is_object() {
+        return Err(format!("invalid {} payload: root must be object", subsystem));
+    }
+    let mut version = parse_schema_version(&value)?;
+    if version > SCHEMA_VERSION {
+        return Err(format!(
+            "{} has unsupported schema_version={} (supported={})",
+            subsystem_display_name(subsystem),
+            version,
+            SCHEMA_VERSION
+        ));
+    }
+    while version < SCHEMA_VERSION {
+        let next = version + 1;
+        value = migrate_schema_value(subsystem, version, next, value)?;
+        version = next;
+    }
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "schema_version".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(SCHEMA_VERSION as u64)),
+        );
+    }
+    Ok(value)
+}
+
+fn decode_imported_settings(bytes: &[u8]) -> Result<DesktopSettings, String> {
+    let raw = String::from_utf8(bytes.to_vec())
+        .map_err(|e| format!("invalid settings.json encoding: {e}"))?;
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("invalid settings.json: {e}"))?;
+
+    if value.get("settings").is_some() {
+        let normalized = import_value_to_current_schema("settings", value)?;
+        let payload: SettingsFilePayload = serde_json::from_value(normalized)
+            .map_err(|e| format!("failed to decode imported settings payload: {e}"))?;
+        return Ok(payload.settings);
+    }
+    serde_json::from_value::<DesktopSettings>(value)
+        .map_err(|e| format!("failed to decode legacy imported settings: {e}"))
+}
+
+fn decode_imported_jobs(bytes: &[u8]) -> Result<Vec<JobRecord>, String> {
+    let raw = String::from_utf8(bytes.to_vec())
+        .map_err(|e| format!("invalid jobs.json encoding: {e}"))?;
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("invalid jobs.json: {e}"))?;
+    let normalized = import_value_to_current_schema("jobs", value)?;
+    let payload: JobFilePayload = serde_json::from_value(normalized)
+        .map_err(|e| format!("failed to decode imported jobs payload: {e}"))?;
+    Ok(payload.jobs)
+}
+
+fn decode_imported_pipelines(bytes: &[u8]) -> Result<Vec<PipelineRecord>, String> {
+    let raw = String::from_utf8(bytes.to_vec())
+        .map_err(|e| format!("invalid pipelines.json encoding: {e}"))?;
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("invalid pipelines.json: {e}"))?;
+    let normalized = import_value_to_current_schema("pipelines", value)?;
+    let payload: PipelineFilePayload = serde_json::from_value(normalized)
+        .map_err(|e| format!("failed to decode imported pipelines payload: {e}"))?;
+    Ok(payload.pipelines)
+}
+
+fn parse_updated_epoch_ms(text: &str) -> u128 {
+    text.trim().parse::<u128>().unwrap_or(0)
+}
+
+fn merge_settings_keep_current(
+    current: &DesktopSettings,
+    imported: &DesktopSettings,
+    warnings: &mut Vec<String>,
+) -> DesktopSettings {
+    let cur_v = serde_json::to_value(current).unwrap_or_else(|_| serde_json::json!({}));
+    let imp_v = serde_json::to_value(imported).unwrap_or_else(|_| serde_json::json!({}));
+    let mut merged = cur_v.clone();
+    if let (Some(cur_obj), Some(imp_obj), Some(dst_obj)) = (
+        cur_v.as_object(),
+        imp_v.as_object(),
+        merged.as_object_mut(),
+    ) {
+        for (k, v) in imp_obj {
+            if let Some(cv) = cur_obj.get(k) {
+                if cv != v {
+                    warnings.push(format!("settings conflict on key `{k}`: keep current value"));
+                }
+            } else {
+                dst_obj.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    serde_json::from_value::<DesktopSettings>(merged).unwrap_or_else(|_| current.clone())
+}
+
+fn merge_jobs_keep_newest(current: &[JobRecord], imported: &[JobRecord], warnings: &mut Vec<String>) -> Vec<JobRecord> {
+    let mut map = std::collections::BTreeMap::<String, JobRecord>::new();
+    for j in current {
+        map.insert(j.job_id.clone(), j.clone());
+    }
+    for j in imported {
+        if let Some(existing) = map.get(&j.job_id) {
+            if serde_json::to_string(existing).ok() != serde_json::to_string(j).ok() {
+                let keep_imported = parse_updated_epoch_ms(&j.updated_at) > parse_updated_epoch_ms(&existing.updated_at);
+                warnings.push(format!(
+                    "jobs collision id={} -> keep {}",
+                    j.job_id,
+                    if keep_imported { "imported(newer)" } else { "current" }
+                ));
+                if keep_imported {
+                    map.insert(j.job_id.clone(), j.clone());
+                }
+            }
+        } else {
+            map.insert(j.job_id.clone(), j.clone());
+        }
+    }
+    let mut out = map.into_values().collect::<Vec<_>>();
+    sort_jobs_for_display(&mut out);
+    out
+}
+
+fn merge_pipelines_keep_newest(
+    current: &[PipelineRecord],
+    imported: &[PipelineRecord],
+    warnings: &mut Vec<String>,
+) -> Vec<PipelineRecord> {
+    let mut map = std::collections::BTreeMap::<String, PipelineRecord>::new();
+    for p in current {
+        map.insert(p.pipeline_id.clone(), p.clone());
+    }
+    for p in imported {
+        if let Some(existing) = map.get(&p.pipeline_id) {
+            if serde_json::to_string(existing).ok() != serde_json::to_string(p).ok() {
+                let keep_imported = parse_updated_epoch_ms(&p.updated_at) > parse_updated_epoch_ms(&existing.updated_at);
+                warnings.push(format!(
+                    "pipelines collision id={} -> keep {}",
+                    p.pipeline_id,
+                    if keep_imported { "imported(newer)" } else { "current" }
+                ));
+                if keep_imported {
+                    map.insert(p.pipeline_id.clone(), p.clone());
+                }
+            }
+        } else {
+            map.insert(p.pipeline_id.clone(), p.clone());
+        }
+    }
+    let mut out = map.into_values().collect::<Vec<_>>();
+    out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then_with(|| a.pipeline_id.cmp(&b.pipeline_id)));
+    out
+}
+
+fn apply_workspace_text_files_atomically(
+    files: &[(PathBuf, String)],
+) -> Result<(), String> {
+    let originals = files
+        .iter()
+        .map(|(path, _)| {
+            let old = if path.exists() {
+                Some(
+                    fs::read_to_string(path)
+                        .map_err(|e| format!("failed to read existing file {}: {e}", path.display()))?,
+                )
+            } else {
+                None
+            };
+            Ok((path.clone(), old))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    for (path, text) in files {
+        if let Err(err) = atomic_write_text(path, text) {
+            for (restore_path, old_opt) in &originals {
+                match old_opt {
+                    Some(old) => {
+                        let _ = atomic_write_text(restore_path, old);
+                    }
+                    None => {
+                        let _ = fs::remove_file(restore_path);
+                    }
+                }
+            }
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+fn render_workspace_export_report(manifest: &WorkspaceExportManifest) -> String {
+    let mut out = String::new();
+    out.push_str("# Workspace Export Report\n\n");
+    out.push_str(&format!("- export_id: {}\n", manifest.export_id));
+    out.push_str(&format!("- created_at: {}\n", manifest.created_at));
+    out.push_str(&format!("- included_files: {}\n", manifest.included.len()));
+    out.push_str(&format!("- skipped_files: {}\n", manifest.skipped.len()));
+    if !manifest.redactions.is_empty() {
+        out.push_str("\n## Redactions\n");
+        for r in &manifest.redactions {
+            out.push_str(&format!("- {} ({})\n", r.path, r.rule));
+        }
+    }
+    out
+}
+
+fn render_workspace_import_report(
+    import_id: &str,
+    mode: &str,
+    dry_run: bool,
+    applied: bool,
+    warnings: &[String],
+) -> String {
+    let mut out = String::new();
+    out.push_str("# Workspace Import Report\n\n");
+    out.push_str(&format!("- import_id: {}\n", import_id));
+    out.push_str(&format!("- mode: {}\n", mode));
+    out.push_str(&format!("- dry_run: {}\n", dry_run));
+    out.push_str(&format!("- applied: {}\n", applied));
+    out.push_str("\n## Warnings\n");
+    if warnings.is_empty() {
+        out.push_str("- (none)\n");
+    } else {
+        for w in warnings {
+            out.push_str(&format!("- {}\n", w));
+        }
+    }
+    out
+}
+
+fn list_workspace_history(base_dir: &Path, zip_name: &str, report_name: &str) -> Vec<WorkspaceHistoryItem> {
+    let mut out = Vec::new();
+    let rd = match fs::read_dir(base_dir) {
+        Ok(v) => v,
+        Err(_) => return out,
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let id = match path.file_name().map(|n| n.to_string_lossy().to_string()) {
+            Some(v) => v,
+            None => continue,
+        };
+        let created = fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .map(to_iso_from_system_time)
+            .unwrap_or_else(|| Utc::now().to_rfc3339());
+        let zip = path.join(zip_name);
+        let report = path.join(report_name);
+        out.push(WorkspaceHistoryItem {
+            id,
+            created_at: created,
+            dir_path: path.to_string_lossy().to_string(),
+            zip_path: if !zip_name.is_empty() && zip.exists() {
+                Some(zip.to_string_lossy().to_string())
+            } else {
+                None
+            },
+            report_path: if report.exists() { Some(report.to_string_lossy().to_string()) } else { None },
+        });
+    }
+    out.sort_by(|a, b| b.id.cmp(&a.id));
+    out
+}
+
+fn export_workspace_internal(
+    _root: &Path,
+    runtime: &RuntimeConfig,
+    options: ExportWorkspaceOptions,
+) -> Result<ExportWorkspaceResult, String> {
+    let include_audit = options.include_audit.unwrap_or(true);
+    let include_diag = options.include_diag.unwrap_or(false);
+    let audit_max_lines = options.audit_max_lines.unwrap_or(500).max(1).min(10_000);
+    let redact = options.redact.unwrap_or(true);
+
+    let state_root = workspace_state_root(&runtime.out_base_dir);
+    fs::create_dir_all(&state_root)
+        .map_err(|e| format!("failed to create workspace state root {}: {e}", state_root.display()))?;
+
+    let export_id = make_workspace_transfer_id();
+    let export_dir = workspace_exports_root(&runtime.out_base_dir).join(&export_id);
+    fs::create_dir_all(&export_dir)
+        .map_err(|e| format!("failed to create export dir {}: {e}", export_dir.display()))?;
+
+    let mut payloads = Vec::<(String, Vec<u8>)>::new();
+    let mut included = Vec::<WorkspaceManifestIncluded>::new();
+    let mut skipped = Vec::<WorkspaceManifestSkipped>::new();
+    let mut redactions = Vec::<WorkspaceManifestRedaction>::new();
+    let mut total: u64 = 0;
+
+    let mut candidates = vec![
+        (settings_file_path(&runtime.out_base_dir), ".jarvis-desktop/settings.json".to_string()),
+        (jobs_file_path(&runtime.out_base_dir), ".jarvis-desktop/jobs.json".to_string()),
+        (pipelines_file_path(&runtime.out_base_dir), ".jarvis-desktop/pipelines.json".to_string()),
+    ];
+
+    if include_audit {
+        let audit_path = audit_jsonl_path(&runtime.out_base_dir);
+        if audit_path.exists() {
+            let tail = read_tail_lines(&audit_path, audit_max_lines).join("\n");
+            let p = export_dir.join("audit_tail.jsonl");
+            atomic_write_text(&p, &tail)?;
+            candidates.push((p, ".jarvis-desktop/audit.jsonl".to_string()));
+        }
+    }
+
+    if include_diag {
+        let diag_root = diagnostics_root(&runtime.out_base_dir);
+        for f in list_state_files_recursive(&diag_root) {
+            if let Ok(rel) = f.strip_prefix(&state_root) {
+                let rel_s = rel.to_string_lossy().replace('\\', "/");
+                candidates.push((f, format!(".jarvis-desktop/{}", rel_s)));
+            }
+        }
+    }
+
+    candidates.sort_by(|a, b| a.1.cmp(&b.1));
+    for (src, rel) in candidates {
+        if !src.exists() || !src.is_file() {
+            continue;
+        }
+        let meta = fs::metadata(&src)
+            .map_err(|e| format!("failed to stat export source {}: {e}", src.display()))?;
+        let size = meta.len();
+        if size > DIAG_MAX_FILE_BYTES {
+            skipped.push(WorkspaceManifestSkipped {
+                path: rel,
+                size_bytes: size,
+                reason: "too_large".to_string(),
+                pointer_path: src.to_string_lossy().to_string(),
+            });
+            continue;
+        }
+        if total.saturating_add(size) > DIAG_MAX_TOTAL_BYTES {
+            skipped.push(WorkspaceManifestSkipped {
+                path: rel,
+                size_bytes: size,
+                reason: "too_large".to_string(),
+                pointer_path: src.to_string_lossy().to_string(),
+            });
+            continue;
+        }
+        let bytes = fs::read(&src)
+            .map_err(|e| format!("failed to read export source {}: {e}", src.display()))?;
+        let (final_bytes, mut rs) = maybe_redact_text_bytes(&rel, bytes, redact);
+        redactions.append(&mut rs);
+        total = total.saturating_add(final_bytes.len() as u64);
+        included.push(WorkspaceManifestIncluded {
+            path: rel.clone(),
+            size_bytes: final_bytes.len() as u64,
+            sha256: to_sha256_hex(&final_bytes),
+        });
+        payloads.push((rel, final_bytes));
+    }
+
+    included.sort_by(|a, b| a.path.cmp(&b.path));
+    skipped.sort_by(|a, b| a.path.cmp(&b.path));
+    redactions.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.rule.cmp(&b.rule)));
+    redactions.dedup_by(|a, b| a.path == b.path && a.rule == b.rule);
+
+    let manifest = WorkspaceExportManifest {
+        schema_version: 1,
+        created_at: Utc::now().to_rfc3339(),
+        export_id: export_id.clone(),
+        included,
+        skipped,
+        redactions,
+    };
+
+    let manifest_path = export_dir.join("export_manifest.json");
+    let manifest_text = serde_json::to_string_pretty(&manifest)
+        .map_err(|e| format!("failed to serialize export manifest: {e}"))?;
+    atomic_write_text(&manifest_path, &manifest_text)?;
+    payloads.push(("export_manifest.json".to_string(), manifest_text.into_bytes()));
+
+    let report_path = export_dir.join("export_report.md");
+    let report_text = render_workspace_export_report(&manifest);
+    atomic_write_text(&report_path, &report_text)?;
+    payloads.push(("export_report.md".to_string(), report_text.into_bytes()));
+
+    let zip_path = export_dir.join("workspace.zip");
+    write_deterministic_zip(&zip_path, payloads)?;
+
+    Ok(ExportWorkspaceResult {
+        export_id,
+        zip_path: zip_path.to_string_lossy().to_string(),
+        manifest_path: manifest_path.to_string_lossy().to_string(),
+    })
+}
+
+#[tauri::command]
+fn export_workspace(opts: Option<ExportWorkspaceOptions>) -> Result<ExportWorkspaceResult, String> {
+    let root = repo_root();
+    let runtime = resolve_runtime_config(&root)?;
+    export_workspace_internal(&root, &runtime, opts.unwrap_or_default())
+}
+
+fn import_workspace_internal(
+    _root: &Path,
+    runtime: &RuntimeConfig,
+    opts: ImportWorkspaceOptions,
+) -> Result<ImportWorkspaceResult, String> {
+    let zip_path = PathBuf::from(opts.zip_path.trim());
+    if !zip_path.exists() || !zip_path.is_file() {
+        return Err(format!("zip file not found: {}", zip_path.display()));
+    }
+
+    let mode = opts.mode.unwrap_or_else(|| "merge".to_string()).to_lowercase();
+    if mode != "merge" && mode != "replace" {
+        return Err("mode must be merge or replace".to_string());
+    }
+    let dry_run = opts.dry_run.unwrap_or(false);
+
+    let import_id = make_workspace_transfer_id();
+    let import_dir = workspace_imports_root(&runtime.out_base_dir).join(&import_id);
+    let staging_dir = import_dir.join("staging");
+    fs::create_dir_all(&staging_dir)
+        .map_err(|e| format!("failed to create import staging dir {}: {e}", staging_dir.display()))?;
+
+    let mut warnings = Vec::<String>::new();
+    let file = fs::File::open(&zip_path)
+        .map_err(|e| format!("failed to open workspace zip {}: {e}", zip_path.display()))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| format!("failed to parse workspace zip {}: {e}", zip_path.display()))?;
+
+    let mut total: u64 = 0;
+    let mut imported_settings: Option<DesktopSettings> = None;
+    let mut imported_jobs: Option<Vec<JobRecord>> = None;
+    let mut imported_pipelines: Option<Vec<PipelineRecord>> = None;
+    let mut imported_audit: Option<String> = None;
+
+    for idx in 0..archive.len() {
+        let mut entry = archive.by_index(idx)
+            .map_err(|e| format!("failed to read zip entry at index {idx}: {e}"))?;
+        if entry.is_dir() {
+            continue;
+        }
+        let name = entry.name().replace('\\', "/");
+        if !is_safe_archive_relpath(&name) {
+            return Err(format!("zip-slip rejected entry: {name}"));
+        }
+        if !name.starts_with(".jarvis-desktop/") {
+            warnings.push(format!("ignored non-workspace entry: {name}"));
+            continue;
+        }
+        let rel = name.trim_start_matches(".jarvis-desktop/").to_string();
+        if !is_allowed_workspace_entry(&rel) {
+            warnings.push(format!("ignored disallowed entry: {name}"));
+            continue;
+        }
+
+        let entry_size = entry.size();
+        if entry_size > DIAG_MAX_FILE_BYTES {
+            return Err(format!("import rejected (file too large): {name} ({entry_size} bytes)"));
+        }
+        if total.saturating_add(entry_size) > DIAG_MAX_TOTAL_BYTES {
+            return Err("import rejected (total extracted size exceeds limit)".to_string());
+        }
+
+        let mut bytes = Vec::<u8>::new();
+        entry
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("failed to extract entry {name}: {e}"))?;
+        total = total.saturating_add(bytes.len() as u64);
+
+        let dst = staging_dir.join(rel_path_to_pathbuf(&rel));
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create staging directory {}: {e}", parent.display()))?;
+        }
+        fs::write(&dst, &bytes)
+            .map_err(|e| format!("failed to write staging file {}: {e}", dst.display()))?;
+
+        match rel.as_str() {
+            "settings.json" => {
+                imported_settings = Some(decode_imported_settings(&bytes)?);
+            }
+            "jobs.json" => {
+                imported_jobs = Some(decode_imported_jobs(&bytes)?);
+            }
+            "pipelines.json" => {
+                imported_pipelines = Some(decode_imported_pipelines(&bytes)?);
+            }
+            "audit.jsonl" => {
+                imported_audit = Some(String::from_utf8(bytes).unwrap_or_default());
+            }
+            _ => {}
+        }
+    }
+
+    let current_settings = load_settings(&runtime.out_base_dir)?;
+    let current_jobs = load_jobs_from_file(&jobs_file_path(&runtime.out_base_dir))?;
+    let current_pipelines = load_pipelines_from_file(&pipelines_file_path(&runtime.out_base_dir))?;
+    let current_audit = fs::read_to_string(audit_jsonl_path(&runtime.out_base_dir)).unwrap_or_default();
+
+    let final_settings;
+    let final_jobs;
+    let final_pipelines;
+    let final_audit;
+
+    if mode == "replace" {
+        final_settings = imported_settings.unwrap_or_default();
+        final_jobs = imported_jobs.unwrap_or_default();
+        final_pipelines = imported_pipelines.unwrap_or_default();
+        final_audit = imported_audit.unwrap_or_default();
+    } else {
+        final_settings = match imported_settings {
+            Some(s) => merge_settings_keep_current(&current_settings, &s, &mut warnings),
+            None => current_settings.clone(),
+        };
+        final_jobs = match imported_jobs {
+            Some(v) => merge_jobs_keep_newest(&current_jobs, &v, &mut warnings),
+            None => current_jobs.clone(),
+        };
+        final_pipelines = match imported_pipelines {
+            Some(v) => merge_pipelines_keep_newest(&current_pipelines, &v, &mut warnings),
+            None => current_pipelines.clone(),
+        };
+        final_audit = if let Some(imported) = imported_audit {
+            if imported.trim().is_empty() {
+                current_audit.clone()
+            } else {
+                format!(
+                    "{}\n{{\"kind\":\"import_separator\",\"ts\":\"{}\",\"import_id\":\"{}\"}}\n{}",
+                    current_audit,
+                    Utc::now().to_rfc3339(),
+                    import_id,
+                    imported
+                )
+            }
+        } else {
+            current_audit.clone()
+        };
+    }
+
+    let settings_text = encode_settings_with_schema(&final_settings)?;
+    let jobs_text = encode_jobs_with_schema(&final_jobs)?;
+    let pipelines_text = encode_pipelines_with_schema(&final_pipelines)?;
+
+    let report_path = import_dir.join("import_report.md");
+    let mut applied = false;
+
+    if !dry_run {
+        if mode == "replace" {
+            let backup_dir = workspace_backups_root(&runtime.out_base_dir).join(&import_id);
+            fs::create_dir_all(&backup_dir)
+                .map_err(|e| format!("failed to create backup directory {}: {e}", backup_dir.display()))?;
+            for path in [
+                settings_file_path(&runtime.out_base_dir),
+                jobs_file_path(&runtime.out_base_dir),
+                pipelines_file_path(&runtime.out_base_dir),
+                audit_jsonl_path(&runtime.out_base_dir),
+            ] {
+                if path.exists() {
+                    let dst = backup_dir.join(path.file_name().unwrap_or_default());
+                    let _ = fs::copy(&path, &dst);
+                }
+            }
+        }
+
+        let files = vec![
+            (settings_file_path(&runtime.out_base_dir), settings_text),
+            (jobs_file_path(&runtime.out_base_dir), jobs_text),
+            (pipelines_file_path(&runtime.out_base_dir), pipelines_text),
+            (audit_jsonl_path(&runtime.out_base_dir), final_audit),
+        ];
+        apply_workspace_text_files_atomically(&files)?;
+        applied = true;
+    }
+
+    let report = render_workspace_import_report(&import_id, &mode, dry_run, applied, &warnings);
+    atomic_write_text(&report_path, &report)?;
+
+    Ok(ImportWorkspaceResult {
+        import_id,
+        applied,
+        warnings,
+        report_path: report_path.to_string_lossy().to_string(),
+    })
+}
+
+#[tauri::command]
+fn import_workspace(opts: ImportWorkspaceOptions) -> Result<ImportWorkspaceResult, String> {
+    let root = repo_root();
+    let runtime = resolve_runtime_config(&root)?;
+    import_workspace_internal(&root, &runtime, opts)
+}
+
+#[tauri::command]
+fn list_workspace_exports() -> Result<Vec<WorkspaceHistoryItem>, String> {
+    let root = repo_root();
+    let runtime = resolve_runtime_config(&root)?;
+    Ok(list_workspace_history(
+        &workspace_exports_root(&runtime.out_base_dir),
+        "workspace.zip",
+        "export_report.md",
+    ))
+}
+
+#[tauri::command]
+fn list_workspace_imports() -> Result<Vec<WorkspaceHistoryItem>, String> {
+    let root = repo_root();
+    let runtime = resolve_runtime_config(&root)?;
+    Ok(list_workspace_history(
+        &workspace_imports_root(&runtime.out_base_dir),
+        "",
+        "import_report.md",
+    ))
+}
+
+#[tauri::command]
+fn open_workspace_export_folder(export_id: String) -> Result<String, String> {
+    let root = repo_root();
+    let runtime = resolve_runtime_config(&root)?;
+    let id = validate_diag_id_component(&export_id)?;
+    let exports_root = workspace_exports_root(&runtime.out_base_dir);
+    let root_canonical = canonicalize_existing_dir(&exports_root, "RULE_EXPORTS_ROOT_INVALID")?;
+    let target = exports_root.join(&id);
+    let canonical = canonicalize_existing_dir(&target, "RULE_EXPORT_DIR_INVALID")?;
+    if !canonical.starts_with(&root_canonical) {
+        return Err("export directory is outside exports root".to_string());
+    }
+    Command::new("explorer")
+        .arg(&canonical)
+        .spawn()
+        .map_err(|e| format!("failed to open export folder in explorer: {e}"))?;
+    Ok(canonical.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn open_workspace_export_zip(export_id: String) -> Result<String, String> {
+    let root = repo_root();
+    let runtime = resolve_runtime_config(&root)?;
+    let id = validate_diag_id_component(&export_id)?;
+    let zip = workspace_exports_root(&runtime.out_base_dir)
+        .join(&id)
+        .join("workspace.zip");
+    if !zip.exists() {
+        return Err(format!("workspace.zip not found: {}", zip.display()));
+    }
+    Command::new("explorer")
+        .arg(&zip)
+        .spawn()
+        .map_err(|e| format!("failed to open workspace.zip in explorer: {e}"))?;
+    Ok(zip.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn read_workspace_export_report(export_id: String) -> Result<String, String> {
+    let root = repo_root();
+    let runtime = resolve_runtime_config(&root)?;
+    let id = validate_diag_id_component(&export_id)?;
+    let path = workspace_exports_root(&runtime.out_base_dir)
+        .join(&id)
+        .join("export_report.md");
+    fs::read_to_string(&path)
+        .map_err(|e| format!("failed to read export report {}: {e}", path.display()))
+}
+
+#[tauri::command]
+fn open_workspace_import_folder(import_id: String) -> Result<String, String> {
+    let root = repo_root();
+    let runtime = resolve_runtime_config(&root)?;
+    let id = validate_diag_id_component(&import_id)?;
+    let imports_root = workspace_imports_root(&runtime.out_base_dir);
+    let root_canonical = canonicalize_existing_dir(&imports_root, "RULE_IMPORTS_ROOT_INVALID")?;
+    let target = imports_root.join(&id);
+    let canonical = canonicalize_existing_dir(&target, "RULE_IMPORT_DIR_INVALID")?;
+    if !canonical.starts_with(&root_canonical) {
+        return Err("import directory is outside imports root".to_string());
+    }
+    Command::new("explorer")
+        .arg(&canonical)
+        .spawn()
+        .map_err(|e| format!("failed to open import folder in explorer: {e}"))?;
+    Ok(canonical.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn read_workspace_import_report(import_id: String) -> Result<String, String> {
+    let root = repo_root();
+    let runtime = resolve_runtime_config(&root)?;
+    let id = validate_diag_id_component(&import_id)?;
+    let path = workspace_imports_root(&runtime.out_base_dir)
+        .join(&id)
+        .join("import_report.md");
+    fs::read_to_string(&path)
+        .map_err(|e| format!("failed to read import report {}: {e}", path.display()))
+}
+
 fn directory_size_bytes(path: &Path) -> u64 {
     let mut total = 0u64;
     let rd = match fs::read_dir(path) {
@@ -6370,6 +7242,15 @@ fn main() {
             open_diagnostic_zip,
             read_manifest,
             create_diagnostic_zip,
+            export_workspace,
+            import_workspace,
+            list_workspace_exports,
+            list_workspace_imports,
+            open_workspace_export_folder,
+            open_workspace_export_zip,
+            read_workspace_export_report,
+            open_workspace_import_folder,
+            read_workspace_import_report,
             read_run_artifact,
             list_run_artifacts,
             read_run_artifact_named,
@@ -7591,6 +8472,258 @@ mod tests {
         assert_eq!(names, names_sorted);
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    fn write_test_zip(path: &Path, entries: &[(&str, &[u8])]) {
+        let file = fs::File::create(path).expect("create zip");
+        let mut writer = zip::ZipWriter::new(file);
+        let fixed_ts = zip::DateTime::from_date_and_time(1980, 1, 1, 0, 0, 0).unwrap_or_default();
+        let options = SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)
+            .last_modified_time(fixed_ts)
+            .unix_permissions(0o644);
+        for (name, content) in entries {
+            writer.start_file((*name).to_string(), options).expect("start entry");
+            writer.write_all(content).expect("write entry");
+        }
+        writer.finish().expect("finish zip");
+    }
+
+    fn build_test_runtime(base: &Path) -> RuntimeConfig {
+        let pipeline_root = base.join("pipeline");
+        let out_dir = base.join("out");
+        let _ = fs::create_dir_all(&pipeline_root);
+        let _ = fs::create_dir_all(pipeline_root.join("jarvis_core"));
+        let _ = fs::create_dir_all(&out_dir);
+        fs::write(pipeline_root.join("pyproject.toml"), "[tool.poetry]").expect("pyproject");
+        fs::write(pipeline_root.join("jarvis_cli.py"), "print('ok')").expect("cli");
+        RuntimeConfig {
+            config_file_path: base.join("config.json"),
+            config_file_loaded: false,
+            pipeline_root,
+            out_base_dir: out_dir,
+            s2_api_key: None,
+            s2_min_interval_ms: None,
+            s2_max_retries: None,
+            s2_backoff_base_sec: None,
+        }
+    }
+
+    #[test]
+    fn workspace_export_creates_zip_and_manifest() {
+        let base = std::env::temp_dir().join(format!("jarvis_ws_export_{}", now_epoch_ms()));
+        let repo_root = base.join("repo");
+        let _ = fs::create_dir_all(repo_root.join("scripts"));
+        fs::write(repo_root.join("smoke_tauri_e2e.ps1"), "# smoke").expect("smoke");
+        let runtime = build_test_runtime(&base);
+
+        save_settings(&runtime.out_base_dir, &DesktopSettings::default()).expect("save settings");
+        save_jobs_to_file(&jobs_file_path(&runtime.out_base_dir), &[]).expect("save jobs");
+        save_pipelines_to_file(&pipelines_file_path(&runtime.out_base_dir), &[]).expect("save pipelines");
+        fs::write(audit_jsonl_path(&runtime.out_base_dir), "authorization: Bearer verylongtoken12345678901234567890\n")
+            .expect("write audit");
+
+        let res = export_workspace_internal(
+            &repo_root,
+            &runtime,
+            ExportWorkspaceOptions {
+                include_audit: Some(true),
+                include_diag: Some(false),
+                audit_max_lines: Some(500),
+                redact: Some(true),
+            },
+        )
+        .expect("export workspace");
+
+        assert!(!res.zip_path.is_empty());
+        assert!(PathBuf::from(&res.zip_path).exists());
+        assert!(PathBuf::from(&res.manifest_path).exists());
+
+        let manifest_raw = fs::read_to_string(&res.manifest_path).expect("read manifest");
+        let manifest: WorkspaceExportManifest = serde_json::from_str(&manifest_raw).expect("parse manifest");
+        assert!(!manifest.included.is_empty());
+        let sorted = manifest
+            .included
+            .iter()
+            .map(|x| x.path.clone())
+            .collect::<Vec<_>>();
+        let mut expected = sorted.clone();
+        expected.sort();
+        assert_eq!(sorted, expected);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn workspace_import_rejects_zip_slip_entry() {
+        let base = std::env::temp_dir().join(format!("jarvis_ws_zipslip_{}", now_epoch_ms()));
+        let runtime = build_test_runtime(&base);
+        let zip_path = base.join("bad.zip");
+        write_test_zip(
+            &zip_path,
+            &[(".jarvis-desktop/../evil.txt", b"oops"), (".jarvis-desktop/settings.json", br#"{"auto_retry_enabled":false,"auto_retry_max_per_job":2,"auto_retry_max_per_pipeline":3,"auto_retry_max_delay_seconds":3600,"auto_retry_base_delay_seconds":30}"#)],
+        );
+
+        let err = match import_workspace_internal(
+            &base,
+            &runtime,
+            ImportWorkspaceOptions {
+                zip_path: zip_path.to_string_lossy().to_string(),
+                mode: Some("merge".to_string()),
+                dry_run: Some(true),
+            },
+        ) {
+            Ok(_) => panic!("must reject zip-slip"),
+            Err(e) => e,
+        };
+        assert!(err.to_lowercase().contains("zip-slip"));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn workspace_import_enforces_allowlist_and_caps() {
+        let base = std::env::temp_dir().join(format!("jarvis_ws_caps_{}", now_epoch_ms()));
+        let runtime = build_test_runtime(&base);
+
+        let zip_small = base.join("allowlist.zip");
+        write_test_zip(
+            &zip_small,
+            &[
+                (".jarvis-desktop/settings.json", br#"{"auto_retry_enabled":false,"auto_retry_max_per_job":2,"auto_retry_max_per_pipeline":3,"auto_retry_max_delay_seconds":3600,"auto_retry_base_delay_seconds":30}"#),
+                (".jarvis-desktop/secret.env", b"SHOULD_NOT_IMPORT"),
+            ],
+        );
+        let res = import_workspace_internal(
+            &base,
+            &runtime,
+            ImportWorkspaceOptions {
+                zip_path: zip_small.to_string_lossy().to_string(),
+                mode: Some("merge".to_string()),
+                dry_run: Some(true),
+            },
+        )
+        .expect("import with allowlist ignore");
+        assert!(res.warnings.iter().any(|w| w.contains("ignored disallowed entry")));
+
+        let zip_large = base.join("large.zip");
+        let huge = vec![b'X'; (DIAG_MAX_FILE_BYTES as usize) + 1024];
+        write_test_zip(
+            &zip_large,
+            &[(".jarvis-desktop/audit.jsonl", huge.as_slice())],
+        );
+        let err = match import_workspace_internal(
+            &base,
+            &runtime,
+            ImportWorkspaceOptions {
+                zip_path: zip_large.to_string_lossy().to_string(),
+                mode: Some("merge".to_string()),
+                dry_run: Some(true),
+            },
+        ) {
+            Ok(_) => panic!("must reject too large import"),
+            Err(e) => e,
+        };
+        assert!(err.contains("file too large"));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn workspace_import_refuses_higher_schema_version() {
+        let base = std::env::temp_dir().join(format!("jarvis_ws_schema_{}", now_epoch_ms()));
+        let runtime = build_test_runtime(&base);
+        let zip_path = base.join("schema.zip");
+        write_test_zip(
+            &zip_path,
+            &[(".jarvis-desktop/jobs.json", br#"{"schema_version":99,"jobs":[]}"#)],
+        );
+
+        let err = match import_workspace_internal(
+            &base,
+            &runtime,
+            ImportWorkspaceOptions {
+                zip_path: zip_path.to_string_lossy().to_string(),
+                mode: Some("merge".to_string()),
+                dry_run: Some(true),
+            },
+        ) {
+            Ok(_) => panic!("must refuse unsupported schema"),
+            Err(e) => e,
+        };
+        assert!(err.contains("unsupported schema_version"));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn workspace_merge_rules_are_deterministic() {
+        let now = now_epoch_ms_string();
+        let current_jobs = vec![JobRecord {
+            job_id: "job_1".to_string(),
+            template_id: "TEMPLATE_TREE".to_string(),
+            canonical_id: "arxiv:1".to_string(),
+            params: serde_json::json!({"a":1}),
+            status: JobStatus::Queued,
+            attempt: 0,
+            created_at: now.clone(),
+            updated_at: "100".to_string(),
+            run_id: None,
+            last_error: None,
+            retry_after_seconds: None,
+            retry_at: None,
+            auto_retry_attempt_count: 0,
+        }];
+        let imported_jobs = vec![JobRecord {
+            job_id: "job_1".to_string(),
+            template_id: "TEMPLATE_TREE".to_string(),
+            canonical_id: "arxiv:1".to_string(),
+            params: serde_json::json!({"a":2}),
+            status: JobStatus::Succeeded,
+            attempt: 1,
+            created_at: now.clone(),
+            updated_at: "101".to_string(),
+            run_id: Some("run_x".to_string()),
+            last_error: None,
+            retry_after_seconds: None,
+            retry_at: None,
+            auto_retry_attempt_count: 0,
+        }];
+        let mut w1 = Vec::new();
+        let mut w2 = Vec::new();
+        let m1 = merge_jobs_keep_newest(&current_jobs, &imported_jobs, &mut w1);
+        let m2 = merge_jobs_keep_newest(&current_jobs, &imported_jobs, &mut w2);
+        assert_eq!(serde_json::to_string(&m1).ok(), serde_json::to_string(&m2).ok());
+
+        let current_pipelines = vec![PipelineRecord {
+            pipeline_id: "pipe_1".to_string(),
+            canonical_id: "arxiv:1".to_string(),
+            name: "A".to_string(),
+            created_at: now.clone(),
+            updated_at: "100".to_string(),
+            steps: vec![],
+            current_step_index: 0,
+            status: PipelineStatus::Running,
+            last_primary_viz: None,
+            auto_retry_attempt_count: 0,
+        }];
+        let imported_pipelines = vec![PipelineRecord {
+            pipeline_id: "pipe_1".to_string(),
+            canonical_id: "arxiv:1".to_string(),
+            name: "B".to_string(),
+            created_at: now.clone(),
+            updated_at: "101".to_string(),
+            steps: vec![],
+            current_step_index: 0,
+            status: PipelineStatus::Succeeded,
+            last_primary_viz: None,
+            auto_retry_attempt_count: 0,
+        }];
+        let mut pw1 = Vec::new();
+        let mut pw2 = Vec::new();
+        let p1 = merge_pipelines_keep_newest(&current_pipelines, &imported_pipelines, &mut pw1);
+        let p2 = merge_pipelines_keep_newest(&current_pipelines, &imported_pipelines, &mut pw2);
+        assert_eq!(serde_json::to_string(&p1).ok(), serde_json::to_string(&p2).ok());
     }
 
     #[test]

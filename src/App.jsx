@@ -220,6 +220,19 @@ export default function App() {
   const [diagReport, setDiagReport] = useState("");
   const [diagReportLoading, setDiagReportLoading] = useState(false);
   const [diagReportError, setDiagReportError] = useState("");
+  const [workspaceExports, setWorkspaceExports] = useState([]);
+  const [workspaceImports, setWorkspaceImports] = useState([]);
+  const [workspaceLoading, setWorkspaceLoading] = useState(false);
+  const [workspaceError, setWorkspaceError] = useState("");
+  const [workspaceExporting, setWorkspaceExporting] = useState(false);
+  const [workspaceImporting, setWorkspaceImporting] = useState(false);
+  const [workspaceImportZipPath, setWorkspaceImportZipPath] = useState("");
+  const [workspaceImportMode, setWorkspaceImportMode] = useState("merge");
+  const [workspaceImportDryRun, setWorkspaceImportDryRun] = useState(false);
+  const [selectedWorkspaceReport, setSelectedWorkspaceReport] = useState({ scope: "", id: "" });
+  const [workspaceReport, setWorkspaceReport] = useState("");
+  const [workspaceReportLoading, setWorkspaceReportLoading] = useState(false);
+  const [workspaceReportError, setWorkspaceReportError] = useState("");
   const autoRetryTickBusyRef = useRef(false);
   const [libraryRows, setLibraryRows] = useState([]);
   const [libraryLoading, setLibraryLoading] = useState(false);
@@ -480,6 +493,117 @@ export default function App() {
       await invoke("open_diagnostic_zip", { diagId });
     } catch (e) {
       alert(String(e));
+    }
+  }
+
+  async function loadWorkspaceHistory() {
+    setWorkspaceLoading(true);
+    setWorkspaceError("");
+    try {
+      const [exportsRows, importsRows] = await Promise.all([
+        invoke("list_workspace_exports"),
+        invoke("list_workspace_imports"),
+      ]);
+      setWorkspaceExports(Array.isArray(exportsRows) ? exportsRows : []);
+      setWorkspaceImports(Array.isArray(importsRows) ? importsRows : []);
+    } catch (e) {
+      setWorkspaceExports([]);
+      setWorkspaceImports([]);
+      setWorkspaceError(String(e));
+    } finally {
+      setWorkspaceLoading(false);
+    }
+  }
+
+  async function onExportWorkspace() {
+    setWorkspaceExporting(true);
+    setWorkspaceError("");
+    try {
+      const res = await invoke("export_workspace", {
+        opts: {
+          include_audit: true,
+          include_diag: false,
+          audit_max_lines: 500,
+          redact: true,
+        },
+      });
+      await loadWorkspaceHistory();
+      if (res?.zip_path) {
+        setWorkspaceImportZipPath(String(res.zip_path));
+      }
+    } catch (e) {
+      setWorkspaceError(String(e));
+    } finally {
+      setWorkspaceExporting(false);
+    }
+  }
+
+  async function onImportWorkspace() {
+    const zipPath = String(workspaceImportZipPath ?? "").trim();
+    if (!zipPath) {
+      setWorkspaceError("zip path is required");
+      return;
+    }
+    setWorkspaceImporting(true);
+    setWorkspaceError("");
+    try {
+      await invoke("import_workspace", {
+        opts: {
+          zip_path: zipPath,
+          mode: workspaceImportMode,
+          dry_run: workspaceImportDryRun,
+        },
+      });
+      await Promise.all([loadWorkspaceHistory(), loadPipelines(), loadJobs(), loadRuns(), loadSettings()]);
+    } catch (e) {
+      setWorkspaceError(String(e));
+    } finally {
+      setWorkspaceImporting(false);
+    }
+  }
+
+  async function onOpenWorkspaceExportFolder(id) {
+    if (!id) return;
+    try {
+      await invoke("open_workspace_export_folder", { exportId: id });
+    } catch (e) {
+      alert(String(e));
+    }
+  }
+
+  async function onOpenWorkspaceExportZip(id) {
+    if (!id) return;
+    try {
+      await invoke("open_workspace_export_zip", { exportId: id });
+    } catch (e) {
+      alert(String(e));
+    }
+  }
+
+  async function onOpenWorkspaceImportFolder(id) {
+    if (!id) return;
+    try {
+      await invoke("open_workspace_import_folder", { importId: id });
+    } catch (e) {
+      alert(String(e));
+    }
+  }
+
+  async function onLoadWorkspaceReport(scope, id) {
+    if (!scope || !id) return;
+    setWorkspaceReportLoading(true);
+    setWorkspaceReportError("");
+    try {
+      const command = scope === "export" ? "read_workspace_export_report" : "read_workspace_import_report";
+      const argName = scope === "export" ? "exportId" : "importId";
+      const report = await invoke(command, { [argName]: id });
+      setWorkspaceReport(String(report ?? ""));
+      setSelectedWorkspaceReport({ scope, id });
+    } catch (e) {
+      setWorkspaceReport("");
+      setWorkspaceReportError(String(e));
+    } finally {
+      setWorkspaceReportLoading(false);
     }
   }
 
@@ -926,6 +1050,7 @@ export default function App() {
     loadPipelines();
     loadSettings();
     loadDiagnostics();
+    loadWorkspaceHistory();
     loadLibraryRows();
     loadLibraryStats();
   }, []);
@@ -942,6 +1067,7 @@ export default function App() {
     if (activeScreen !== "ops") return;
     tickAutoRetry();
     loadDiagnostics();
+    loadWorkspaceHistory();
     const timer = setInterval(() => {
       tickAutoRetry();
     }, 2000);
@@ -2649,6 +2775,143 @@ export default function App() {
                 })}
               </div>
             )}
+          </div>
+
+          <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: 10, marginBottom: 12 }}>
+            <div style={{ fontWeight: 600, marginBottom: 8 }}>Workspace</div>
+            <div style={{ display: "flex", gap: 8, marginBottom: 8, flexWrap: "wrap", alignItems: "center" }}>
+              <button
+                onClick={onExportWorkspace}
+                disabled={workspaceExporting}
+                style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+              >
+                {workspaceExporting ? "Exporting..." : "Export workspace"}
+              </button>
+              <input
+                value={workspaceImportZipPath}
+                onChange={(e) => setWorkspaceImportZipPath(e.target.value)}
+                placeholder="workspace.zip path"
+                style={{ minWidth: 340, padding: 6, borderRadius: 6, border: "1px solid #ccc", fontSize: 12 }}
+              />
+              <select
+                value={workspaceImportMode}
+                onChange={(e) => setWorkspaceImportMode(e.target.value)}
+                style={{ padding: 6, borderRadius: 6, border: "1px solid #ccc", fontSize: 12 }}
+              >
+                <option value="merge">merge</option>
+                <option value="replace">replace</option>
+              </select>
+              <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
+                <input
+                  type="checkbox"
+                  checked={workspaceImportDryRun}
+                  onChange={(e) => setWorkspaceImportDryRun(e.target.checked)}
+                />
+                dry-run
+              </label>
+              <button
+                onClick={onImportWorkspace}
+                disabled={workspaceImporting}
+                style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+              >
+                {workspaceImporting ? "Importing..." : "Import workspace"}
+              </button>
+              <button
+                onClick={loadWorkspaceHistory}
+                disabled={workspaceLoading}
+                style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+              >
+                Reload workspace history
+              </button>
+            </div>
+            {workspaceError ? <div style={{ color: "#c00", fontSize: 12, marginBottom: 6 }}>{workspaceError}</div> : null}
+
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+              <div style={{ border: "1px solid #eee", borderRadius: 6, padding: 8 }}>
+                <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>Exports</div>
+                {workspaceExports.length === 0 ? (
+                  <div style={{ fontSize: 12, opacity: 0.8 }}>No exports.</div>
+                ) : (
+                  <div style={{ display: "grid", gap: 6 }}>
+                    {workspaceExports.map((item) => (
+                      <div key={item.id} style={{ border: "1px solid #f0f0f0", borderRadius: 6, padding: 6 }}>
+                        <div style={{ fontSize: 11, fontWeight: 600 }}>{item.id}</div>
+                        <div style={{ fontSize: 11 }}>zip={item.zip_path || "(none)"}</div>
+                        <div style={{ display: "flex", gap: 6, marginTop: 4, flexWrap: "wrap" }}>
+                          <button
+                            onClick={() => onOpenWorkspaceExportFolder(item.id)}
+                            style={{ padding: "3px 6px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+                          >
+                            Open folder
+                          </button>
+                          <button
+                            onClick={() => onOpenWorkspaceExportZip(item.id)}
+                            disabled={!item.zip_path}
+                            style={{ padding: "3px 6px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+                          >
+                            Open zip
+                          </button>
+                          <button
+                            onClick={() => onLoadWorkspaceReport("export", item.id)}
+                            style={{ padding: "3px 6px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+                          >
+                            View report
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div style={{ border: "1px solid #eee", borderRadius: 6, padding: 8 }}>
+                <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>Imports</div>
+                {workspaceImports.length === 0 ? (
+                  <div style={{ fontSize: 12, opacity: 0.8 }}>No imports.</div>
+                ) : (
+                  <div style={{ display: "grid", gap: 6 }}>
+                    {workspaceImports.map((item) => (
+                      <div key={item.id} style={{ border: "1px solid #f0f0f0", borderRadius: 6, padding: 6 }}>
+                        <div style={{ fontSize: 11, fontWeight: 600 }}>{item.id}</div>
+                        <div style={{ fontSize: 11 }}>created_at={item.created_at}</div>
+                        <div style={{ display: "flex", gap: 6, marginTop: 4, flexWrap: "wrap" }}>
+                          <button
+                            onClick={() => onOpenWorkspaceImportFolder(item.id)}
+                            style={{ padding: "3px 6px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+                          >
+                            Open folder
+                          </button>
+                          <button
+                            onClick={() => onLoadWorkspaceReport("import", item.id)}
+                            style={{ padding: "3px 6px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+                          >
+                            View report
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {selectedWorkspaceReport?.id ? (
+              <div style={{ marginTop: 8, border: "1px solid #eee", borderRadius: 6, padding: 8 }}>
+                <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>
+                  Workspace report ({selectedWorkspaceReport.scope}): {selectedWorkspaceReport.id}
+                </div>
+                {workspaceReportLoading ? (
+                  <div style={{ fontSize: 12, opacity: 0.8 }}>Loading report...</div>
+                ) : workspaceReportError ? (
+                  <div style={{ fontSize: 12, color: "#c00" }}>{workspaceReportError}</div>
+                ) : (
+                  <div
+                    style={{ fontSize: 12, lineHeight: 1.5 }}
+                    dangerouslySetInnerHTML={{ __html: renderMarkdownToHtml(workspaceReport || "") }}
+                  />
+                )}
+              </div>
+            ) : null}
           </div>
 
           <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: 10, marginBottom: 12 }}>
