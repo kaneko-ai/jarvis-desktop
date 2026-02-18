@@ -205,7 +205,14 @@ export default function App() {
   const [selectedPipelineId, setSelectedPipelineId] = useState("");
   const [pipelineDetail, setPipelineDetail] = useState(null);
   const [pipelineDetailLoading, setPipelineDetailLoading] = useState(false);
-  const [activeScreen, setActiveScreen] = useState("main");
+  const [activeScreen, setActiveScreen] = useState("setup");
+  const [pipelineRepoBusy, setPipelineRepoBusy] = useState(false);
+  const [pipelineRepoError, setPipelineRepoError] = useState("");
+  const [pipelineRepoStatus, setPipelineRepoStatus] = useState(null);
+  const [pipelineRepoValidate, setPipelineRepoValidate] = useState(null);
+  const [pipelineRepoRemoteUrl, setPipelineRepoRemoteUrl] = useState("");
+  const [pipelineRepoLocalPath, setPipelineRepoLocalPath] = useState("");
+  const [pipelineRepoRef, setPipelineRepoRef] = useState("main");
   const [opsNeedsAttentionOnly, setOpsNeedsAttentionOnly] = useState(false);
   const [opsAutoRetryPendingOnly, setOpsAutoRetryPendingOnly] = useState(false);
   const [desktopSettings, setDesktopSettings] = useState(null);
@@ -395,6 +402,95 @@ export default function App() {
       setDesktopSettings(updated ?? null);
     } catch (e) {
       setSettingsError(String(e));
+    }
+  }
+
+  async function loadPipelineRepoStatus() {
+    try {
+      const status = await invoke("get_pipeline_repo_status");
+      setPipelineRepoStatus(status ?? null);
+      setPipelineRepoRemoteUrl(String(status?.remote_url ?? ""));
+      setPipelineRepoLocalPath(String(status?.local_path ?? ""));
+      setPipelineRepoRef(String(status?.git_ref ?? "main"));
+    } catch (e) {
+      setPipelineRepoStatus(null);
+      setPipelineRepoError(String(e));
+    }
+  }
+
+  async function onSavePipelineRepoSettings() {
+    setPipelineRepoBusy(true);
+    setPipelineRepoError("");
+    try {
+      const settings = await invoke("update_pipeline_repo_settings", {
+        update: {
+          remote_url: pipelineRepoRemoteUrl,
+          local_path: pipelineRepoLocalPath,
+          git_ref: pipelineRepoRef,
+        },
+      });
+      const repo = settings?.pipeline_repo ?? {};
+      setPipelineRepoRemoteUrl(String(repo.remote_url ?? pipelineRepoRemoteUrl));
+      setPipelineRepoLocalPath(String(repo.local_path ?? pipelineRepoLocalPath));
+      setPipelineRepoRef(String(repo.git_ref ?? pipelineRepoRef));
+      await loadPipelineRepoStatus();
+      await Promise.all([loadRuntimeConfig(true), loadPreflight(), loadSettings()]);
+    } catch (e) {
+      setPipelineRepoError(String(e));
+    } finally {
+      setPipelineRepoBusy(false);
+    }
+  }
+
+  async function onBootstrapPipelineRepo() {
+    setPipelineRepoBusy(true);
+    setPipelineRepoError("");
+    try {
+      const status = await invoke("bootstrap_pipeline_repo");
+      setPipelineRepoStatus(status ?? null);
+      await Promise.all([loadRuntimeConfig(true), loadPreflight(), loadSettings(), loadPipelineRepoStatus()]);
+    } catch (e) {
+      setPipelineRepoError(String(e));
+      await loadPipelineRepoStatus();
+    } finally {
+      setPipelineRepoBusy(false);
+    }
+  }
+
+  async function onUpdatePipelineRepo() {
+    setPipelineRepoBusy(true);
+    setPipelineRepoError("");
+    try {
+      const status = await invoke("update_pipeline_repo");
+      setPipelineRepoStatus(status ?? null);
+      await Promise.all([loadRuntimeConfig(true), loadPreflight(), loadSettings(), loadPipelineRepoStatus()]);
+    } catch (e) {
+      setPipelineRepoError(String(e));
+      await loadPipelineRepoStatus();
+    } finally {
+      setPipelineRepoBusy(false);
+    }
+  }
+
+  async function onValidatePipelineRepo() {
+    setPipelineRepoBusy(true);
+    setPipelineRepoError("");
+    try {
+      const result = await invoke("validate_pipeline_repo");
+      setPipelineRepoValidate(result ?? null);
+    } catch (e) {
+      setPipelineRepoValidate(null);
+      setPipelineRepoError(String(e));
+    } finally {
+      setPipelineRepoBusy(false);
+    }
+  }
+
+  async function onOpenPipelineRepoFolder() {
+    try {
+      await invoke("open_pipeline_repo_folder");
+    } catch (e) {
+      setPipelineRepoError(String(e));
     }
   }
 
@@ -1049,6 +1145,7 @@ export default function App() {
     loadJobs();
     loadPipelines();
     loadSettings();
+    loadPipelineRepoStatus();
     loadDiagnostics();
     loadWorkspaceHistory();
     loadLibraryRows();
@@ -1066,6 +1163,7 @@ export default function App() {
   useEffect(() => {
     if (activeScreen !== "ops") return;
     tickAutoRetry();
+    loadPipelineRepoStatus();
     loadDiagnostics();
     loadWorkspaceHistory();
     const timer = setInterval(() => {
@@ -1541,6 +1639,17 @@ export default function App() {
 
       <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
         <button
+          onClick={() => setActiveScreen("setup")}
+          style={{
+            padding: "8px 12px",
+            borderRadius: 8,
+            border: "1px solid #333",
+            background: activeScreen === "setup" ? "#eef5ff" : "white",
+          }}
+        >
+          Setup
+        </button>
+        <button
           onClick={() => setActiveScreen("main")}
           style={{
             padding: "8px 12px",
@@ -1564,7 +1673,84 @@ export default function App() {
         </button>
       </div>
 
-      {activeScreen === "main" ? (
+      {activeScreen === "setup" ? (
+      <div style={{ border: "1px solid #ddd", borderRadius: 10, padding: 12, background: "#fafafa" }}>
+        <div style={{ fontWeight: 600, marginBottom: 8 }}>Pipeline Engine</div>
+        <div style={{ fontSize: 12, marginBottom: 8 }}>
+          remote_url / local_path / ref を確認して、Clone/Update/Validate を実行します。
+        </div>
+        <div style={{ display: "grid", gap: 8 }}>
+          <label style={{ display: "grid", gap: 4 }}>
+            <span style={{ fontSize: 12 }}>remote_url</span>
+            <input
+              value={pipelineRepoRemoteUrl}
+              onChange={(e) => setPipelineRepoRemoteUrl(e.target.value)}
+              style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #bbb" }}
+            />
+          </label>
+          <label style={{ display: "grid", gap: 4 }}>
+            <span style={{ fontSize: 12 }}>local_path</span>
+            <input
+              value={pipelineRepoLocalPath}
+              onChange={(e) => setPipelineRepoLocalPath(e.target.value)}
+              style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #bbb" }}
+            />
+          </label>
+          <label style={{ display: "grid", gap: 4 }}>
+            <span style={{ fontSize: 12 }}>git_ref</span>
+            <input
+              value={pipelineRepoRef}
+              onChange={(e) => setPipelineRepoRef(e.target.value)}
+              style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #bbb" }}
+            />
+          </label>
+        </div>
+
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 10 }}>
+          <button onClick={onSavePipelineRepoSettings} disabled={pipelineRepoBusy} style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}>
+            Save settings
+          </button>
+          <button onClick={onBootstrapPipelineRepo} disabled={pipelineRepoBusy} style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}>
+            Clone / Setup
+          </button>
+          <button onClick={onUpdatePipelineRepo} disabled={pipelineRepoBusy} style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}>
+            Update
+          </button>
+          <button onClick={onValidatePipelineRepo} disabled={pipelineRepoBusy} style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}>
+            Validate
+          </button>
+          <button onClick={onOpenPipelineRepoFolder} disabled={pipelineRepoBusy} style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}>
+            Open folder
+          </button>
+          <button onClick={() => setActiveScreen("main")} style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}>
+            Continue to Main
+          </button>
+        </div>
+
+        {pipelineRepoBusy ? <div style={{ marginTop: 8, fontSize: 12 }}>実行中...</div> : null}
+        {pipelineRepoStatus ? (
+          <div style={{ marginTop: 8, fontSize: 12 }}>
+            <div>status: <code>{pipelineRepoStatus.ok ? "ok" : "ng"}</code> / {pipelineRepoStatus.message}</div>
+            <div>commit: <code>{pipelineRepoStatus.head_commit ?? "-"}</code></div>
+            <div>last_sync: <code>{pipelineRepoStatus.last_sync_at ?? "-"}</code></div>
+            <div>dirty: <code>{pipelineRepoStatus.dirty ? "yes" : "no"}</code></div>
+          </div>
+        ) : null}
+        {pipelineRepoValidate ? (
+          <div style={{ marginTop: 8, fontSize: 12 }}>
+            validate: <code>{pipelineRepoValidate.ok ? "ok" : "ng"}</code>
+            <div style={{ marginTop: 4 }}>
+              {(Array.isArray(pipelineRepoValidate.checks) ? pipelineRepoValidate.checks : []).map((c) => (
+                <div key={c.name} style={{ color: c.ok ? "#1f6f3f" : "#a33" }}>
+                  {c.name}: {c.ok ? "ok" : "ng"} - {c.detail}
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : null}
+        {pipelineRepoError ? <div style={{ marginTop: 8, color: "#a33", fontSize: 12 }}>{pipelineRepoError}</div> : null}
+      </div>
+      ) : activeScreen === "main" ? (
       <>
 
       <div
@@ -2584,6 +2770,7 @@ export default function App() {
                 await loadJobs();
                 await loadRuns();
                 await loadSettings();
+                await loadPipelineRepoStatus();
                 await loadDiagnostics();
               }}
               style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
@@ -2636,6 +2823,30 @@ export default function App() {
               tick={tickResult?.reason ?? "-"} acted={tickResult?.acted ? "yes" : "no"}
             </div>
             {settingsError ? <div style={{ marginTop: 4, color: "#c00" }}>{settingsError}</div> : null}
+          </div>
+
+          <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: 10, marginBottom: 12, fontSize: 12 }}>
+            <div style={{ fontWeight: 600, marginBottom: 6 }}>Pipeline Repo</div>
+            <div>remote: <code>{(pipelineRepoStatus?.remote_url ?? pipelineRepoRemoteUrl) || "-"}</code></div>
+            <div>local_path: <code>{(pipelineRepoStatus?.local_path ?? pipelineRepoLocalPath) || "-"}</code></div>
+            <div>ref: <code>{(pipelineRepoStatus?.git_ref ?? pipelineRepoRef) || "-"}</code></div>
+            <div>commit: <code>{pipelineRepoStatus?.head_commit ?? "-"}</code></div>
+            <div>last_sync: <code>{pipelineRepoStatus?.last_sync_at ?? "-"}</code></div>
+            <div style={{ marginTop: 6, display: "flex", gap: 8, flexWrap: "wrap" }}>
+              <button onClick={onUpdatePipelineRepo} disabled={pipelineRepoBusy} style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}>
+                Update
+              </button>
+              <button onClick={onValidatePipelineRepo} disabled={pipelineRepoBusy} style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}>
+                Validate
+              </button>
+              <button onClick={onOpenPipelineRepoFolder} disabled={pipelineRepoBusy} style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}>
+                Open folder
+              </button>
+              <button onClick={loadPipelineRepoStatus} disabled={pipelineRepoBusy} style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}>
+                Reload status
+              </button>
+            </div>
+            {pipelineRepoError ? <div style={{ marginTop: 6, color: "#c00" }}>{pipelineRepoError}</div> : null}
           </div>
 
           <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: 10, marginBottom: 12 }}>

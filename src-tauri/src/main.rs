@@ -14,11 +14,14 @@ use sha2::{Digest, Sha256};
 use zip::write::SimpleFileOptions;
 
 const MAX_ARTIFACT_READ_BYTES: u64 = 3 * 1024 * 1024;
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const DIAG_MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
 const DIAG_MAX_TOTAL_BYTES: u64 = 30 * 1024 * 1024;
 const DIAG_AUDIT_TAIL_LINES: usize = 200;
 const DIAG_MAX_RECENT_ITEMS: usize = 20;
+const DEFAULT_PIPELINE_REPO_REMOTE_URL: &str = "https://github.com/kaneko-ai/jarvis-ml-pipeline.git";
+const DEFAULT_PIPELINE_REPO_LOCAL_SUBDIR: &str = "pipeline_repo/jarvis-ml-pipeline";
+const DEFAULT_PIPELINE_REPO_REF: &str = "main";
 
 #[derive(Serialize)]
 struct RunResult {
@@ -293,6 +296,43 @@ struct DesktopSettings {
     auto_retry_max_per_pipeline: u32,
     auto_retry_max_delay_seconds: u64,
     auto_retry_base_delay_seconds: u64,
+    #[serde(default = "default_pipeline_repo_settings")]
+    pipeline_repo: PipelineRepoSettings,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct PipelineRepoSettings {
+    remote_url: String,
+    local_path: String,
+    git_ref: String,
+    last_sync_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PipelineRepoSettingsUpdate {
+    remote_url: String,
+    local_path: String,
+    git_ref: String,
+}
+
+#[derive(Serialize)]
+struct PipelineRepoStatus {
+    ok: bool,
+    message: String,
+    remote_url: String,
+    local_path: String,
+    git_ref: String,
+    last_sync_at: Option<String>,
+    exists: bool,
+    is_git_repo: bool,
+    head_commit: Option<String>,
+    dirty: bool,
+}
+
+#[derive(Serialize)]
+struct PipelineRepoValidateResult {
+    ok: bool,
+    checks: Vec<PreflightCheckItem>,
 }
 
 impl Default for DesktopSettings {
@@ -303,7 +343,17 @@ impl Default for DesktopSettings {
             auto_retry_max_per_pipeline: 3,
             auto_retry_max_delay_seconds: 3600,
             auto_retry_base_delay_seconds: 30,
+            pipeline_repo: default_pipeline_repo_settings(),
         }
+    }
+}
+
+fn default_pipeline_repo_settings() -> PipelineRepoSettings {
+    PipelineRepoSettings {
+        remote_url: DEFAULT_PIPELINE_REPO_REMOTE_URL.to_string(),
+        local_path: DEFAULT_PIPELINE_REPO_LOCAL_SUBDIR.to_string(),
+        git_ref: DEFAULT_PIPELINE_REPO_REF.to_string(),
+        last_sync_at: None,
     }
 }
 
@@ -1958,7 +2008,7 @@ fn load_settings(out_dir: &Path) -> Result<DesktopSettings, String> {
         save_settings(out_dir, &defaults)?;
         return Ok(defaults);
     }
-    load_with_migration(&path, "settings", |value| {
+    let loaded = load_with_migration(&path, "settings", |value| {
         if value.get("settings").is_some() {
             let payload = serde_json::from_value::<SettingsFilePayload>(value)
                 .map_err(|e| format!("failed to decode settings file {}: {e}", path.display()))?;
@@ -1966,7 +2016,8 @@ fn load_settings(out_dir: &Path) -> Result<DesktopSettings, String> {
         }
         serde_json::from_value::<DesktopSettings>(value)
             .map_err(|e| format!("failed to parse legacy settings file {}: {e}", path.display()))
-    })
+    })?;
+    Ok(pipeline_repo_settings_with_defaults(loaded))
 }
 
 fn save_settings(out_dir: &Path, settings: &DesktopSettings) -> Result<(), String> {
@@ -2159,6 +2210,35 @@ fn is_pipeline_root(path: &Path) -> bool {
     path.join("pyproject.toml").is_file()
         && path.join("jarvis_cli.py").is_file()
         && path.join("jarvis_core").is_dir()
+}
+
+fn pipeline_repo_marker_checks(path: &Path) -> Vec<PreflightCheckItem> {
+    let required = [
+        ("pyproject.toml", path.join("pyproject.toml").is_file()),
+        ("jarvis_cli.py", path.join("jarvis_cli.py").is_file()),
+        ("jarvis_core", path.join("jarvis_core").is_dir()),
+        ("RUNBOOK.md", path.join("RUNBOOK.md").is_file()),
+    ];
+    required
+        .iter()
+        .map(|(name, ok)| {
+            if *ok {
+                preflight_item(
+                    &format!("pipeline_repo_marker_{name}"),
+                    true,
+                    format!("{name} found"),
+                    "",
+                )
+            } else {
+                preflight_item(
+                    &format!("pipeline_repo_marker_{name}"),
+                    false,
+                    format!("{name} missing"),
+                    "Run bootstrap/update or fix pipeline checkout.",
+                )
+            }
+        })
+        .collect()
 }
 
 fn find_pipeline_root_autodetect(repo_root: &Path) -> Option<PathBuf> {
@@ -2754,6 +2834,170 @@ fn has_disallowed_windows_prefix(raw: &str) -> bool {
         || t.starts_with(r"\\.\")
         || t.starts_with(r"\\")
         || t.to_ascii_lowercase().starts_with(r"\\?\unc\")
+}
+
+fn validate_pipeline_repo_url(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("RULE_PIPELINE_REPO_URL_EMPTY: remote_url is empty".to_string());
+    }
+    if !trimmed.to_ascii_lowercase().starts_with("https://") {
+        return Err("RULE_PIPELINE_REPO_URL_SCHEME: only https:// remote_url is allowed".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+fn validate_pipeline_repo_ref(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("RULE_PIPELINE_REPO_REF_EMPTY: git_ref is empty".to_string());
+    }
+    if trimmed
+        .chars()
+        .any(|c| !(c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '/' || c == '.'))
+    {
+        return Err("RULE_PIPELINE_REPO_REF_INVALID: git_ref contains invalid characters".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+fn normalize_remote_url(raw: &str) -> String {
+    let mut s = raw.trim().to_ascii_lowercase();
+    while s.ends_with('/') {
+        s.pop();
+    }
+    if let Some(stripped) = s.strip_suffix(".git") {
+        return stripped.to_string();
+    }
+    s
+}
+
+fn validate_pipeline_repo_local_path(raw: &str, allowed_root: &Path) -> Result<PathBuf, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("RULE_PIPELINE_REPO_PATH_EMPTY: local_path is empty".to_string());
+    }
+    if has_disallowed_windows_prefix(trimmed) {
+        return Err(
+            "RULE_PIPELINE_REPO_PATH_PREFIX: UNC/device-prefixed local_path is not allowed"
+                .to_string(),
+        );
+    }
+
+    let requested = PathBuf::from(trimmed);
+    if requested
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err("RULE_PIPELINE_REPO_PATH_TRAVERSAL: local_path cannot contain `..`".to_string());
+    }
+
+    let allowed_canonical = canonicalize_existing_dir(allowed_root, "RULE_PIPELINE_REPO_ALLOWED_ROOT")?;
+    let absolute = if requested.is_absolute() {
+        requested
+    } else {
+        allowed_canonical.join(requested)
+    };
+
+    if absolute.exists() {
+        let canonical = canonicalize_existing_dir(&absolute, "RULE_PIPELINE_REPO_PATH_INVALID")?;
+        if !canonical.starts_with(&allowed_canonical) {
+            return Err(format!(
+                "RULE_PIPELINE_REPO_PATH_OUTSIDE_ALLOWED: {} is outside {}",
+                canonical.display(),
+                allowed_canonical.display()
+            ));
+        }
+        return Ok(canonical);
+    }
+
+    let parent = absolute
+        .parent()
+        .ok_or_else(|| "RULE_PIPELINE_REPO_PATH_PARENT: local_path has no parent".to_string())?;
+    fs::create_dir_all(parent)
+        .map_err(|e| format!("RULE_PIPELINE_REPO_PATH_PARENT_CREATE: failed to create {}: {e}", parent.display()))?;
+    let parent_canonical = canonicalize_existing_dir(parent, "RULE_PIPELINE_REPO_PATH_PARENT_INVALID")?;
+    if !parent_canonical.starts_with(&allowed_canonical) {
+        return Err(format!(
+            "RULE_PIPELINE_REPO_PATH_PARENT_OUTSIDE_ALLOWED: {} is outside {}",
+            parent_canonical.display(),
+            allowed_canonical.display()
+        ));
+    }
+    Ok(parent_canonical.join(
+        absolute
+            .file_name()
+            .ok_or_else(|| "RULE_PIPELINE_REPO_PATH_BASENAME: missing leaf name".to_string())?,
+    ))
+}
+
+fn run_git_capture(args: &[String]) -> Result<(String, String), String> {
+    let out = Command::new("git")
+        .args(args)
+        .output()
+        .map_err(|e| format!("failed to run git {:?}: {e}", args))?;
+
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if out.status.success() {
+        Ok((stdout, stderr))
+    } else {
+        Err(format!(
+            "git command failed (exit={}): {}",
+            out.status.code().unwrap_or(-1),
+            if !stderr.is_empty() { stderr } else { stdout }
+        ))
+    }
+}
+
+fn append_audit_pipeline_repo_event(
+    out_dir: &Path,
+    action: &str,
+    result: &str,
+    detail: &str,
+    settings: &PipelineRepoSettings,
+) -> Result<(), String> {
+    let path = audit_jsonl_path(out_dir);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create audit directory {}: {e}", parent.display()))?;
+    }
+
+    let line = serde_json::json!({
+        "ts": Utc::now().to_rfc3339(),
+        "event": "pipeline_repo",
+        "action": action,
+        "result": result,
+        "detail": detail,
+        "remote_url": settings.remote_url,
+        "local_path": settings.local_path,
+        "git_ref": settings.git_ref,
+    });
+    let serialized = serde_json::to_string(&line)
+        .map_err(|e| format!("failed to serialize pipeline_repo audit entry: {e}"))?;
+
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| format!("failed to open audit log {}: {e}", path.display()))?;
+    file.write_all(serialized.as_bytes())
+        .map_err(|e| format!("failed to append audit log {}: {e}", path.display()))?;
+    file.write_all(b"\n")
+        .map_err(|e| format!("failed to append newline to audit log {}: {e}", path.display()))
+}
+
+fn pipeline_repo_settings_with_defaults(mut settings: DesktopSettings) -> DesktopSettings {
+    if settings.pipeline_repo.remote_url.trim().is_empty() {
+        settings.pipeline_repo.remote_url = DEFAULT_PIPELINE_REPO_REMOTE_URL.to_string();
+    }
+    if settings.pipeline_repo.local_path.trim().is_empty() {
+        settings.pipeline_repo.local_path = DEFAULT_PIPELINE_REPO_LOCAL_SUBDIR.to_string();
+    }
+    if settings.pipeline_repo.git_ref.trim().is_empty() {
+        settings.pipeline_repo.git_ref = DEFAULT_PIPELINE_REPO_REF.to_string();
+    }
+    settings
 }
 
 fn check_python_runnable(python_cmd: &str, pipeline_root: &Path) -> Result<(), String> {
@@ -6774,6 +7018,7 @@ fn get_settings() -> Result<DesktopSettings, String> {
 
 #[tauri::command]
 fn update_settings(settings: DesktopSettings) -> Result<DesktopSettings, String> {
+    let mut settings = pipeline_repo_settings_with_defaults(settings);
     if settings.auto_retry_max_per_job == 0 {
         return Err("auto_retry_max_per_job must be >= 1".to_string());
     }
@@ -6788,8 +7033,319 @@ fn update_settings(settings: DesktopSettings) -> Result<DesktopSettings, String>
     }
 
     let (runtime, _) = runtime_and_jobs_path()?;
+    settings.pipeline_repo.remote_url = validate_pipeline_repo_url(&settings.pipeline_repo.remote_url)?;
+    settings.pipeline_repo.git_ref = validate_pipeline_repo_ref(&settings.pipeline_repo.git_ref)?;
+    let local_path = validate_pipeline_repo_local_path(
+        &settings.pipeline_repo.local_path,
+        &runtime.out_base_dir,
+    )?;
+    settings.pipeline_repo.local_path = local_path.to_string_lossy().to_string();
     save_settings(&runtime.out_base_dir, &settings)?;
     Ok(settings)
+}
+
+fn run_pipeline_repo_update_internal(
+    local_path: &Path,
+    settings: &PipelineRepoSettings,
+) -> Result<String, String> {
+    let current_remote_args = vec![
+        "-C".to_string(),
+        local_path.to_string_lossy().to_string(),
+        "remote".to_string(),
+        "get-url".to_string(),
+        "origin".to_string(),
+    ];
+    let (remote_stdout, remote_stderr) = run_git_capture(&current_remote_args)?;
+    if normalize_remote_url(&remote_stdout) != normalize_remote_url(&settings.remote_url) {
+        return Err(format!(
+            "RULE_PIPELINE_REPO_REMOTE_MISMATCH: origin remote mismatch. expected={} actual={}",
+            settings.remote_url,
+            remote_stdout
+        ));
+    }
+
+    let fetch_args = vec![
+        "-C".to_string(),
+        local_path.to_string_lossy().to_string(),
+        "fetch".to_string(),
+        "origin".to_string(),
+        settings.git_ref.clone(),
+    ];
+    let (fetch_stdout, fetch_stderr) = run_git_capture(&fetch_args)?;
+
+    let pull_args = vec![
+        "-C".to_string(),
+        local_path.to_string_lossy().to_string(),
+        "pull".to_string(),
+        "--ff-only".to_string(),
+        "origin".to_string(),
+        settings.git_ref.clone(),
+    ];
+    let (pull_stdout, pull_stderr) = run_git_capture(&pull_args)?;
+
+    let stdout = format!(
+        "remote={}\n{}\n{}",
+        remote_stdout,
+        fetch_stdout,
+        pull_stdout
+    )
+    .trim()
+    .to_string();
+    let stderr = [remote_stderr, fetch_stderr, pull_stderr]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Ok([stdout, stderr].join("\n").trim().to_string())
+}
+
+#[tauri::command]
+fn update_pipeline_repo_settings(update: PipelineRepoSettingsUpdate) -> Result<DesktopSettings, String> {
+    let (runtime, _) = runtime_and_jobs_path()?;
+    let mut settings = load_settings(&runtime.out_base_dir)?;
+    settings.pipeline_repo.remote_url = validate_pipeline_repo_url(&update.remote_url)?;
+    settings.pipeline_repo.git_ref = validate_pipeline_repo_ref(&update.git_ref)?;
+    let local_path = validate_pipeline_repo_local_path(&update.local_path, &runtime.out_base_dir)?;
+    settings.pipeline_repo.local_path = local_path.to_string_lossy().to_string();
+    save_settings(&runtime.out_base_dir, &settings)?;
+    Ok(settings)
+}
+
+#[tauri::command]
+fn get_pipeline_repo_status() -> Result<PipelineRepoStatus, String> {
+    let (runtime, _) = runtime_and_jobs_path()?;
+    let settings = load_settings(&runtime.out_base_dir)?;
+    let local_path = validate_pipeline_repo_local_path(&settings.pipeline_repo.local_path, &runtime.out_base_dir)?;
+
+    let exists = local_path.exists();
+    let mut is_git_repo = false;
+    let mut head_commit = None;
+    let mut dirty = false;
+    let mut message = "pipeline repo is not cloned yet".to_string();
+
+    if exists {
+        let is_git_args = vec![
+            "-C".to_string(),
+            local_path.to_string_lossy().to_string(),
+            "rev-parse".to_string(),
+            "--is-inside-work-tree".to_string(),
+        ];
+        if let Ok((stdout, _)) = run_git_capture(&is_git_args) {
+            is_git_repo = stdout.trim() == "true";
+        }
+
+        if is_git_repo {
+            let rev_args = vec![
+                "-C".to_string(),
+                local_path.to_string_lossy().to_string(),
+                "rev-parse".to_string(),
+                "HEAD".to_string(),
+            ];
+            if let Ok((stdout, _)) = run_git_capture(&rev_args) {
+                if !stdout.trim().is_empty() {
+                    head_commit = Some(stdout.trim().to_string());
+                }
+            }
+
+            let dirty_args = vec![
+                "-C".to_string(),
+                local_path.to_string_lossy().to_string(),
+                "status".to_string(),
+                "--porcelain".to_string(),
+            ];
+            if let Ok((stdout, _)) = run_git_capture(&dirty_args) {
+                dirty = !stdout.trim().is_empty();
+            }
+            message = "pipeline repo ready".to_string();
+        } else {
+            message = "local path exists but is not a git repository".to_string();
+        }
+    }
+
+    Ok(PipelineRepoStatus {
+        ok: exists && is_git_repo,
+        message,
+        remote_url: settings.pipeline_repo.remote_url,
+        local_path: local_path.to_string_lossy().to_string(),
+        git_ref: settings.pipeline_repo.git_ref,
+        last_sync_at: settings.pipeline_repo.last_sync_at,
+        exists,
+        is_git_repo,
+        head_commit,
+        dirty,
+    })
+}
+
+#[tauri::command]
+fn validate_pipeline_repo() -> Result<PipelineRepoValidateResult, String> {
+    let (runtime, _) = runtime_and_jobs_path()?;
+    let settings = load_settings(&runtime.out_base_dir)?;
+    let mut checks = Vec::new();
+
+    match validate_pipeline_repo_url(&settings.pipeline_repo.remote_url) {
+        Ok(_) => checks.push(preflight_item("pipeline_repo_remote_url", true, "remote_url OK".to_string(), "")),
+        Err(e) => checks.push(preflight_item("pipeline_repo_remote_url", false, e, "Use https:// remote URL.")),
+    }
+
+    match validate_pipeline_repo_ref(&settings.pipeline_repo.git_ref) {
+        Ok(_) => checks.push(preflight_item("pipeline_repo_ref", true, "git_ref OK".to_string(), "")),
+        Err(e) => checks.push(preflight_item("pipeline_repo_ref", false, e, "Use branch/ref with [A-Za-z0-9._/-].")),
+    }
+
+    match validate_pipeline_repo_local_path(&settings.pipeline_repo.local_path, &runtime.out_base_dir) {
+        Ok(local_path) => {
+            checks.push(preflight_item(
+                "pipeline_repo_local_path",
+                true,
+                format!("local_path OK: {}", local_path.display()),
+                "",
+            ));
+            if !local_path.exists() {
+                checks.push(preflight_item(
+                    "pipeline_repo_exists",
+                    false,
+                    format!("not found: {}", local_path.display()),
+                    "Run bootstrap first.",
+                ));
+            } else {
+                checks.push(preflight_item(
+                    "pipeline_repo_exists",
+                    true,
+                    "repo path exists".to_string(),
+                    "",
+                ));
+                checks.extend(pipeline_repo_marker_checks(&local_path));
+            }
+        }
+        Err(e) => checks.push(preflight_item(
+            "pipeline_repo_local_path",
+            false,
+            e,
+            "Set local_path under out_dir.",
+        )),
+    }
+
+    let ok = checks.iter().all(|c| c.ok);
+    Ok(PipelineRepoValidateResult { ok, checks })
+}
+
+#[tauri::command]
+fn bootstrap_pipeline_repo() -> Result<PipelineRepoStatus, String> {
+    let (runtime, _) = runtime_and_jobs_path()?;
+    let mut settings = load_settings(&runtime.out_base_dir)?;
+    settings.pipeline_repo.remote_url = validate_pipeline_repo_url(&settings.pipeline_repo.remote_url)?;
+    settings.pipeline_repo.git_ref = validate_pipeline_repo_ref(&settings.pipeline_repo.git_ref)?;
+    let local_path = validate_pipeline_repo_local_path(&settings.pipeline_repo.local_path, &runtime.out_base_dir)?;
+
+    let action_result = (|| -> Result<String, String> {
+        let _ = run_git_capture(&["--version".to_string()])?;
+        if !local_path.exists() {
+            if let Some(parent) = local_path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("failed to create parent directory {}: {e}", parent.display()))?;
+            }
+            let clone_args = vec![
+                "clone".to_string(),
+                "--depth".to_string(),
+                "1".to_string(),
+                "--branch".to_string(),
+                settings.pipeline_repo.git_ref.clone(),
+                settings.pipeline_repo.remote_url.clone(),
+                local_path.to_string_lossy().to_string(),
+            ];
+            let (stdout, stderr) = run_git_capture(&clone_args)?;
+            return Ok([stdout, stderr].join("\n").trim().to_string());
+        }
+
+        let detail = run_pipeline_repo_update_internal(&local_path, &settings.pipeline_repo)?;
+        Ok(detail)
+    })();
+
+    match action_result {
+        Ok(detail) => {
+            settings.pipeline_repo.local_path = local_path.to_string_lossy().to_string();
+            settings.pipeline_repo.last_sync_at = Some(Utc::now().to_rfc3339());
+            save_settings(&runtime.out_base_dir, &settings)?;
+            let _ = append_audit_pipeline_repo_event(
+                &runtime.out_base_dir,
+                "bootstrap",
+                "ok",
+                &detail,
+                &settings.pipeline_repo,
+            );
+        }
+        Err(e) => {
+            let _ = append_audit_pipeline_repo_event(
+                &runtime.out_base_dir,
+                "bootstrap",
+                "error",
+                &e,
+                &settings.pipeline_repo,
+            );
+            return Err(e);
+        }
+    }
+
+    get_pipeline_repo_status()
+}
+
+#[tauri::command]
+fn update_pipeline_repo() -> Result<PipelineRepoStatus, String> {
+    let (runtime, _) = runtime_and_jobs_path()?;
+    let mut settings = load_settings(&runtime.out_base_dir)?;
+    settings.pipeline_repo.remote_url = validate_pipeline_repo_url(&settings.pipeline_repo.remote_url)?;
+    settings.pipeline_repo.git_ref = validate_pipeline_repo_ref(&settings.pipeline_repo.git_ref)?;
+    let local_path = validate_pipeline_repo_local_path(&settings.pipeline_repo.local_path, &runtime.out_base_dir)?;
+    if !local_path.exists() {
+        return Err(format!(
+            "RULE_PIPELINE_REPO_NOT_FOUND: local path does not exist: {}",
+            local_path.display()
+        ));
+    }
+
+    match run_pipeline_repo_update_internal(&local_path, &settings.pipeline_repo) {
+        Ok(detail) => {
+            settings.pipeline_repo.local_path = local_path.to_string_lossy().to_string();
+            settings.pipeline_repo.last_sync_at = Some(Utc::now().to_rfc3339());
+            save_settings(&runtime.out_base_dir, &settings)?;
+            let _ = append_audit_pipeline_repo_event(
+                &runtime.out_base_dir,
+                "update",
+                "ok",
+                &detail,
+                &settings.pipeline_repo,
+            );
+            get_pipeline_repo_status()
+        }
+        Err(e) => {
+            let _ = append_audit_pipeline_repo_event(
+                &runtime.out_base_dir,
+                "update",
+                "error",
+                &e,
+                &settings.pipeline_repo,
+            );
+            Err(e)
+        }
+    }
+}
+
+#[tauri::command]
+fn open_pipeline_repo_folder() -> Result<String, String> {
+    let (runtime, _) = runtime_and_jobs_path()?;
+    let settings = load_settings(&runtime.out_base_dir)?;
+    let local_path = validate_pipeline_repo_local_path(&settings.pipeline_repo.local_path, &runtime.out_base_dir)?;
+    if !local_path.exists() {
+        return Err(format!("pipeline repo path not found: {}", local_path.display()));
+    }
+    let canonical = canonicalize_existing_dir(&local_path, "RULE_PIPELINE_REPO_OPEN_INVALID")?;
+
+    Command::new("explorer")
+        .arg(&canonical)
+        .spawn()
+        .map_err(|e| format!("failed to open pipeline repo folder: {e}"))?;
+    Ok(canonical.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -7221,6 +7777,12 @@ fn main() {
             retry_pipeline_step,
             get_settings,
             update_settings,
+            update_pipeline_repo_settings,
+            get_pipeline_repo_status,
+            bootstrap_pipeline_repo,
+            update_pipeline_repo,
+            validate_pipeline_repo,
+            open_pipeline_repo_folder,
             open_audit_log,
             tick_auto_retry,
             clear_finished_jobs,
@@ -7281,6 +7843,53 @@ mod tests {
 
         let selected = first_from_precedence(None, None, Some("C:/auto"));
         assert_eq!(selected.as_deref(), Some("C:/auto"));
+    }
+
+    #[test]
+    fn pipeline_repo_url_rejects_non_https() {
+        assert!(validate_pipeline_repo_url("git@github.com:kaneko-ai/jarvis-ml-pipeline.git").is_err());
+        assert!(validate_pipeline_repo_url("http://example.com/repo.git").is_err());
+        assert!(validate_pipeline_repo_url("https://github.com/kaneko-ai/jarvis-ml-pipeline.git").is_ok());
+    }
+
+    #[test]
+    fn pipeline_repo_local_path_rejects_parent_traversal() {
+        let base = std::env::temp_dir().join(format!("jarvis_pr17_path_{}", now_epoch_ms()));
+        fs::create_dir_all(&base).expect("create base");
+        let err = validate_pipeline_repo_local_path("../escape", &base)
+            .err()
+            .unwrap_or_default();
+        assert!(err.contains("RULE_PIPELINE_REPO_PATH_TRAVERSAL"));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pipeline_repo_local_path_accepts_under_allowed_root() {
+        let base = std::env::temp_dir().join(format!("jarvis_pr17_path_ok_{}", now_epoch_ms()));
+        fs::create_dir_all(&base).expect("create base");
+        let resolved = validate_pipeline_repo_local_path("pipeline_repo/jarvis-ml-pipeline", &base)
+            .expect("resolve local path");
+        assert!(resolved.starts_with(base.canonicalize().expect("canonical base")));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn validate_pipeline_repo_markers_ok_and_ng() {
+        let base = std::env::temp_dir().join(format!("jarvis_pr17_markers_{}", now_epoch_ms()));
+        let repo_ok = base.join("ok_repo");
+        fs::create_dir_all(repo_ok.join("jarvis_core")).expect("jarvis_core");
+        fs::write(repo_ok.join("pyproject.toml"), "[tool.poetry]").expect("pyproject");
+        fs::write(repo_ok.join("jarvis_cli.py"), "print('ok')").expect("cli");
+        fs::write(repo_ok.join("RUNBOOK.md"), "# runbook").expect("runbook");
+
+        let ok_checks = pipeline_repo_marker_checks(&repo_ok);
+        assert!(ok_checks.iter().all(|c| c.ok));
+
+        let repo_ng = base.join("ng_repo");
+        fs::create_dir_all(&repo_ng).expect("ng_repo");
+        let ng_checks = pipeline_repo_marker_checks(&repo_ng);
+        assert!(ng_checks.iter().any(|c| !c.ok));
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -8315,6 +8924,7 @@ mod tests {
             auto_retry_max_per_pipeline: 3,
             auto_retry_base_delay_seconds: 10,
             auto_retry_max_delay_seconds: 25,
+            pipeline_repo: default_pipeline_repo_settings(),
         };
         let now_ms = 2_000u128;
 
