@@ -83,8 +83,11 @@ function renderMarkdownToHtml(md) {
 
 export default function App() {
   const [paperId, setPaperId] = useState("arxiv:1706.03762");
-  const [depth, setDepth] = useState(2);
-  const [maxPerLevel, setMaxPerLevel] = useState(50);
+  const [templates, setTemplates] = useState([]);
+  const [templatesLoading, setTemplatesLoading] = useState(false);
+  const [templatesError, setTemplatesError] = useState("");
+  const [selectedTemplateId, setSelectedTemplateId] = useState("TEMPLATE_TREE");
+  const [templateParams, setTemplateParams] = useState({});
 
   const [running, setRunning] = useState(false);
   const [stdout, setStdout] = useState("");
@@ -135,6 +138,25 @@ export default function App() {
       setRuntimeCfg(null);
     } finally {
       setCfgLoading(false);
+    }
+  }
+
+  async function loadTemplates() {
+    setTemplatesLoading(true);
+    setTemplatesError("");
+    try {
+      const res = await invoke("list_task_templates");
+      const list = Array.isArray(res) ? res : [];
+      setTemplates(list);
+      setSelectedTemplateId((prev) => {
+        if (prev && list.some((t) => t.id === prev)) return prev;
+        return list[0]?.id ?? "";
+      });
+    } catch (e) {
+      setTemplates([]);
+      setTemplatesError(String(e));
+    } finally {
+      setTemplatesLoading(false);
     }
   }
 
@@ -195,8 +217,23 @@ export default function App() {
   useEffect(() => {
     loadRuntimeConfig(false);
     loadPreflight();
+    loadTemplates();
     loadRuns();
   }, []);
+
+  const selectedTemplate = templates.find((t) => t.id === selectedTemplateId) ?? null;
+
+  useEffect(() => {
+    if (!selectedTemplate) {
+      setTemplateParams({});
+      return;
+    }
+    const defaults = {};
+    for (const p of selectedTemplate.params ?? []) {
+      defaults[p.key] = p.default_value;
+    }
+    setTemplateParams(defaults);
+  }, [selectedTemplateId, selectedTemplate?.id]);
 
   useEffect(() => {
     const timer = setTimeout(async () => {
@@ -236,10 +273,10 @@ export default function App() {
     setRetryAfterSec(null);
 
     try {
-      const res = await invoke("run_papers_tree", {
-        paperId: params.paperId,
-        depth: params.depth,
-        maxPerLevel: params.maxPerLevel,
+      const res = await invoke("run_task_template", {
+        templateId: params.templateId,
+        canonicalId: params.canonicalId,
+        params: params.templateParams,
       });
 
       setStdout(res.stdout ?? "");
@@ -252,6 +289,9 @@ export default function App() {
       setRetryAfterSec(res.retry_after_sec ?? null);
       setLastRunRequest(params);
       await loadRuns();
+      if (res?.run_id) {
+        setSelectedRunId(res.run_id);
+      }
     } catch (e) {
       setStderr(String(e));
       setStatus("error");
@@ -263,7 +303,11 @@ export default function App() {
 
   async function onRunTree() {
     const idForRun = normalized?.canonical?.trim() ? normalized.canonical : paperId;
-    await runTree({ paperId: idForRun, depth, maxPerLevel });
+    await runTree({
+      templateId: selectedTemplateId,
+      canonicalId: idForRun,
+      templateParams,
+    });
   }
 
   async function onRetry() {
@@ -313,7 +357,8 @@ export default function App() {
   const normalizeWarnings = Array.isArray(normalized?.warnings) ? normalized.warnings : [];
   const canRunByNormalization = normalizeErrors.length === 0 && !!normalized?.canonical;
   const canRunByPreflight = preflight?.ok === true;
-  const runDisabled = running || !canRunByNormalization || !canRunByPreflight;
+  const canRunByTemplate = !!selectedTemplate && selectedTemplate.wired === true;
+  const runDisabled = running || !canRunByNormalization || !canRunByPreflight || !canRunByTemplate;
 
   const showRetryButton = status === "needs_retry" && !!lastRunRequest;
   const selectedRun = runs.find((r) => r.run_id === selectedRunId) ?? null;
@@ -390,7 +435,7 @@ export default function App() {
         ) : null}
       </div>
 
-      <div style={{ display: "grid", gap: 12, gridTemplateColumns: "1fr 160px 160px" }}>
+      <div style={{ display: "grid", gap: 12, gridTemplateColumns: "1fr 260px" }}>
         <label style={{ display: "grid", gap: 6 }}>
           <span>Paper ID (doi:/pmid:/arxiv:/s2:)</span>
           <input
@@ -401,28 +446,67 @@ export default function App() {
         </label>
 
         <label style={{ display: "grid", gap: 6 }}>
-          <span>Depth</span>
+          <span>Template</span>
           <select
-            value={depth}
-            onChange={(e) => setDepth(Number(e.target.value))}
+            value={selectedTemplateId}
+            onChange={(e) => setSelectedTemplateId(e.target.value)}
             style={{ padding: 10, borderRadius: 8, border: "1px solid #ccc" }}
+            disabled={templatesLoading || templates.length === 0}
           >
-            <option value={1}>1</option>
-            <option value={2}>2</option>
+            {templates.map((t) => (
+              <option key={t.id} value={t.id}>
+                {t.title} ({t.id}){t.wired ? "" : " - not wired"}
+              </option>
+            ))}
           </select>
         </label>
+      </div>
 
-        <label style={{ display: "grid", gap: 6 }}>
-          <span>Max/level</span>
-          <input
-            type="number"
-            min={1}
-            max={200}
-            value={maxPerLevel}
-            onChange={(e) => setMaxPerLevel(Number(e.target.value))}
-            style={{ padding: 10, borderRadius: 8, border: "1px solid #ccc" }}
-          />
-        </label>
+      {templatesError ? <div style={{ marginTop: 8, color: "#a33", fontSize: 12 }}>{templatesError}</div> : null}
+
+      <div
+        style={{
+          border: "1px solid #d2d2d2",
+          borderRadius: 10,
+          padding: 10,
+          marginTop: 10,
+          background: "#fafafa",
+        }}
+      >
+        <div style={{ fontWeight: 600, marginBottom: 6 }}>Template parameters</div>
+        <div style={{ fontSize: 12, marginBottom: 6 }}>
+          {selectedTemplate ? (
+            <>
+              <strong>{selectedTemplate.title}</strong>: {selectedTemplate.description}
+              {!selectedTemplate.wired ? (
+                <span style={{ marginLeft: 8, color: "#a33" }}>not wired</span>
+              ) : null}
+            </>
+          ) : (
+            "No template selected"
+          )}
+        </div>
+        <div style={{ display: "grid", gap: 8, gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))" }}>
+          {(selectedTemplate?.params ?? []).map((p) => (
+            <label key={p.key} style={{ display: "grid", gap: 4 }}>
+              <span style={{ fontSize: 12 }}>{p.label}</span>
+              <input
+                type={p.param_type === "integer" ? "number" : "text"}
+                min={p.min ?? undefined}
+                max={p.max ?? undefined}
+                value={templateParams[p.key] ?? ""}
+                onChange={(e) => {
+                  const raw = e.target.value;
+                  setTemplateParams((prev) => ({
+                    ...prev,
+                    [p.key]: p.param_type === "integer" ? Number(raw) : raw,
+                  }));
+                }}
+                style={{ padding: 8, borderRadius: 6, border: "1px solid #ccc" }}
+              />
+            </label>
+          ))}
+        </div>
       </div>
 
       <div
@@ -481,7 +565,7 @@ export default function App() {
           disabled={runDisabled}
           style={{ padding: "10px 14px", borderRadius: 10, border: "1px solid #333" }}
         >
-          {running ? "Running..." : "Run papers tree"}
+          {running ? "Running..." : "Run selected template"}
         </button>
 
         <button

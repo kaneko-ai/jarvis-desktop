@@ -109,6 +109,156 @@ struct PreflightResult {
     checks: Vec<PreflightCheckItem>,
 }
 
+#[derive(Serialize, Clone)]
+struct TemplateParamDef {
+    key: String,
+    label: String,
+    param_type: String,
+    default_value: serde_json::Value,
+    min: Option<i64>,
+    max: Option<i64>,
+}
+
+#[derive(Serialize, Clone)]
+struct TaskTemplateDef {
+    id: String,
+    title: String,
+    description: String,
+    wired: bool,
+    disabled_reason: String,
+    params: Vec<TemplateParamDef>,
+}
+
+fn template_registry() -> Vec<TaskTemplateDef> {
+    vec![
+        TaskTemplateDef {
+            id: "TEMPLATE_TREE".to_string(),
+            title: "Papers Tree".to_string(),
+            description: "Build citation tree from canonical identifier".to_string(),
+            wired: true,
+            disabled_reason: "".to_string(),
+            params: vec![
+                TemplateParamDef {
+                    key: "depth".to_string(),
+                    label: "Depth".to_string(),
+                    param_type: "integer".to_string(),
+                    default_value: serde_json::json!(2),
+                    min: Some(1),
+                    max: Some(2),
+                },
+                TemplateParamDef {
+                    key: "max_per_level".to_string(),
+                    label: "Max per level".to_string(),
+                    param_type: "integer".to_string(),
+                    default_value: serde_json::json!(50),
+                    min: Some(1),
+                    max: Some(200),
+                },
+            ],
+        },
+        TaskTemplateDef {
+            id: "TEMPLATE_MAP".to_string(),
+            title: "Paper Map".to_string(),
+            description: "Generate paper map (placeholder)".to_string(),
+            wired: false,
+            disabled_reason: "not wired".to_string(),
+            params: vec![],
+        },
+        TaskTemplateDef {
+            id: "TEMPLATE_RELATED".to_string(),
+            title: "Related Papers".to_string(),
+            description: "Find related papers (placeholder)".to_string(),
+            wired: false,
+            disabled_reason: "not wired".to_string(),
+            params: vec![],
+        },
+        TaskTemplateDef {
+            id: "TEMPLATE_SUMMARY".to_string(),
+            title: "Paper Summary".to_string(),
+            description: "Generate summary (placeholder)".to_string(),
+            wired: false,
+            disabled_reason: "not wired".to_string(),
+            params: vec![],
+        },
+    ]
+}
+
+fn find_template(id: &str) -> Option<TaskTemplateDef> {
+    template_registry().into_iter().find(|t| t.id == id)
+}
+
+fn json_i64_with_default(
+    value: Option<&serde_json::Value>,
+    default_value: i64,
+    min: i64,
+    max: i64,
+) -> Result<i64, String> {
+    let parsed = match value {
+        None => default_value,
+        Some(v) if v.is_null() => default_value,
+        Some(serde_json::Value::Number(n)) => n
+            .as_i64()
+            .ok_or_else(|| "expected integer parameter".to_string())?,
+        Some(serde_json::Value::String(s)) => s
+            .trim()
+            .parse::<i64>()
+            .map_err(|_| format!("invalid integer parameter: {s}"))?,
+        Some(_) => return Err("expected integer parameter".to_string()),
+    };
+
+    if parsed < min || parsed > max {
+        return Err(format!("parameter out of range: {parsed} (allowed: {min}..{max})"));
+    }
+    Ok(parsed)
+}
+
+fn build_template_args(
+    template_id: &str,
+    canonical_id: &str,
+    params: &serde_json::Value,
+) -> Result<(Vec<String>, serde_json::Value), String> {
+    match template_id {
+        "TEMPLATE_TREE" => {
+            let normalized = normalize_identifier_internal(canonical_id);
+            let pipeline_id = to_pipeline_identifier(&normalized)
+                .map_err(|e| format!("identifier normalize error: {e}"))?;
+
+            let obj = params.as_object();
+            let depth = json_i64_with_default(
+                obj.and_then(|m| m.get("depth")),
+                2,
+                1,
+                2,
+            )?;
+            let max_per_level = json_i64_with_default(
+                obj.and_then(|m| m.get("max_per_level")),
+                50,
+                1,
+                200,
+            )?;
+
+            let argv = vec![
+                "papers".to_string(),
+                "tree".to_string(),
+                "--id".to_string(),
+                pipeline_id,
+                "--depth".to_string(),
+                depth.to_string(),
+                "--max-per-level".to_string(),
+                max_per_level.to_string(),
+            ];
+
+            let normalized_params = serde_json::json!({
+                "depth": depth,
+                "max_per_level": max_per_level,
+            });
+
+            Ok((argv, normalized_params))
+        }
+        other => Err(format!("template not wired: {other}")),
+    }
+}
+
 fn split_url_tail(raw: &str) -> String {
     raw.split(&['?', '#'][..]).next().unwrap_or("").trim().to_string()
 }
@@ -1169,6 +1319,17 @@ fn parse_paper_id_from_input(path: &Path) -> String {
         Err(_) => return "unknown".to_string(),
     };
 
+    if let Some(v) = value
+        .get("desktop")
+        .and_then(|v| v.get("canonical_id"))
+        .and_then(|v| v.as_str())
+    {
+        let t = v.trim();
+        if !t.is_empty() {
+            return t.to_string();
+        }
+    }
+
     if let Some(v) = value.get("paper_id").and_then(|v| v.as_str()) {
         let t = v.trim();
         if !t.is_empty() {
@@ -1335,27 +1496,59 @@ fn read_run_artifact(run_id: String, artifact: String) -> Result<RunArtifactView
     }
 }
 
-#[tauri::command]
-fn run_papers_tree(paper_id: String, depth: u8, max_per_level: u32) -> RunResult {
-    let run_id = make_run_id();
+fn merge_desktop_input_metadata(
+    run_dir: &Path,
+    template_id: &str,
+    canonical_id: &str,
+    params: &serde_json::Value,
+) -> Result<(), String> {
+    let input_path = run_dir.join("input.json");
+    let desktop_meta = serde_json::json!({
+        "template_id": template_id,
+        "canonical_id": canonical_id,
+        "params": params,
+        "created_by": "jarvis-desktop",
+        "version": env!("CARGO_PKG_VERSION"),
+    });
 
-    let normalized = match normalize_paper_id(&paper_id) {
-        Ok(v) => v,
-        Err(e) => {
-            return RunResult {
-                ok: false,
-                exit_code: 1,
-                stdout: "".to_string(),
-                stderr: format!("paper_id normalize error: {e}"),
-                run_id,
-                run_dir: "".to_string(),
-                status: "error".to_string(),
-                message: format!("paper_id normalize error: {e}"),
-                retry_after_sec: None,
+    let merged = if input_path.exists() {
+        let raw = fs::read_to_string(&input_path)
+            .map_err(|e| format!("failed to read input.json {}: {e}", input_path.display()))?;
+        match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(mut v) => {
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("desktop".to_string(), desktop_meta);
+                    v
+                } else {
+                    serde_json::json!({
+                        "original": v,
+                        "desktop": desktop_meta,
+                    })
+                }
             }
+            Err(_) => serde_json::json!({
+                "desktop": desktop_meta,
+            }),
         }
+    } else {
+        serde_json::json!({
+            "desktop": desktop_meta,
+        })
     };
 
+    let pretty = serde_json::to_string_pretty(&merged)
+        .map_err(|e| format!("failed to serialize merged input.json: {e}"))?;
+    fs::write(&input_path, pretty)
+        .map_err(|e| format!("failed to write input.json {}: {e}", input_path.display()))
+}
+
+fn execute_pipeline_task(
+    task_args: Vec<String>,
+    template_id: String,
+    canonical_id: String,
+    normalized_params: serde_json::Value,
+) -> RunResult {
+    let run_id = make_run_id();
     let root = repo_root();
     let runtime = match resolve_runtime_config(&root) {
         Ok(cfg) => cfg,
@@ -1377,9 +1570,9 @@ fn run_papers_tree(paper_id: String, depth: u8, max_per_level: u32) -> RunResult
     let (python_cmd, preflight_warnings) = choose_python(&root, &pipeline_root);
     if let Err(e) = check_python_runnable(&python_cmd, &pipeline_root) {
         return missing_dependency(
-      run_id,
-      format!("{e}\nHint: set JARVIS_PIPELINE_ROOT and prepare a venv under src-tauri/.venv or pipeline/.venv."),
-    );
+            run_id,
+            format!("{e}\nHint: set JARVIS_PIPELINE_ROOT and prepare a venv under src-tauri/.venv or pipeline/.venv."),
+        );
     }
 
     let out_base_dir = runtime.out_base_dir.clone();
@@ -1419,24 +1612,20 @@ fn run_papers_tree(paper_id: String, depth: u8, max_per_level: u32) -> RunResult
     if let Some(v) = runtime.s2_backoff_base_sec {
         cmd.env("S2_BACKOFF_BASE_SEC", v.to_string());
     }
+
+    let mut final_args = task_args;
+    final_args.extend_from_slice(&[
+        "--out".to_string(),
+        out_base_dir.to_string_lossy().to_string(),
+        "--out-run".to_string(),
+        run_id.clone(),
+    ]);
+
     cmd.current_dir(&pipeline_root)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .arg(cli_script.as_os_str())
-        .args([
-            "papers",
-            "tree",
-            "--id",
-            &normalized,
-            "--depth",
-            &depth.to_string(),
-            "--max-per-level",
-            &max_per_level.to_string(),
-            "--out",
-            out_base_dir.to_string_lossy().as_ref(),
-            "--out-run",
-            &run_id,
-        ]);
+        .args(&final_args);
 
     let out = match cmd.output() {
         Ok(o) => o,
@@ -1466,6 +1655,16 @@ fn run_papers_tree(paper_id: String, depth: u8, max_per_level: u32) -> RunResult
             format!("{warning}{stderr}")
         };
     }
+
+    if out.status.success() {
+        let _ = merge_desktop_input_metadata(
+            &run_dir_abs,
+            &template_id,
+            &canonical_id,
+            &normalized_params,
+        );
+    }
+
     let status = read_status(&stdout, &stderr, code);
     let retry_after_sec = extract_retry_after_seconds(&format!("{stdout}\n{stderr}"));
     let message = build_status_message(&status, &stdout, &stderr, retry_after_sec);
@@ -1473,14 +1672,85 @@ fn run_papers_tree(paper_id: String, depth: u8, max_per_level: u32) -> RunResult
     RunResult {
         ok: out.status.success(),
         exit_code: code,
-        stdout: stdout.clone(),
-        stderr: stderr.clone(),
+        stdout,
+        stderr,
         run_id,
         run_dir: run_dir_abs.to_string_lossy().to_string(),
         status,
         message,
         retry_after_sec,
     }
+}
+
+#[tauri::command]
+fn list_task_templates() -> Vec<TaskTemplateDef> {
+    template_registry()
+}
+
+#[tauri::command]
+fn run_task_template(
+    template_id: String,
+    canonical_id: String,
+    params: serde_json::Value,
+) -> RunResult {
+    let tpl = match find_template(&template_id) {
+        Some(t) => t,
+        None => {
+            return RunResult {
+                ok: false,
+                exit_code: 1,
+                stdout: "".to_string(),
+                stderr: format!("unknown template id: {template_id}"),
+                run_id: make_run_id(),
+                run_dir: "".to_string(),
+                status: "error".to_string(),
+                message: format!("unknown template id: {template_id}"),
+                retry_after_sec: None,
+            }
+        }
+    };
+
+    if !tpl.wired {
+        return RunResult {
+            ok: false,
+            exit_code: 1,
+            stdout: "".to_string(),
+            stderr: format!("template is not wired: {}", tpl.id),
+            run_id: make_run_id(),
+            run_dir: "".to_string(),
+            status: "error".to_string(),
+            message: format!("template is not wired: {}", tpl.id),
+            retry_after_sec: None,
+        };
+    }
+
+    let (argv, normalized_params) = match build_template_args(&template_id, &canonical_id, &params) {
+        Ok(v) => v,
+        Err(e) => {
+            return RunResult {
+                ok: false,
+                exit_code: 1,
+                stdout: "".to_string(),
+                stderr: e.clone(),
+                run_id: make_run_id(),
+                run_dir: "".to_string(),
+                status: "error".to_string(),
+                message: e,
+                retry_after_sec: None,
+            }
+        }
+    };
+
+    execute_pipeline_task(argv, template_id, canonical_id, normalized_params)
+}
+
+#[tauri::command]
+fn run_papers_tree(paper_id: String, depth: u8, max_per_level: u32) -> RunResult {
+    let params = serde_json::json!({
+        "depth": depth,
+        "max_per_level": max_per_level,
+    });
+    run_task_template("TEMPLATE_TREE".to_string(), paper_id, params)
 }
 
 #[tauri::command]
@@ -1655,7 +1925,9 @@ fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             run_papers_tree,
+            run_task_template,
             open_run_folder,
+            list_task_templates,
             list_runs,
             read_run_artifact,
             normalize_identifier,
@@ -1769,5 +2041,51 @@ mod tests {
         let invalid = normalize_identifier_internal("not-an-id???");
         assert_eq!(invalid.kind, "unknown");
         assert!(!invalid.errors.is_empty());
+    }
+
+    #[test]
+    fn template_registry_defaults_are_stable() {
+        let templates = template_registry();
+        let tree = templates
+            .iter()
+            .find(|t| t.id == "TEMPLATE_TREE")
+            .expect("TEMPLATE_TREE missing");
+        assert!(tree.wired);
+        assert_eq!(tree.params.len(), 2);
+
+        let depth = tree
+            .params
+            .iter()
+            .find(|p| p.key == "depth")
+            .expect("depth param missing");
+        assert_eq!(depth.default_value, serde_json::json!(2));
+
+        let max_per_level = tree
+            .params
+            .iter()
+            .find(|p| p.key == "max_per_level")
+            .expect("max_per_level param missing");
+        assert_eq!(max_per_level.default_value, serde_json::json!(50));
+    }
+
+    #[test]
+    fn template_build_args_are_deterministic() {
+        let params = serde_json::json!({ "depth": 1, "max_per_level": 5 });
+        let (argv, normalized_params) = build_template_args("TEMPLATE_TREE", "arxiv:1706.03762", &params)
+            .expect("build args failed");
+
+        let expected = vec![
+            "papers".to_string(),
+            "tree".to_string(),
+            "--id".to_string(),
+            "arxiv:1706.03762".to_string(),
+            "--depth".to_string(),
+            "1".to_string(),
+            "--max-per-level".to_string(),
+            "5".to_string(),
+        ];
+        assert_eq!(argv, expected);
+        assert_eq!(normalized_params["depth"], serde_json::json!(1));
+        assert_eq!(normalized_params["max_per_level"], serde_json::json!(5));
     }
 }
