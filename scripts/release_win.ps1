@@ -109,14 +109,9 @@ npm run build
 Assert-LastExitCode "npm run build"
 
 Write-Host ""
-Write-Host "[3/5] Gate: cargo test -q"
-Push-Location (Join-Path $desktopRoot "src-tauri")
-try {
-  cargo test -q
-  Assert-LastExitCode "cargo test -q"
-} finally {
-  Pop-Location
-}
+Write-Host "[3/5] Gate: cargo test -q --manifest-path src-tauri/Cargo.toml"
+cargo test -q --manifest-path src-tauri/Cargo.toml
+Assert-LastExitCode "cargo test -q --manifest-path src-tauri/Cargo.toml"
 
 Write-Host ""
 Write-Host "[4/5] Gate: smoke_tauri_e2e.ps1 -RunDiagStrict"
@@ -139,6 +134,9 @@ if ([string]::IsNullOrWhiteSpace($productName)) {
 }
 
 $releaseRoot = Join-Path $desktopRoot (Join-Path "dist\releases" $appVersion)
+if (Test-Path $releaseRoot) {
+  Remove-Item -Path $releaseRoot -Recurse -Force
+}
 Ensure-Dir $releaseRoot
 
 $bundleRoot = Join-Path $desktopRoot "src-tauri\target\release\bundle"
@@ -149,7 +147,9 @@ $artifacts = New-Object System.Collections.Generic.List[object]
 if (Test-Path $bundleRoot) {
   $bundleFiles = Get-ChildItem -Path $bundleRoot -Recurse -File | Where-Object {
     $ext = $_.Extension.ToLowerInvariant()
-    $ext -eq ".msi" -or $ext -eq ".exe"
+    $name = $_.Name.ToLowerInvariant()
+    $versionToken = "_{0}" -f $appVersion.ToLowerInvariant()
+    ($ext -eq ".msi" -or $ext -eq ".exe") -and $name.Contains($versionToken)
   } | Sort-Object FullName
 
   foreach ($file in $bundleFiles) {

@@ -8,6 +8,11 @@
 - [ ] Python 3.12+ をインストール
 - [ ] Pipeline 側で `jarvis_cli.py` が実行可能であることを確認
 
+### 実行ゲート（固定）
+- [ ] `npm run build`
+- [ ] `cargo test -q --manifest-path src-tauri/Cargo.toml`
+- [ ] `powershell -ExecutionPolicy Bypass -File .\smoke_tauri_e2e.ps1 -PipelineRoot "<pipeline_root>"`
+
 ## 1. インストールと初回起動
 - [ ] desktop installer を実行してインストール
 - [ ] アプリを起動

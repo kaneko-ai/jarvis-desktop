@@ -26,7 +26,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\release_win.ps1 -P
 ## スクリプトが実行する内容
 1. 依存解決 (`npm ci` / lock がない場合は `npm install`)
 2. フロントビルド (`npm run build`)
-3. Rust テスト (`cargo test -q` in `src-tauri`)
+3. Rust テスト (`cargo test -q --manifest-path src-tauri/Cargo.toml`)
 4. スモーク (`smoke_tauri_e2e.ps1 -RunDiagStrict`)
 5. Tauri リリースビルド (`npx tauri build`)
 6. 成果物収集 + `SHA256SUMS.txt` + `release_manifest.json` 生成
