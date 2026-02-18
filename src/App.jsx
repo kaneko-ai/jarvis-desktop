@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 function escapeHtml(raw) {
@@ -207,6 +207,12 @@ export default function App() {
   const [pipelineDetailLoading, setPipelineDetailLoading] = useState(false);
   const [activeScreen, setActiveScreen] = useState("main");
   const [opsNeedsAttentionOnly, setOpsNeedsAttentionOnly] = useState(false);
+  const [opsAutoRetryPendingOnly, setOpsAutoRetryPendingOnly] = useState(false);
+  const [desktopSettings, setDesktopSettings] = useState(null);
+  const [settingsLoading, setSettingsLoading] = useState(false);
+  const [settingsError, setSettingsError] = useState("");
+  const [tickResult, setTickResult] = useState(null);
+  const autoRetryTickBusyRef = useRef(false);
   const [libraryRows, setLibraryRows] = useState([]);
   const [libraryLoading, setLibraryLoading] = useState(false);
   const [libraryError, setLibraryError] = useState("");
@@ -338,6 +344,60 @@ export default function App() {
       setPipelinesError(String(e));
     } finally {
       setPipelinesLoading(false);
+    }
+  }
+
+  async function loadSettings() {
+    setSettingsLoading(true);
+    setSettingsError("");
+    try {
+      const settings = await invoke("get_settings");
+      setDesktopSettings(settings ?? null);
+    } catch (e) {
+      setDesktopSettings(null);
+      setSettingsError(String(e));
+    } finally {
+      setSettingsLoading(false);
+    }
+  }
+
+  async function updateAutoRetryEnabled(enabled) {
+    if (!desktopSettings) return;
+    setSettingsError("");
+    try {
+      const updated = await invoke("update_settings", {
+        settings: {
+          ...desktopSettings,
+          auto_retry_enabled: !!enabled,
+        },
+      });
+      setDesktopSettings(updated ?? null);
+    } catch (e) {
+      setSettingsError(String(e));
+    }
+  }
+
+  async function onOpenAuditLog() {
+    try {
+      await invoke("open_audit_log");
+    } catch (e) {
+      alert(String(e));
+    }
+  }
+
+  async function tickAutoRetry() {
+    if (autoRetryTickBusyRef.current) return;
+    autoRetryTickBusyRef.current = true;
+    try {
+      const res = await invoke("tick_auto_retry");
+      setTickResult(res ?? null);
+      if (res?.acted) {
+        await Promise.all([loadPipelines(), loadJobs(), loadRuns()]);
+      }
+    } catch (e) {
+      setTickResult({ acted: false, reason: String(e) });
+    } finally {
+      autoRetryTickBusyRef.current = false;
     }
   }
 
@@ -773,6 +833,7 @@ export default function App() {
     loadRuns();
     loadJobs();
     loadPipelines();
+    loadSettings();
     loadLibraryRows();
     loadLibraryStats();
   }, []);
@@ -784,6 +845,15 @@ export default function App() {
     }, 1500);
     return () => clearInterval(timer);
   }, []);
+
+  useEffect(() => {
+    if (activeScreen !== "ops") return;
+    tickAutoRetry();
+    const timer = setInterval(() => {
+      tickAutoRetry();
+    }, 2000);
+    return () => clearInterval(timer);
+  }, [activeScreen]);
 
   useEffect(() => {
     loadPipelineDetail(selectedPipelineId);
@@ -1037,10 +1107,15 @@ export default function App() {
     return rows.filter((p) => p?.status === "failed" || p?.status === "needs_retry");
   }, [pipelines, opsNeedsAttentionOnly]);
   const opsJobRows = useMemo(() => {
-    const rows = Array.isArray(jobs) ? jobs : [];
-    if (!opsNeedsAttentionOnly) return rows;
-    return rows.filter((j) => j?.status === "failed" || j?.status === "needs_retry");
-  }, [jobs, opsNeedsAttentionOnly]);
+    let rows = Array.isArray(jobs) ? jobs : [];
+    if (opsNeedsAttentionOnly) {
+      rows = rows.filter((j) => j?.status === "failed" || j?.status === "needs_retry");
+    }
+    if (opsAutoRetryPendingOnly) {
+      rows = rows.filter((j) => j?.status === "needs_retry" && !!j?.retry_at);
+    }
+    return rows;
+  }, [jobs, opsNeedsAttentionOnly, opsAutoRetryPendingOnly]);
   const opsRunRows = useMemo(() => (Array.isArray(runs) ? runs : []), [runs]);
   const isLibrarySearchMode = String(librarySearchQuery ?? "").trim() !== "";
   const visibleLibraryRows = isLibrarySearchMode ? librarySearchRows : libraryRows;
@@ -2280,10 +2355,17 @@ export default function App() {
                 await loadPipelines();
                 await loadJobs();
                 await loadRuns();
+                await loadSettings();
               }}
               style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
             >
               Refresh Ops
+            </button>
+            <button
+              onClick={onOpenAuditLog}
+              style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+            >
+              Open audit log
             </button>
             <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
               <input
@@ -2293,6 +2375,38 @@ export default function App() {
               />
               Needs Attention only (failed / needs_retry)
             </label>
+            <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
+              <input
+                type="checkbox"
+                checked={opsAutoRetryPendingOnly}
+                onChange={(e) => setOpsAutoRetryPendingOnly(e.target.checked)}
+              />
+              Auto-retry pending only
+            </label>
+            <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
+              <input
+                type="checkbox"
+                checked={desktopSettings?.auto_retry_enabled === true}
+                disabled={!desktopSettings || settingsLoading}
+                onChange={(e) => updateAutoRetryEnabled(e.target.checked)}
+              />
+              Auto-retry enabled
+            </label>
+          </div>
+
+          <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: 10, marginBottom: 12, fontSize: 12 }}>
+            <div style={{ fontWeight: 600, marginBottom: 6 }}>Auto-retry policy</div>
+            {desktopSettings ? (
+              <div>
+                max/job={desktopSettings.auto_retry_max_per_job} max/pipeline={desktopSettings.auto_retry_max_per_pipeline} base_delay={desktopSettings.auto_retry_base_delay_seconds}s max_delay={desktopSettings.auto_retry_max_delay_seconds}s
+              </div>
+            ) : (
+              <div style={{ opacity: 0.8 }}>No settings loaded.</div>
+            )}
+            <div style={{ marginTop: 4, opacity: 0.8 }}>
+              tick={tickResult?.reason ?? "-"} acted={tickResult?.acted ? "yes" : "no"}
+            </div>
+            {settingsError ? <div style={{ marginTop: 4, color: "#c00" }}>{settingsError}</div> : null}
           </div>
 
           <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: 10, marginBottom: 12 }}>
@@ -2368,6 +2482,7 @@ export default function App() {
                     <div style={{ fontSize: 12, fontWeight: 600 }}>{j.job_id}</div>
                     <div style={{ fontSize: 11 }}>{j.template_id} / {j.canonical_id}</div>
                     <div style={{ fontSize: 11 }}>status={j.status} attempt={j.attempt} updated_at={j.updated_at}</div>
+                    <div style={{ fontSize: 11 }}>next_retry_at={j.retry_at || "-"} auto_retry_attempt_count={j.auto_retry_attempt_count ?? 0}</div>
                     <div style={{ display: "flex", gap: 6, marginTop: 6, flexWrap: "wrap" }}>
                       <button
                         onClick={() => onCancelJob(j.job_id)}

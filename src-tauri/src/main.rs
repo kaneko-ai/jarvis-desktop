@@ -213,6 +213,8 @@ struct JobRecord {
     last_error: Option<String>,
     retry_after_seconds: Option<f64>,
     retry_at: Option<String>,
+    #[serde(default)]
+    auto_retry_attempt_count: u32,
 }
 
 #[derive(Default)]
@@ -272,6 +274,48 @@ struct PipelineRecord {
     current_step_index: usize,
     status: PipelineStatus,
     last_primary_viz: Option<PrimaryVizRef>,
+    #[serde(default)]
+    auto_retry_attempt_count: u32,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct DesktopSettings {
+    auto_retry_enabled: bool,
+    auto_retry_max_per_job: u32,
+    auto_retry_max_per_pipeline: u32,
+    auto_retry_max_delay_seconds: u64,
+    auto_retry_base_delay_seconds: u64,
+}
+
+impl Default for DesktopSettings {
+    fn default() -> Self {
+        Self {
+            auto_retry_enabled: false,
+            auto_retry_max_per_job: 2,
+            auto_retry_max_per_pipeline: 3,
+            auto_retry_max_delay_seconds: 3600,
+            auto_retry_base_delay_seconds: 30,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct AuditAutoRetryEntry {
+    ts: String,
+    kind: String,
+    job_id: String,
+    pipeline_id: Option<String>,
+    reason: String,
+    next_retry_at: Option<String>,
+    attempt: u32,
+}
+
+#[derive(Serialize)]
+struct AutoRetryTickResult {
+    acted: bool,
+    job_id: Option<String>,
+    pipeline_id: Option<String>,
+    reason: String,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -990,6 +1034,14 @@ fn pipelines_file_path(out_dir: &Path) -> PathBuf {
     out_dir.join(".jarvis-desktop").join("pipelines.json")
 }
 
+fn settings_file_path(out_dir: &Path) -> PathBuf {
+    out_dir.join(".jarvis-desktop").join("settings.json")
+}
+
+fn audit_jsonl_path(out_dir: &Path) -> PathBuf {
+    out_dir.join(".jarvis-desktop").join("audit.jsonl")
+}
+
 fn library_jsonl_path(out_dir: &Path) -> PathBuf {
     out_dir.join(".jarvis-desktop").join("library.jsonl")
 }
@@ -1596,6 +1648,72 @@ fn save_pipelines_to_file(path: &Path, pipelines: &[PipelineRecord]) -> Result<(
     let text = serde_json::to_string_pretty(&payload)
         .map_err(|e| format!("failed to serialize pipelines payload: {e}"))?;
     atomic_write_text(path, &text)
+}
+
+fn load_settings(out_dir: &Path) -> Result<DesktopSettings, String> {
+    let path = settings_file_path(out_dir);
+    if !path.exists() {
+        let defaults = DesktopSettings::default();
+        save_settings(out_dir, &defaults)?;
+        return Ok(defaults);
+    }
+    let raw = fs::read_to_string(&path)
+        .map_err(|e| format!("failed to read settings file {}: {e}", path.display()))?;
+    serde_json::from_str::<DesktopSettings>(&raw)
+        .map_err(|e| format!("failed to parse settings file {}: {e}", path.display()))
+}
+
+fn save_settings(out_dir: &Path, settings: &DesktopSettings) -> Result<(), String> {
+    let path = settings_file_path(out_dir);
+    let text = serde_json::to_string_pretty(settings)
+        .map_err(|e| format!("failed to serialize settings: {e}"))?;
+    atomic_write_text(&path, &text)
+}
+
+fn append_audit_auto_retry(out_dir: &Path, entry: &AuditAutoRetryEntry) -> Result<(), String> {
+    let path = audit_jsonl_path(out_dir);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create audit directory {}: {e}", parent.display()))?;
+    }
+    let line = serde_json::to_string(entry)
+        .map_err(|e| format!("failed to serialize audit entry: {e}"))?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| format!("failed to open audit log {}: {e}", path.display()))?;
+    file.write_all(line.as_bytes())
+        .map_err(|e| format!("failed to append audit log {}: {e}", path.display()))?;
+    file.write_all(b"\n")
+        .map_err(|e| format!("failed to append newline to audit log {}: {e}", path.display()))
+}
+
+fn compute_next_retry_at_ms(
+    now_ms: u128,
+    retry_after_seconds: Option<f64>,
+    auto_retry_attempt_count: u32,
+    settings: &DesktopSettings,
+) -> String {
+    let delay_seconds = if let Some(sec) = retry_after_seconds {
+        sec.max(0.0).min(settings.auto_retry_max_delay_seconds as f64)
+    } else {
+        let exp = auto_retry_attempt_count.saturating_sub(1).min(31);
+        let base = settings.auto_retry_base_delay_seconds as u128;
+        let raw = base.saturating_mul(1u128 << exp);
+        let capped = raw.min(settings.auto_retry_max_delay_seconds as u128);
+        capped as f64
+    };
+    let next = now_ms as f64 + delay_seconds * 1000.0;
+    format!("{:.0}", next.max(now_ms as f64))
+}
+
+fn parse_retry_at_ms(text: Option<&String>) -> Option<u128> {
+    let raw = text?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    raw.parse::<u128>().ok()
 }
 
 fn pipeline_step_status_from_job(job: &JobRecord) -> PipelineStepStatus {
@@ -2553,6 +2671,7 @@ fn apply_job_result(
     run_result: &RunResult,
 ) -> Result<(), String> {
     let (runtime, _) = runtime_and_jobs_path()?;
+    let settings = load_settings(&runtime.out_base_dir).unwrap_or_default();
     let (run_id_for_index, status_for_index);
 
     {
@@ -2578,11 +2697,17 @@ fn apply_job_result(
         let (status, retry_after, err) = classify_job_status(run_result, &runtime, &resolved_run_id, canceled);
 
         let updated_at = now_epoch_ms_string();
-        let retry_at = retry_after.map(|sec| {
-            let base = now_epoch_ms() as f64;
-            let ms = (base + sec * 1000.0).max(base);
-            format!("{:.0}", ms)
-        });
+        let retry_at = if status == JobStatus::NeedsRetry {
+            let next_attempt_idx = guard.jobs[idx].auto_retry_attempt_count.saturating_add(1);
+            Some(compute_next_retry_at_ms(
+                now_epoch_ms(),
+                retry_after,
+                next_attempt_idx,
+                &settings,
+            ))
+        } else {
+            None
+        };
 
         guard.jobs[idx].status = status;
         guard.jobs[idx].updated_at = updated_at;
@@ -4163,6 +4288,7 @@ fn enqueue_job_internal(
             last_error: None,
             retry_after_seconds: None,
             retry_at: None,
+            auto_retry_attempt_count: 0,
         });
     }
     persist_state(state, jobs_path)?;
@@ -4507,6 +4633,7 @@ fn create_pipeline(
         current_step_index: 0,
         status: PipelineStatus::Running,
         last_primary_viz: None,
+        auto_retry_attempt_count: 0,
     });
     save_pipelines_to_file(&pipelines_path, &pipelines)?;
 
@@ -4672,6 +4799,195 @@ fn retry_pipeline_step(
         .into_iter()
         .find(|p| p.pipeline_id == pipeline_id)
         .ok_or_else(|| format!("pipeline not found after retry: {pipeline_id}"))
+}
+
+#[tauri::command]
+fn get_settings() -> Result<DesktopSettings, String> {
+    let (runtime, _) = runtime_and_jobs_path()?;
+    load_settings(&runtime.out_base_dir)
+}
+
+#[tauri::command]
+fn update_settings(settings: DesktopSettings) -> Result<DesktopSettings, String> {
+    if settings.auto_retry_max_per_job == 0 {
+        return Err("auto_retry_max_per_job must be >= 1".to_string());
+    }
+    if settings.auto_retry_max_per_pipeline == 0 {
+        return Err("auto_retry_max_per_pipeline must be >= 1".to_string());
+    }
+    if settings.auto_retry_base_delay_seconds == 0 {
+        return Err("auto_retry_base_delay_seconds must be >= 1".to_string());
+    }
+    if settings.auto_retry_max_delay_seconds == 0 {
+        return Err("auto_retry_max_delay_seconds must be >= 1".to_string());
+    }
+
+    let (runtime, _) = runtime_and_jobs_path()?;
+    save_settings(&runtime.out_base_dir, &settings)?;
+    Ok(settings)
+}
+
+#[tauri::command]
+fn open_audit_log() -> Result<String, String> {
+    let (runtime, _) = runtime_and_jobs_path()?;
+    let path = audit_jsonl_path(&runtime.out_base_dir);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create audit directory {}: {e}", parent.display()))?;
+    }
+    if !path.exists() {
+        fs::write(&path, "")
+            .map_err(|e| format!("failed to create audit log {}: {e}", path.display()))?;
+    }
+    Command::new("explorer")
+        .arg(&path)
+        .spawn()
+        .map_err(|e| format!("failed to open audit log in explorer: {e}"))?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn tick_auto_retry() -> Result<AutoRetryTickResult, String> {
+    let (runtime, _) = runtime_and_jobs_path()?;
+    let settings = load_settings(&runtime.out_base_dir)?;
+    if !settings.auto_retry_enabled {
+        return Ok(AutoRetryTickResult {
+            acted: false,
+            job_id: None,
+            pipeline_id: None,
+            reason: "auto_retry_disabled".to_string(),
+        });
+    }
+
+    let (state, jobs_path) = init_job_runtime()?;
+    let pipelines_path = pipelines_file_path(&runtime.out_base_dir);
+    let mut pipelines = load_pipelines_from_file(&pipelines_path)?;
+    let now_ms = now_epoch_ms();
+
+    let selected = {
+        let mut guard = state
+            .lock()
+            .map_err(|_| "failed to lock job runtime".to_string())?;
+        guard.jobs = load_jobs_from_file(&jobs_path)?;
+
+        if guard.running_job_id.is_some() {
+            return Ok(AutoRetryTickResult {
+                acted: false,
+                job_id: None,
+                pipeline_id: None,
+                reason: "worker_busy".to_string(),
+            });
+        }
+
+        let mut changed_schedule = false;
+        let mut candidates: Vec<(u128, String, Option<(String, String, usize)>)> = Vec::new();
+        for job in &mut guard.jobs {
+            if job.status != JobStatus::NeedsRetry {
+                continue;
+            }
+
+            if job.retry_at.is_none() {
+                job.retry_at = Some(compute_next_retry_at_ms(
+                    now_ms,
+                    job.retry_after_seconds,
+                    job.auto_retry_attempt_count.saturating_add(1),
+                    &settings,
+                ));
+                changed_schedule = true;
+            }
+
+            let next_ms = parse_retry_at_ms(job.retry_at.as_ref()).unwrap_or(now_ms);
+            if now_ms < next_ms {
+                continue;
+            }
+            if job.auto_retry_attempt_count >= settings.auto_retry_max_per_job {
+                continue;
+            }
+
+            let mut pipeline_ref: Option<(String, String, usize)> = None;
+            for (pidx, p) in pipelines.iter().enumerate() {
+                let step = p.steps.iter().find(|s| s.job_id.as_deref() == Some(job.job_id.as_str()));
+                if let Some(s) = step {
+                    if p.auto_retry_attempt_count < settings.auto_retry_max_per_pipeline {
+                        pipeline_ref = Some((p.pipeline_id.clone(), s.step_id.clone(), pidx));
+                    }
+                    break;
+                }
+            }
+
+            if let Some((_, _, pidx)) = pipeline_ref.as_ref() {
+                if pipelines[*pidx].auto_retry_attempt_count >= settings.auto_retry_max_per_pipeline {
+                    continue;
+                }
+            }
+
+            candidates.push((next_ms, job.job_id.clone(), pipeline_ref));
+        }
+
+        if changed_schedule {
+            persist_state(&state, &jobs_path)?;
+        }
+
+        candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        candidates.first().cloned()
+    };
+
+    let Some((_next_ms, job_id, pipeline_ref)) = selected else {
+        return Ok(AutoRetryTickResult {
+            acted: false,
+            job_id: None,
+            pipeline_id: None,
+            reason: "no_eligible_item".to_string(),
+        });
+    };
+
+    let mut pipeline_id_for_audit: Option<String> = None;
+    if let Some((pipeline_id, step_id, pidx)) = pipeline_ref {
+        let _ = retry_pipeline_step(pipeline_id.clone(), step_id, Some(false))?;
+        pipeline_id_for_audit = Some(pipeline_id.clone());
+        if pidx < pipelines.len() {
+            pipelines[pidx].auto_retry_attempt_count = pipelines[pidx].auto_retry_attempt_count.saturating_add(1);
+            pipelines[pidx].updated_at = now_epoch_ms_string();
+            save_pipelines_to_file(&pipelines_path, &pipelines)?;
+        }
+    } else {
+        let _ = retry_job(job_id.clone(), Some(false))?;
+    }
+
+    let mut attempt = 0u32;
+    let mut next_retry_at = None;
+    {
+        let mut guard = state
+            .lock()
+            .map_err(|_| "failed to lock job runtime".to_string())?;
+        guard.jobs = load_jobs_from_file(&jobs_path)?;
+        if let Some(job) = guard.jobs.iter_mut().find(|j| j.job_id == job_id) {
+            job.auto_retry_attempt_count = job.auto_retry_attempt_count.saturating_add(1);
+            attempt = job.auto_retry_attempt_count;
+            next_retry_at = job.retry_at.clone();
+        }
+    }
+    persist_state(&state, &jobs_path)?;
+
+    append_audit_auto_retry(
+        &runtime.out_base_dir,
+        &AuditAutoRetryEntry {
+            ts: now_epoch_ms_string(),
+            kind: "auto_retry".to_string(),
+            job_id: job_id.clone(),
+            pipeline_id: pipeline_id_for_audit.clone(),
+            reason: "eligible_tick".to_string(),
+            next_retry_at,
+            attempt,
+        },
+    )?;
+
+    Ok(AutoRetryTickResult {
+        acted: true,
+        job_id: Some(job_id),
+        pipeline_id: pipeline_id_for_audit,
+        reason: "auto_retry_enqueued".to_string(),
+    })
 }
 
 #[tauri::command]
@@ -4938,6 +5254,10 @@ fn main() {
             start_pipeline,
             cancel_pipeline,
             retry_pipeline_step,
+            get_settings,
+            update_settings,
+            open_audit_log,
+            tick_auto_retry,
             clear_finished_jobs,
             library_reindex,
             library_reload,
@@ -5256,6 +5576,7 @@ mod tests {
             last_error: None,
             retry_after_seconds: None,
             retry_at: None,
+            auto_retry_attempt_count: 0,
         }];
 
         save_jobs_to_file(&jobs_path, &jobs).expect("save jobs failed");
@@ -5282,6 +5603,7 @@ mod tests {
             last_error: None,
             retry_after_seconds: None,
             retry_at: None,
+            auto_retry_attempt_count: 0,
         };
 
         job.status = JobStatus::Running;
@@ -5314,6 +5636,7 @@ mod tests {
             last_error: None,
             retry_after_seconds: None,
             retry_at: None,
+            auto_retry_attempt_count: 0,
         };
 
         apply_mock_transition(
@@ -5643,6 +5966,7 @@ mod tests {
             current_step_index: 0,
             status: PipelineStatus::Running,
             last_primary_viz: None,
+            auto_retry_attempt_count: 0,
         }];
 
         save_pipelines_to_file(&path, &data).expect("save pipelines");
@@ -5693,6 +6017,7 @@ mod tests {
             current_step_index: 0,
             status: PipelineStatus::Running,
             last_primary_viz: None,
+            auto_retry_attempt_count: 0,
         };
         save_pipelines_to_file(&pipelines_file_path(&out_dir), &[pipeline]).expect("save pipeline");
 
@@ -5737,6 +6062,7 @@ mod tests {
                 last_error: Some("429".to_string()),
                 retry_after_seconds: Some(3.0),
                 retry_at: Some((now_epoch_ms() + 3000).to_string()),
+                auto_retry_attempt_count: 0,
             }],
         )
         .expect("save jobs");
@@ -5772,6 +6098,7 @@ mod tests {
             current_step_index: 0,
             status: PipelineStatus::Running,
             last_primary_viz: None,
+            auto_retry_attempt_count: 0,
         };
         save_pipelines_to_file(&pipelines_file_path(&out_dir), &[pipeline]).expect("save pipeline");
 
@@ -5812,6 +6139,7 @@ mod tests {
             current_step_index: 0,
             status: PipelineStatus::Running,
             last_primary_viz: None,
+            auto_retry_attempt_count: 0,
         };
         save_pipelines_to_file(&pipelines_file_path(&out_dir), &[pipeline]).expect("save pipeline");
 
@@ -5849,6 +6177,7 @@ mod tests {
                 last_error: Some("canceled".to_string()),
                 retry_after_seconds: None,
                 retry_at: None,
+                auto_retry_attempt_count: 0,
             }],
         )
         .expect("save canceled job");
@@ -5872,6 +6201,7 @@ mod tests {
             current_step_index: 0,
             status: PipelineStatus::Running,
             last_primary_viz: None,
+            auto_retry_attempt_count: 0,
         };
         save_pipelines_to_file(&pipelines_file_path(&out_dir), &[pipeline]).expect("save pipeline");
 
@@ -5915,6 +6245,7 @@ mod tests {
                 last_error: None,
                 retry_after_seconds: None,
                 retry_at: None,
+                auto_retry_attempt_count: 0,
             },
             JobRecord {
                 job_id: "job_a".to_string(),
@@ -5929,6 +6260,7 @@ mod tests {
                 last_error: None,
                 retry_after_seconds: None,
                 retry_at: None,
+                auto_retry_attempt_count: 0,
             },
             JobRecord {
                 job_id: "job_c".to_string(),
@@ -5943,6 +6275,7 @@ mod tests {
                 last_error: None,
                 retry_after_seconds: None,
                 retry_at: None,
+                auto_retry_attempt_count: 0,
             },
         ];
         sort_jobs_for_display(&mut jobs);
@@ -5983,6 +6316,42 @@ mod tests {
         assert_eq!(runs[0].run_id, "run_c");
         assert_eq!(runs[1].run_id, "run_a");
         assert_eq!(runs[2].run_id, "run_b");
+    }
+
+    #[test]
+    fn auto_retry_schedule_prefers_retry_after_header() {
+        let settings = DesktopSettings::default();
+        let now_ms = 1_000u128;
+        let next = compute_next_retry_at_ms(now_ms, Some(12.5), 3, &settings);
+        assert_eq!(next.parse::<u128>().ok(), Some(now_ms + 12_500));
+    }
+
+    #[test]
+    fn auto_retry_schedule_uses_exponential_backoff_with_cap() {
+        let settings = DesktopSettings {
+            auto_retry_enabled: true,
+            auto_retry_max_per_job: 3,
+            auto_retry_max_per_pipeline: 3,
+            auto_retry_base_delay_seconds: 10,
+            auto_retry_max_delay_seconds: 25,
+        };
+        let now_ms = 2_000u128;
+
+        let first = compute_next_retry_at_ms(now_ms, None, 1, &settings);
+        assert_eq!(first.parse::<u128>().ok(), Some(now_ms + 10_000));
+
+        let third = compute_next_retry_at_ms(now_ms, None, 3, &settings);
+        assert_eq!(third.parse::<u128>().ok(), Some(now_ms + 25_000));
+    }
+
+    #[test]
+    fn parse_retry_at_ms_handles_valid_and_invalid_values() {
+        let valid = Some("12345".to_string());
+        assert_eq!(parse_retry_at_ms(valid.as_ref()), Some(12_345));
+
+        let invalid = Some("not-a-number".to_string());
+        assert_eq!(parse_retry_at_ms(invalid.as_ref()), None);
+        assert_eq!(parse_retry_at_ms(None), None);
     }
 
     #[test]
