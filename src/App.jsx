@@ -116,6 +116,10 @@ export default function App() {
   const [artifactLoading, setArtifactLoading] = useState(false);
   const [artifactError, setArtifactError] = useState("");
   const [artifactView, setArtifactView] = useState(null);
+  const [jobs, setJobs] = useState([]);
+  const [jobsLoading, setJobsLoading] = useState(false);
+  const [jobsError, setJobsError] = useState("");
+  const [selectedJobId, setSelectedJobId] = useState("");
 
   const combined = useMemo(() => {
     const parts = [];
@@ -193,6 +197,25 @@ export default function App() {
     }
   }
 
+  async function loadJobs() {
+    setJobsLoading(true);
+    setJobsError("");
+    try {
+      const rows = await invoke("list_jobs");
+      const list = Array.isArray(rows) ? rows : [];
+      setJobs(list);
+      setSelectedJobId((prev) => {
+        if (prev && list.some((j) => j.job_id === prev)) return prev;
+        return list[0]?.job_id ?? "";
+      });
+    } catch (e) {
+      setJobsError(String(e));
+      setJobs([]);
+    } finally {
+      setJobsLoading(false);
+    }
+  }
+
   async function loadArtifact(runId, artifactKey) {
     if (!runId) {
       setArtifactView(null);
@@ -219,6 +242,14 @@ export default function App() {
     loadPreflight();
     loadTemplates();
     loadRuns();
+    loadJobs();
+  }, []);
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      loadJobs();
+    }, 1500);
+    return () => clearInterval(timer);
   }, []);
 
   const selectedTemplate = templates.find((t) => t.id === selectedTemplateId) ?? null;
@@ -273,25 +304,23 @@ export default function App() {
     setRetryAfterSec(null);
 
     try {
-      const res = await invoke("run_task_template", {
+      const jobId = await invoke("enqueue_job", {
         templateId: params.templateId,
         canonicalId: params.canonicalId,
         params: params.templateParams,
       });
 
-      setStdout(res.stdout ?? "");
-      setStderr(res.stderr ?? "");
-      setExitCode(res.exit_code ?? null);
-      setRunId(res.run_id ?? null);
-      setRunDir(res.run_dir ?? null);
-      setStatus(res.status ?? null);
-      setMessage(res.message ?? "");
-      setRetryAfterSec(res.retry_after_sec ?? null);
+      setStdout(`enqueued job_id=${jobId}`);
+      setStderr("");
+      setExitCode(0);
+      setRunId(null);
+      setRunDir(null);
+      setStatus("queued");
+      setMessage(`Job queued: ${jobId}`);
+      setRetryAfterSec(null);
       setLastRunRequest(params);
-      await loadRuns();
-      if (res?.run_id) {
-        setSelectedRunId(res.run_id);
-      }
+      await loadJobs();
+      setSelectedJobId(jobId);
     } catch (e) {
       setStderr(String(e));
       setStatus("error");
@@ -334,6 +363,30 @@ export default function App() {
     }
   }
 
+  async function onCancelJob(jobId) {
+    try {
+      await invoke("cancel_job", { jobId });
+      await loadJobs();
+    } catch (e) {
+      alert(String(e));
+    }
+  }
+
+  async function onRetryJob(jobId, force = false) {
+    try {
+      await invoke("retry_job", { jobId, force });
+      await loadJobs();
+    } catch (e) {
+      alert(String(e));
+    }
+  }
+
+  async function onOpenRunFromJob(job) {
+    if (!job?.run_id) return;
+    await loadRuns();
+    setSelectedRunId(job.run_id);
+  }
+
   async function onOpenConfigLocation() {
     try {
       await invoke("open_config_file_location");
@@ -366,6 +419,7 @@ export default function App() {
   const createdAtText = selectedRun?.created_at_epoch_ms
     ? new Date(selectedRun.created_at_epoch_ms).toLocaleString()
     : "-";
+  const selectedJob = jobs.find((j) => j.job_id === selectedJobId) ?? null;
 
   return (
     <div style={{ fontFamily: "system-ui", padding: 16, maxWidth: 960 }}>
@@ -632,6 +686,89 @@ export default function App() {
 
       <div style={{ marginTop: 10, opacity: 0.8, fontSize: 12 }}>
         Retry button re-runs the same request with a new <code>run_id</code>.
+      </div>
+
+      <hr style={{ margin: "18px 0" }} />
+      <h3 style={{ marginBottom: 8 }}>Jobs</h3>
+      <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+        <button
+          onClick={loadJobs}
+          disabled={jobsLoading}
+          style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+        >
+          {jobsLoading ? "Refreshing..." : "Refresh jobs"}
+        </button>
+      </div>
+      {jobsError ? <div style={{ color: "#a33", fontSize: 12 }}>{jobsError}</div> : null}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1.8fr", gap: 12, marginBottom: 12 }}>
+        <div style={{ border: "1px solid #ddd", borderRadius: 8, maxHeight: 240, overflow: "auto" }}>
+          {jobs.length === 0 ? (
+            <div style={{ padding: 10, fontSize: 12, opacity: 0.8 }}>No jobs.</div>
+          ) : (
+            jobs.map((j) => (
+              <button
+                key={j.job_id}
+                onClick={() => setSelectedJobId(j.job_id)}
+                style={{
+                  width: "100%",
+                  textAlign: "left",
+                  padding: 10,
+                  border: "none",
+                  borderBottom: "1px solid #eee",
+                  background: j.job_id === selectedJobId ? "#eef5ff" : "white",
+                  cursor: "pointer",
+                }}
+              >
+                <div style={{ fontSize: 12, fontWeight: 600 }}>{j.job_id}</div>
+                <div style={{ fontSize: 11 }}>status={j.status} attempt={j.attempt}</div>
+                <div style={{ fontSize: 11, opacity: 0.75 }}>{j.template_id} / {j.canonical_id}</div>
+              </button>
+            ))
+          )}
+        </div>
+        <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: 10 }}>
+          <div style={{ fontSize: 12, marginBottom: 4 }}>job_id: <code>{selectedJob?.job_id ?? "-"}</code></div>
+          <div style={{ fontSize: 12, marginBottom: 4 }}>status: <code>{selectedJob?.status ?? "-"}</code></div>
+          <div style={{ fontSize: 12, marginBottom: 4 }}>updated_at: <code>{selectedJob?.updated_at ?? "-"}</code></div>
+          {selectedJob?.retry_at ? (
+            <div style={{ fontSize: 12, marginBottom: 4 }}>
+              retry_in_sec: <code>{Math.max(0, Math.floor((Number(selectedJob.retry_at) - Date.now()) / 1000))}</code>
+            </div>
+          ) : null}
+          {selectedJob?.last_error ? (
+            <div style={{ fontSize: 12, color: "#a33", marginBottom: 6 }}>error: {selectedJob.last_error}</div>
+          ) : null}
+          <div style={{ display: "flex", gap: 8 }}>
+            <button
+              onClick={() => onCancelJob(selectedJob?.job_id)}
+              disabled={!selectedJob || (selectedJob.status !== "queued" && selectedJob.status !== "running")}
+              style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+            >
+              Cancel
+            </button>
+            <button
+              onClick={() => onRetryJob(selectedJob?.job_id, false)}
+              disabled={!selectedJob || (selectedJob.status !== "failed" && selectedJob.status !== "needs_retry")}
+              style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+            >
+              Retry
+            </button>
+            <button
+              onClick={() => onRetryJob(selectedJob?.job_id, true)}
+              disabled={!selectedJob}
+              style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+            >
+              Retry(force)
+            </button>
+            <button
+              onClick={() => onOpenRunFromJob(selectedJob)}
+              disabled={!selectedJob?.run_id}
+              style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+            >
+              Open run detail
+            </button>
+          </div>
+        </div>
       </div>
 
       <hr style={{ margin: "18px 0" }} />

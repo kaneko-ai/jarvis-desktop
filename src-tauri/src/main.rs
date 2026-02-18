@@ -1,8 +1,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{fs, io::Write};
 
@@ -108,6 +112,48 @@ struct PreflightResult {
     ok: bool,
     checks: Vec<PreflightCheckItem>,
 }
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum JobStatus {
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+    NeedsRetry,
+    Canceled,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct JobRecord {
+    job_id: String,
+    template_id: String,
+    canonical_id: String,
+    params: serde_json::Value,
+    status: JobStatus,
+    attempt: u32,
+    created_at: String,
+    updated_at: String,
+    run_id: Option<String>,
+    last_error: Option<String>,
+    retry_after_seconds: Option<f64>,
+    retry_at: Option<String>,
+}
+
+#[derive(Default)]
+struct JobRuntimeState {
+    jobs: Vec<JobRecord>,
+    running_job_id: Option<String>,
+    running_pid: Option<u32>,
+    cancel_requested: HashSet<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct JobFilePayload {
+    jobs: Vec<JobRecord>,
+}
+
+static JOB_RUNTIME: OnceLock<Arc<Mutex<JobRuntimeState>>> = OnceLock::new();
 
 #[derive(Serialize, Clone)]
 struct TemplateParamDef {
@@ -528,16 +574,100 @@ fn to_pipeline_identifier(normalized: &NormalizedIdentifier) -> Result<String, S
     }
 }
 
-fn normalize_paper_id(raw: &str) -> Result<String, String> {
-    let normalized = normalize_identifier_internal(raw);
-    to_pipeline_identifier(&normalized)
-}
-
 fn make_run_id() -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     format!("{}_{}", now.as_secs(), now.subsec_nanos())
+}
+
+fn now_epoch_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+fn now_epoch_ms_string() -> String {
+    now_epoch_ms().to_string()
+}
+
+fn jobs_file_path(out_dir: &Path) -> PathBuf {
+    out_dir.join(".jarvis-desktop").join("jobs.json")
+}
+
+fn atomic_write_text(path: &Path, content: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("invalid path without parent: {}", path.display()))?;
+    fs::create_dir_all(parent)
+        .map_err(|e| format!("failed to create directory {}: {e}", parent.display()))?;
+
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, content)
+        .map_err(|e| format!("failed to write temp file {}: {e}", tmp.display()))?;
+
+    if path.exists() {
+        fs::remove_file(path)
+            .map_err(|e| format!("failed to replace file {}: {e}", path.display()))?;
+    }
+    fs::rename(&tmp, path)
+        .map_err(|e| format!("failed to move temp file to {}: {e}", path.display()))
+}
+
+fn load_jobs_from_file(path: &Path) -> Result<Vec<JobRecord>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let raw = fs::read_to_string(path)
+        .map_err(|e| format!("failed to read jobs file {}: {e}", path.display()))?;
+    let payload: JobFilePayload = serde_json::from_str(&raw)
+        .map_err(|e| format!("failed to parse jobs file {}: {e}", path.display()))?;
+    Ok(payload.jobs)
+}
+
+fn save_jobs_to_file(path: &Path, jobs: &[JobRecord]) -> Result<(), String> {
+    let payload = JobFilePayload {
+        jobs: jobs.to_vec(),
+    };
+    let text = serde_json::to_string_pretty(&payload)
+        .map_err(|e| format!("failed to serialize jobs payload: {e}"))?;
+    atomic_write_text(path, &text)
+}
+
+fn runtime_and_jobs_path() -> Result<(RuntimeConfig, PathBuf), String> {
+    let root = repo_root();
+    let runtime = resolve_runtime_config(&root)?;
+    let jobs_path = jobs_file_path(&runtime.out_base_dir);
+    Ok((runtime, jobs_path))
+}
+
+fn init_job_runtime() -> Result<(Arc<Mutex<JobRuntimeState>>, PathBuf), String> {
+    let (_runtime, jobs_path) = runtime_and_jobs_path()?;
+    let state = JOB_RUNTIME
+        .get_or_init(|| Arc::new(Mutex::new(JobRuntimeState::default())))
+        .clone();
+
+    {
+        let mut guard = state
+            .lock()
+            .map_err(|_| "failed to lock job runtime".to_string())?;
+        if guard.jobs.is_empty() {
+            guard.jobs = load_jobs_from_file(&jobs_path)?;
+        }
+    }
+
+    Ok((state, jobs_path))
+}
+
+fn persist_state(state: &Arc<Mutex<JobRuntimeState>>, jobs_path: &Path) -> Result<(), String> {
+    let jobs = {
+        let guard = state
+            .lock()
+            .map_err(|_| "failed to lock job runtime for persist".to_string())?;
+        guard.jobs.clone()
+    };
+    save_jobs_to_file(jobs_path, &jobs)
 }
 
 fn repo_root() -> PathBuf {
@@ -1252,6 +1382,282 @@ fn build_status_message(
     "Pipeline run completed.".to_string()
 }
 
+fn parse_f64_loose(value: &serde_json::Value) -> Option<f64> {
+    match value {
+        serde_json::Value::Number(n) => n.as_f64(),
+        serde_json::Value::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn inspect_retry_fields(value: &serde_json::Value) -> (bool, Option<f64>) {
+    let mut needs_retry = false;
+    let mut retry_after: Option<f64> = None;
+
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                let key = k.to_lowercase();
+                if key == "status" {
+                    if let Some(s) = v.as_str() {
+                        if s.eq_ignore_ascii_case("needs_retry") {
+                            needs_retry = true;
+                        }
+                    }
+                }
+                if key == "http_status" || key == "error_code" {
+                    if let Some(n) = v.as_i64() {
+                        if n == 429 {
+                            needs_retry = true;
+                        }
+                    } else if let Some(s) = v.as_str() {
+                        if s.trim() == "429" {
+                            needs_retry = true;
+                        }
+                    }
+                }
+                if key == "retry_after_seconds" || key == "retry_after" {
+                    if let Some(sec) = parse_f64_loose(v) {
+                        retry_after = Some(sec.max(0.0));
+                        needs_retry = true;
+                    }
+                }
+
+                let (nested_retry, nested_after) = inspect_retry_fields(v);
+                if nested_retry {
+                    needs_retry = true;
+                }
+                if retry_after.is_none() {
+                    retry_after = nested_after;
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                let (nested_retry, nested_after) = inspect_retry_fields(v);
+                if nested_retry {
+                    needs_retry = true;
+                }
+                if retry_after.is_none() {
+                    retry_after = nested_after;
+                }
+            }
+        }
+        _ => {}
+    }
+
+    (needs_retry, retry_after)
+}
+
+fn infer_newest_run_id_after(out_dir: &Path, started_ms: u128) -> Option<String> {
+    let mut candidates: Vec<(u64, String)> = Vec::new();
+    let entries = fs::read_dir(out_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let ts = modified_epoch_ms(&path);
+        if u128::from(ts) + 1 < started_ms {
+            continue;
+        }
+        let run_id = path.file_name()?.to_string_lossy().to_string();
+        candidates.push((ts, run_id));
+    }
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    candidates.first().map(|(_, run_id)| run_id.clone())
+}
+
+fn classify_job_status(
+    run_result: &RunResult,
+    runtime: &RuntimeConfig,
+    run_id: &str,
+    canceled: bool,
+) -> (JobStatus, Option<f64>, Option<String>) {
+    if canceled {
+        return (JobStatus::Canceled, None, None);
+    }
+
+    let run_dir = runtime.out_base_dir.join(run_id);
+    let result_path = run_dir.join("result.json");
+    if result_path.exists() {
+        if let Ok(raw) = fs::read_to_string(&result_path) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                let (needs_retry, retry_after) = inspect_retry_fields(&v);
+                if needs_retry {
+                    return (JobStatus::NeedsRetry, retry_after, Some("needs retry from result.json".to_string()));
+                }
+                if let Some(status) = v.get("status").and_then(|x| x.as_str()) {
+                    if status.eq_ignore_ascii_case("ok") {
+                        return (JobStatus::Succeeded, None, None);
+                    }
+                }
+            }
+        }
+    }
+
+    if run_result.status == "needs_retry" {
+        return (
+            JobStatus::NeedsRetry,
+            run_result.retry_after_sec,
+            Some(run_result.message.clone()),
+        );
+    }
+
+    if run_result.ok {
+        (JobStatus::Succeeded, None, None)
+    } else {
+        (JobStatus::Failed, None, Some(run_result.message.clone()))
+    }
+}
+
+fn apply_job_result(
+    state: &Arc<Mutex<JobRuntimeState>>,
+    jobs_path: &Path,
+    job_id: &str,
+    run_result: &RunResult,
+) -> Result<(), String> {
+    let (runtime, _) = runtime_and_jobs_path()?;
+
+    {
+        let mut guard = state
+            .lock()
+            .map_err(|_| "failed to lock job runtime".to_string())?;
+        let idx = guard
+            .jobs
+            .iter()
+            .position(|j| j.job_id == job_id)
+            .ok_or_else(|| format!("job not found: {job_id}"))?;
+
+        let mut run_id = guard.jobs[idx].run_id.clone();
+        if run_id.is_none() && !run_result.run_id.trim().is_empty() {
+            run_id = Some(run_result.run_id.clone());
+        }
+        if run_id.is_none() {
+            run_id = infer_newest_run_id_after(&runtime.out_base_dir, now_epoch_ms());
+        }
+
+        let canceled = guard.cancel_requested.contains(job_id);
+        let resolved_run_id = run_id.clone().unwrap_or_default();
+        let (status, retry_after, err) = classify_job_status(run_result, &runtime, &resolved_run_id, canceled);
+
+        let updated_at = now_epoch_ms_string();
+        let retry_at = retry_after.map(|sec| {
+            let base = now_epoch_ms() as f64;
+            let ms = (base + sec * 1000.0).max(base);
+            format!("{:.0}", ms)
+        });
+
+        guard.jobs[idx].status = status;
+        guard.jobs[idx].updated_at = updated_at;
+        guard.jobs[idx].run_id = run_id;
+        guard.jobs[idx].retry_after_seconds = retry_after;
+        guard.jobs[idx].retry_at = retry_at;
+        guard.jobs[idx].last_error = err;
+
+        guard.running_job_id = None;
+        guard.running_pid = None;
+        guard.cancel_requested.remove(job_id);
+    }
+
+    persist_state(state, jobs_path)
+}
+
+fn apply_mock_transition(
+    job: &mut JobRecord,
+    status: JobStatus,
+    run_id: Option<String>,
+    last_error: Option<String>,
+    retry_after_seconds: Option<f64>,
+) {
+    job.status = status;
+    job.updated_at = now_epoch_ms_string();
+    job.run_id = run_id;
+    job.last_error = last_error;
+    job.retry_after_seconds = retry_after_seconds;
+    job.retry_at = retry_after_seconds.map(|sec| {
+        let at = now_epoch_ms() as f64 + sec.max(0.0) * 1000.0;
+        format!("{:.0}", at)
+    });
+}
+
+fn start_job_worker_if_needed() -> Result<(), String> {
+    let (state, jobs_path) = init_job_runtime()?;
+    static WORKER_STARTED: OnceLock<()> = OnceLock::new();
+    if WORKER_STARTED.get().is_some() {
+        return Ok(());
+    }
+
+    let worker_state = state.clone();
+    let worker_jobs_path = jobs_path.clone();
+    thread::spawn(move || loop {
+        let next_job = {
+            let mut guard = match worker_state.lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    thread::sleep(Duration::from_millis(500));
+                    continue;
+                }
+            };
+
+            if guard.running_job_id.is_some() {
+                None
+            } else {
+                let next_idx = guard.jobs.iter().position(|j| j.status == JobStatus::Queued);
+                if let Some(idx) = next_idx {
+                    guard.jobs[idx].status = JobStatus::Running;
+                    guard.jobs[idx].attempt = guard.jobs[idx].attempt.saturating_add(1);
+                    guard.jobs[idx].updated_at = now_epoch_ms_string();
+                    guard.running_job_id = Some(guard.jobs[idx].job_id.clone());
+                    Some(guard.jobs[idx].clone())
+                } else {
+                    None
+                }
+            }
+        };
+
+        if let Some(job) = next_job {
+            let _ = persist_state(&worker_state, &worker_jobs_path);
+
+            let (argv, normalized_params) = match build_template_args(&job.template_id, &job.canonical_id, &job.params) {
+                Ok(v) => v,
+                Err(e) => {
+                    let mut failed = RunResult {
+                        ok: false,
+                        exit_code: 1,
+                        stdout: "".to_string(),
+                        stderr: e.clone(),
+                        run_id: "".to_string(),
+                        run_dir: "".to_string(),
+                        status: "error".to_string(),
+                        message: e,
+                        retry_after_sec: None,
+                    };
+                    failed.run_id = make_run_id();
+                    let _ = apply_job_result(&worker_state, &worker_jobs_path, &job.job_id, &failed);
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+            };
+
+            let result = execute_pipeline_task(
+                argv,
+                job.template_id.clone(),
+                job.canonical_id.clone(),
+                normalized_params,
+                Some((worker_state.clone(), job.job_id.clone())),
+            );
+            let _ = apply_job_result(&worker_state, &worker_jobs_path, &job.job_id, &result);
+            thread::sleep(Duration::from_millis(100));
+        } else {
+            thread::sleep(Duration::from_millis(500));
+        }
+    });
+
+    let _ = WORKER_STARTED.set(());
+    Ok(())
+}
+
 fn missing_dependency(run_id: String, message: String) -> RunResult {
     let user_message = first_non_empty_line(&message)
         .unwrap_or_else(|| "Missing dependency detected. Check stderr for details.".to_string());
@@ -1547,6 +1953,7 @@ fn execute_pipeline_task(
     template_id: String,
     canonical_id: String,
     normalized_params: serde_json::Value,
+    worker_ctx: Option<(Arc<Mutex<JobRuntimeState>>, String)>,
 ) -> RunResult {
     let run_id = make_run_id();
     let root = repo_root();
@@ -1627,8 +2034,8 @@ fn execute_pipeline_task(
         .arg(cli_script.as_os_str())
         .args(&final_args);
 
-    let out = match cmd.output() {
-        Ok(o) => o,
+    let child = match cmd.spawn() {
+        Ok(c) => c,
         Err(e) => {
             return RunResult {
                 ok: false,
@@ -1639,6 +2046,31 @@ fn execute_pipeline_task(
                 run_dir: run_dir_abs.to_string_lossy().to_string(),
                 status: "error".to_string(),
                 message: format!("failed to spawn pipeline: {e}"),
+                retry_after_sec: None,
+            }
+        }
+    };
+
+    if let Some((state, job_id)) = worker_ctx.as_ref() {
+        if let Ok(mut guard) = state.lock() {
+            if guard.running_job_id.as_deref() == Some(job_id.as_str()) {
+                guard.running_pid = Some(child.id());
+            }
+        }
+    }
+
+    let out = match child.wait_with_output() {
+        Ok(o) => o,
+        Err(e) => {
+            return RunResult {
+                ok: false,
+                exit_code: 1,
+                stdout: "".to_string(),
+                stderr: format!("failed to wait pipeline process: {e}"),
+                run_id,
+                run_dir: run_dir_abs.to_string_lossy().to_string(),
+                status: "error".to_string(),
+                message: format!("failed to wait pipeline process: {e}"),
                 retry_after_sec: None,
             }
         }
@@ -1685,6 +2117,159 @@ fn execute_pipeline_task(
 #[tauri::command]
 fn list_task_templates() -> Vec<TaskTemplateDef> {
     template_registry()
+}
+
+#[tauri::command]
+fn enqueue_job(
+    template_id: String,
+    canonical_id: String,
+    params: serde_json::Value,
+) -> Result<String, String> {
+    let tpl = find_template(&template_id).ok_or_else(|| format!("unknown template id: {template_id}"))?;
+    if !tpl.wired {
+        return Err(format!("template not wired: {}", tpl.id));
+    }
+
+    let normalized = normalize_identifier_internal(&canonical_id);
+    if !normalized.errors.is_empty() {
+        return Err(format!("invalid canonical_id: {}", normalized.errors.join("; ")));
+    }
+
+    let (state, jobs_path) = init_job_runtime()?;
+    let job_id = format!("job_{}_{}", now_epoch_ms(), make_run_id());
+    {
+        let mut guard = state
+            .lock()
+            .map_err(|_| "failed to lock job runtime".to_string())?;
+        let now = now_epoch_ms_string();
+        guard.jobs.push(JobRecord {
+            job_id: job_id.clone(),
+            template_id,
+            canonical_id,
+            params,
+            status: JobStatus::Queued,
+            attempt: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            run_id: None,
+            last_error: None,
+            retry_after_seconds: None,
+            retry_at: None,
+        });
+    }
+    persist_state(&state, &jobs_path)?;
+    start_job_worker_if_needed()?;
+    Ok(job_id)
+}
+
+#[tauri::command]
+fn list_jobs() -> Result<Vec<JobRecord>, String> {
+    let (state, jobs_path) = init_job_runtime()?;
+    {
+        let mut guard = state
+            .lock()
+            .map_err(|_| "failed to lock job runtime".to_string())?;
+        guard.jobs = load_jobs_from_file(&jobs_path)?;
+        let mut rows = guard.jobs.clone();
+        rows.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        Ok(rows)
+    }
+}
+
+#[tauri::command]
+fn cancel_job(job_id: String) -> Result<JobRecord, String> {
+    let (state, jobs_path) = init_job_runtime()?;
+    let updated: JobRecord;
+    {
+        let mut guard = state
+            .lock()
+            .map_err(|_| "failed to lock job runtime".to_string())?;
+        let idx = guard
+            .jobs
+            .iter()
+            .position(|j| j.job_id == job_id)
+            .ok_or_else(|| format!("job not found: {job_id}"))?;
+
+        match guard.jobs[idx].status {
+            JobStatus::Queued => {
+                guard.jobs[idx].status = JobStatus::Canceled;
+            }
+            JobStatus::Running => {
+                guard.cancel_requested.insert(job_id.clone());
+                if let Some(pid) = guard.running_pid {
+                    let _ = Command::new("cmd")
+                        .args(["/c", &format!("taskkill /PID {pid} /T /F")])
+                        .output();
+                }
+                guard.jobs[idx].status = JobStatus::Canceled;
+            }
+            _ => {}
+        }
+        guard.jobs[idx].updated_at = now_epoch_ms_string();
+        updated = guard.jobs[idx].clone();
+    }
+    persist_state(&state, &jobs_path)?;
+    Ok(updated)
+}
+
+#[tauri::command]
+fn retry_job(job_id: String, force: Option<bool>) -> Result<JobRecord, String> {
+    let force_retry = force.unwrap_or(false);
+    let (state, jobs_path) = init_job_runtime()?;
+    let updated: JobRecord;
+    {
+        let mut guard = state
+            .lock()
+            .map_err(|_| "failed to lock job runtime".to_string())?;
+        let idx = guard
+            .jobs
+            .iter()
+            .position(|j| j.job_id == job_id)
+            .ok_or_else(|| format!("job not found: {job_id}"))?;
+
+        let status = guard.jobs[idx].status.clone();
+        if !(status == JobStatus::Failed || status == JobStatus::NeedsRetry || force_retry) {
+            return Err("job is not retryable".to_string());
+        }
+
+        if !force_retry {
+            if let Some(retry_at) = guard.jobs[idx].retry_at.as_ref() {
+                if let Ok(ts) = retry_at.parse::<u128>() {
+                    if now_epoch_ms() < ts {
+                        return Err("retry window has not started yet; pass force=true to override".to_string());
+                    }
+                }
+            }
+        }
+
+        guard.jobs[idx].status = JobStatus::Queued;
+        guard.jobs[idx].updated_at = now_epoch_ms_string();
+        guard.jobs[idx].last_error = None;
+        guard.jobs[idx].retry_after_seconds = None;
+        guard.jobs[idx].retry_at = None;
+        updated = guard.jobs[idx].clone();
+    }
+    persist_state(&state, &jobs_path)?;
+    start_job_worker_if_needed()?;
+    Ok(updated)
+}
+
+#[tauri::command]
+fn clear_finished_jobs() -> Result<usize, String> {
+    let (state, jobs_path) = init_job_runtime()?;
+    let removed;
+    {
+        let mut guard = state
+            .lock()
+            .map_err(|_| "failed to lock job runtime".to_string())?;
+        let before = guard.jobs.len();
+        guard.jobs.retain(|j| {
+            !(j.status == JobStatus::Succeeded || j.status == JobStatus::Failed || j.status == JobStatus::Canceled)
+        });
+        removed = before.saturating_sub(guard.jobs.len());
+    }
+    persist_state(&state, &jobs_path)?;
+    Ok(removed)
 }
 
 #[tauri::command]
@@ -1741,7 +2326,7 @@ fn run_task_template(
         }
     };
 
-    execute_pipeline_task(argv, template_id, canonical_id, normalized_params)
+    execute_pipeline_task(argv, template_id, canonical_id, normalized_params, None)
 }
 
 #[tauri::command]
@@ -1922,10 +2507,16 @@ fn create_config_if_missing() -> Result<String, String> {
 }
 
 fn main() {
+    let _ = start_job_worker_if_needed();
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             run_papers_tree,
             run_task_template,
+            enqueue_job,
+            list_jobs,
+            cancel_job,
+            retry_job,
+            clear_finished_jobs,
             open_run_folder,
             list_task_templates,
             list_runs,
@@ -2087,5 +2678,99 @@ mod tests {
         assert_eq!(argv, expected);
         assert_eq!(normalized_params["depth"], serde_json::json!(1));
         assert_eq!(normalized_params["max_per_level"], serde_json::json!(5));
+    }
+
+    #[test]
+    fn job_persistence_roundtrip() {
+        let base = std::env::temp_dir().join(format!("jarvis_job_rt_{}", now_epoch_ms()));
+        let jobs_path = base.join("jobs.json");
+        let jobs = vec![JobRecord {
+            job_id: "job_1".to_string(),
+            template_id: "TEMPLATE_TREE".to_string(),
+            canonical_id: "arxiv:1706.03762".to_string(),
+            params: serde_json::json!({"depth": 1, "max_per_level": 5}),
+            status: JobStatus::Queued,
+            attempt: 0,
+            created_at: now_epoch_ms_string(),
+            updated_at: now_epoch_ms_string(),
+            run_id: None,
+            last_error: None,
+            retry_after_seconds: None,
+            retry_at: None,
+        }];
+
+        save_jobs_to_file(&jobs_path, &jobs).expect("save jobs failed");
+        let loaded = load_jobs_from_file(&jobs_path).expect("load jobs failed");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].job_id, "job_1");
+
+        let _ = fs::remove_file(&jobs_path);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn job_state_transition_queued_running_succeeded() {
+        let mut job = JobRecord {
+            job_id: "job_a".to_string(),
+            template_id: "TEMPLATE_TREE".to_string(),
+            canonical_id: "arxiv:1706.03762".to_string(),
+            params: serde_json::json!({}),
+            status: JobStatus::Queued,
+            attempt: 0,
+            created_at: now_epoch_ms_string(),
+            updated_at: now_epoch_ms_string(),
+            run_id: None,
+            last_error: None,
+            retry_after_seconds: None,
+            retry_at: None,
+        };
+
+        job.status = JobStatus::Running;
+        job.attempt += 1;
+        apply_mock_transition(
+            &mut job,
+            JobStatus::Succeeded,
+            Some("run_1".to_string()),
+            None,
+            None,
+        );
+
+        assert_eq!(job.status, JobStatus::Succeeded);
+        assert_eq!(job.attempt, 1);
+        assert_eq!(job.run_id.as_deref(), Some("run_1"));
+    }
+
+    #[test]
+    fn job_state_transition_needs_retry_and_retry_queue() {
+        let mut job = JobRecord {
+            job_id: "job_b".to_string(),
+            template_id: "TEMPLATE_TREE".to_string(),
+            canonical_id: "arxiv:1706.03762".to_string(),
+            params: serde_json::json!({}),
+            status: JobStatus::Running,
+            attempt: 1,
+            created_at: now_epoch_ms_string(),
+            updated_at: now_epoch_ms_string(),
+            run_id: Some("run_2".to_string()),
+            last_error: None,
+            retry_after_seconds: None,
+            retry_at: None,
+        };
+
+        apply_mock_transition(
+            &mut job,
+            JobStatus::NeedsRetry,
+            Some("run_2".to_string()),
+            Some("429".to_string()),
+            Some(3.0),
+        );
+        assert_eq!(job.status, JobStatus::NeedsRetry);
+        assert_eq!(job.retry_after_seconds, Some(3.0));
+        assert!(job.retry_at.is_some());
+
+        job.status = JobStatus::Queued;
+        job.retry_after_seconds = None;
+        job.retry_at = None;
+        assert_eq!(job.status, JobStatus::Queued);
     }
 }
