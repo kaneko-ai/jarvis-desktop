@@ -9,8 +9,12 @@
 - [ ] Pipeline 側で `jarvis_cli.py` が実行可能であることを確認
 
 ## 1. インストールと初回起動
-- [ ] desktop installer を実行してインストール
-- [ ] アプリを起動
+- [ ] `dist/releases/<version>/installers/` の `*.msi` または `*-setup.exe` を実行
+- [ ] Start Menu から `jarvis-desktop` を起動（ターミナル不要）
+- [ ] Setup 画面で `デスクトップにショートカットを作成` を押す
+- [ ] Desktop に `jarvis-desktop.lnk` が作成されることを確認
+- [ ] `jarvis-desktop.lnk` をダブルクリックして起動できることを確認
+- [ ] （任意）タスクバーへピン留め（手動操作）
 - [ ] UI で `Open config file location` を押す
 - [ ] `config.json` が無ければ `Create config template` を押す（または自動生成を確認）
 
