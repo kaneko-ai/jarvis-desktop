@@ -47,7 +47,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\release_win.ps1 -P
 1. Start Menu から `jarvis-desktop` を起動する
 2. Setup 画面（または Ops 画面）で `デスクトップにショートカットを作成` を実行する
 3. Desktop に `jarvis-desktop.lnk` が生成される
-4. `.lnk` をダブルクリックしてアプリが起動する
+4. アプリを一度終了し、Desktop の `.lnk` をダブルクリックして再起動できる
+5. Start Menu からも再度クリック起動できる
 
 期待結果:
 - ターミナルを開かずに起動できる

@@ -139,6 +139,9 @@ if ([string]::IsNullOrWhiteSpace($productName)) {
 }
 
 $releaseRoot = Join-Path $desktopRoot (Join-Path "dist\releases" $appVersion)
+if (Test-Path $releaseRoot) {
+  Remove-Item -Path $releaseRoot -Recurse -Force
+}
 Ensure-Dir $releaseRoot
 
 $bundleRoot = Join-Path $desktopRoot "src-tauri\target\release\bundle"
@@ -147,9 +150,10 @@ $releaseBinRoot = Join-Path $desktopRoot "src-tauri\target\release"
 $artifacts = New-Object System.Collections.Generic.List[object]
 
 if (Test-Path $bundleRoot) {
+  $versionPattern = [regex]::Escape("_$appVersion")
   $bundleFiles = Get-ChildItem -Path $bundleRoot -Recurse -File | Where-Object {
     $ext = $_.Extension.ToLowerInvariant()
-    $ext -eq ".msi" -or $ext -eq ".exe"
+    ($ext -eq ".msi" -or $ext -eq ".exe") -and $_.Name -match $versionPattern
   } | Sort-Object FullName
 
   foreach ($file in $bundleFiles) {
