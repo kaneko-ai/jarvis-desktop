@@ -6208,82 +6208,87 @@ fn merge_desktop_input_metadata(
 ) -> Result<(), String> {
     let input_path = run_dir.join("input.json");
 
-    let merged = if input_path.exists() {
+    let mut merged = if input_path.exists() {
         let raw = fs::read_to_string(&input_path)
             .map_err(|e| format!("failed to read input.json {}: {e}", input_path.display()))?;
-        match serde_json::from_str::<serde_json::Value>(&raw) {
-            Ok(mut v) => {
-                if let Some(obj) = v.as_object_mut() {
-                    let desktop_obj = if let Some(existing) = obj.get_mut("desktop") {
-                        if let Some(d) = existing.as_object_mut() {
-                            d
-                        } else {
-                            *existing = serde_json::json!({});
-                            existing.as_object_mut().expect("desktop converted to object")
-                        }
-                    } else {
-                        obj.insert("desktop".to_string(), serde_json::json!({}));
-                        obj.get_mut("desktop")
-                            .and_then(|x| x.as_object_mut())
-                            .expect("desktop inserted")
-                    };
+        serde_json::from_str::<serde_json::Value>(&raw).unwrap_or_else(|_| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
 
-                    desktop_obj.insert("template_id".to_string(), serde_json::json!(template_id));
-                    desktop_obj.insert("canonical_id".to_string(), serde_json::json!(canonical_id));
-                    desktop_obj.insert("params".to_string(), params.clone());
-                    desktop_obj.insert("created_by".to_string(), serde_json::json!("jarvis-desktop"));
-                    desktop_obj.insert("version".to_string(), serde_json::json!(env!("CARGO_PKG_VERSION")));
-                    if let Some(pv) = primary_viz {
-                        desktop_obj.insert(
-                            "primary_viz".to_string(),
-                            serde_json::json!({ "name": pv.name, "kind": pv.kind }),
-                        );
-                    } else {
-                        desktop_obj.remove("primary_viz");
-                    }
-                    v
-                } else {
-                    serde_json::json!({
-                        "original": v,
-                        "desktop": {
-                            "template_id": template_id,
-                            "canonical_id": canonical_id,
-                            "params": params,
-                            "created_by": "jarvis-desktop",
-                            "version": env!("CARGO_PKG_VERSION"),
-                            "primary_viz": primary_viz.map(|pv| serde_json::json!({"name": pv.name, "kind": pv.kind})),
-                        },
-                    })
-                }
-            }
-            Err(_) => serde_json::json!({
-                "desktop": {
-                    "template_id": template_id,
-                    "canonical_id": canonical_id,
-                    "params": params,
-                    "created_by": "jarvis-desktop",
-                    "version": env!("CARGO_PKG_VERSION"),
-                    "primary_viz": primary_viz.map(|pv| serde_json::json!({"name": pv.name, "kind": pv.kind})),
-                },
-            }),
+    let has_required_contract = merged
+        .get("desktop")
+        .and_then(|v| v.as_object())
+        .map(|desktop| {
+            let template_ok = desktop
+                .get("template_id")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            let canonical_ok = desktop
+                .get("canonical_id")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            template_ok && canonical_ok
+        })
+        .unwrap_or(false);
+    if has_required_contract {
+        return Ok(());
+    }
+
+    if !merged.is_object() {
+        merged = serde_json::json!({ "original": merged });
+    }
+
+    let obj = merged
+        .as_object_mut()
+        .ok_or_else(|| "failed to prepare input.json object".to_string())?;
+    let desktop_obj = if let Some(existing) = obj.get_mut("desktop") {
+        if let Some(d) = existing.as_object_mut() {
+            d
+        } else {
+            *existing = serde_json::json!({});
+            existing
+                .as_object_mut()
+                .ok_or_else(|| "failed to convert desktop to object".to_string())?
         }
     } else {
-        serde_json::json!({
-            "desktop": {
-                "template_id": template_id,
-                "canonical_id": canonical_id,
-                "params": params,
-                "created_by": "jarvis-desktop",
-                "version": env!("CARGO_PKG_VERSION"),
-                "primary_viz": primary_viz.map(|pv| serde_json::json!({"name": pv.name, "kind": pv.kind})),
-            },
-        })
+        obj.insert("desktop".to_string(), serde_json::json!({}));
+        obj.get_mut("desktop")
+            .and_then(|x| x.as_object_mut())
+            .ok_or_else(|| "failed to create desktop object".to_string())?
     };
+
+    desktop_obj.insert("template_id".to_string(), serde_json::json!(template_id));
+    desktop_obj.insert("canonical_id".to_string(), serde_json::json!(canonical_id));
+    desktop_obj.insert("params".to_string(), params.clone());
+    desktop_obj.insert(
+        "desktop_app".to_string(),
+        serde_json::json!({
+            "name": env!("CARGO_PKG_NAME"),
+            "version": env!("CARGO_PKG_VERSION"),
+        }),
+    );
+    desktop_obj.insert(
+        "platform".to_string(),
+        serde_json::json!({
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+        }),
+    );
+    desktop_obj.insert("invoked_at".to_string(), serde_json::json!(Utc::now().to_rfc3339()));
+    desktop_obj.insert("source".to_string(), serde_json::json!("jarvis-desktop"));
+    if let Some(pv) = primary_viz {
+        desktop_obj.insert(
+            "primary_viz".to_string(),
+            serde_json::json!({ "name": pv.name, "kind": pv.kind }),
+        );
+    }
 
     let pretty = serde_json::to_string_pretty(&merged)
         .map_err(|e| format!("failed to serialize merged input.json: {e}"))?;
-    fs::write(&input_path, pretty)
-        .map_err(|e| format!("failed to write input.json {}: {e}", input_path.display()))
+    atomic_write_text(&input_path, &pretty)
 }
 
 fn execute_pipeline_task(
@@ -7758,7 +7763,48 @@ fn resume_pipelines_if_possible() {
     let _ = start_job_worker_if_needed();
 }
 
+fn maybe_run_smoke_template_tree_cli() -> Option<i32> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(|s| s.as_str()) != Some("--smoke-run-template-tree") {
+        return None;
+    }
+
+    let canonical_id = args
+        .get(2)
+        .cloned()
+        .unwrap_or_else(|| "arxiv:1706.03762".to_string());
+    let depth = args
+        .get(3)
+        .and_then(|s| s.parse::<u8>().ok())
+        .unwrap_or(1);
+    let max_per_level = args
+        .get(4)
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(5);
+
+    let result = run_task_template(
+        "TEMPLATE_TREE".to_string(),
+        canonical_id,
+        serde_json::json!({
+            "depth": depth,
+            "max_per_level": max_per_level,
+        }),
+    );
+    let serialized = serde_json::to_string(&result).unwrap_or_else(|_| {
+        format!(
+            "{{\"ok\":false,\"status\":\"error\",\"message\":\"failed to serialize run result\",\"run_id\":\"{}\"}}",
+            result.run_id
+        )
+    });
+    println!("{serialized}");
+    Some(if result.ok { 0 } else { 1 })
+}
+
 fn main() {
+    if let Some(code) = maybe_run_smoke_template_tree_cli() {
+        std::process::exit(code);
+    }
+
     let _ = start_job_worker_if_needed();
     resume_pipelines_if_possible();
     tauri::Builder::default()
@@ -8145,6 +8191,56 @@ mod tests {
         assert_eq!(updated.get("desktop").and_then(|v| v.get("custom")), Some(&serde_json::json!("keep")));
         assert_eq!(updated.get("desktop").and_then(|v| v.get("template_id")), Some(&serde_json::json!("TEMPLATE_MAP")));
         assert_eq!(updated.get("desktop").and_then(|v| v.get("primary_viz")).and_then(|v| v.get("kind")), Some(&serde_json::json!("html")));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn merge_input_metadata_inserts_desktop_contract_when_missing() {
+        let base = std::env::temp_dir().join(format!("jarvis_input_insert_{}", now_epoch_ms()));
+        let run_dir = base.join("run_1");
+        let _ = fs::create_dir_all(&run_dir);
+        fs::write(run_dir.join("input.json"), r#"{"title":"A"}"#).expect("write input");
+
+        merge_desktop_input_metadata(
+            &run_dir,
+            "TEMPLATE_TREE",
+            "arxiv:1706.03762",
+            &serde_json::json!({"depth": 1, "max_per_level": 5}),
+            None,
+        )
+        .expect("inject desktop metadata");
+
+        let updated_raw = fs::read_to_string(run_dir.join("input.json")).expect("read merged input");
+        let updated: serde_json::Value = serde_json::from_str(&updated_raw).expect("parse merged input");
+        assert_eq!(updated.get("title"), Some(&serde_json::json!("A")));
+        assert_eq!(updated.get("desktop").and_then(|v| v.get("template_id")), Some(&serde_json::json!("TEMPLATE_TREE")));
+        assert_eq!(updated.get("desktop").and_then(|v| v.get("canonical_id")), Some(&serde_json::json!("arxiv:1706.03762")));
+        assert_eq!(updated.get("desktop").and_then(|v| v.get("source")), Some(&serde_json::json!("jarvis-desktop")));
+        assert_eq!(updated.get("desktop").and_then(|v| v.get("desktop_app")).and_then(|v| v.get("version")), Some(&serde_json::json!(env!("CARGO_PKG_VERSION"))));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn merge_input_metadata_keeps_existing_contract_unchanged() {
+        let base = std::env::temp_dir().join(format!("jarvis_input_keep_{}", now_epoch_ms()));
+        let run_dir = base.join("run_1");
+        let _ = fs::create_dir_all(&run_dir);
+        let original = r#"{"desktop":{"template_id":"TEMPLATE_TREE","canonical_id":"arxiv:1706.03762","custom":"keep"},"title":"A"}"#;
+        fs::write(run_dir.join("input.json"), original).expect("write input");
+
+        merge_desktop_input_metadata(
+            &run_dir,
+            "TEMPLATE_TREE",
+            "arxiv:1706.03762",
+            &serde_json::json!({"depth": 1}),
+            None,
+        )
+        .expect("merge input metadata");
+
+        let after = fs::read_to_string(run_dir.join("input.json")).expect("read input");
+        assert_eq!(after, original);
 
         let _ = fs::remove_dir_all(&base);
     }
