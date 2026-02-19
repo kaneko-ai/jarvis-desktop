@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 
 function escapeHtml(raw) {
   return String(raw ?? "")
@@ -206,6 +207,19 @@ export default function App() {
   const [pipelineDetail, setPipelineDetail] = useState(null);
   const [pipelineDetailLoading, setPipelineDetailLoading] = useState(false);
   const [activeScreen, setActiveScreen] = useState("main");
+  const [setupStatus, setSetupStatus] = useState(null);
+  const [setupLoading, setSetupLoading] = useState(false);
+  const [setupError, setSetupError] = useState("");
+  const [setupSaving, setSetupSaving] = useState(false);
+  const [setupPipelineRoot, setSetupPipelineRoot] = useState("");
+  const [setupOutDir, setSetupOutDir] = useState("");
+  const [setupWarningsAcknowledged, setSetupWarningsAcknowledged] = useState(() => {
+    try {
+      return window.localStorage.getItem("jarvis_setup_warnings_ack") === "1";
+    } catch {
+      return false;
+    }
+  });
   const [opsNeedsAttentionOnly, setOpsNeedsAttentionOnly] = useState(false);
   const [opsAutoRetryPendingOnly, setOpsAutoRetryPendingOnly] = useState(false);
   const [desktopSettings, setDesktopSettings] = useState(null);
@@ -272,6 +286,20 @@ export default function App() {
       setRuntimeCfg(null);
     } finally {
       setCfgLoading(false);
+    }
+  }
+
+  async function loadSetupStatus() {
+    setSetupLoading(true);
+    setSetupError("");
+    try {
+      const res = await invoke("get_setup_status");
+      setSetupStatus(res ?? null);
+    } catch (e) {
+      setSetupStatus(null);
+      setSetupError(String(e));
+    } finally {
+      setSetupLoading(false);
     }
   }
 
@@ -538,6 +566,22 @@ export default function App() {
     }
   }
 
+  async function onPickWorkspaceZip() {
+    try {
+      const picked = await open({
+        multiple: false,
+        directory: false,
+        title: "Select workspace zip",
+        filters: [{ name: "Zip archive", extensions: ["zip"] }],
+      });
+      if (typeof picked === "string" && picked.trim()) {
+        setWorkspaceImportZipPath(picked);
+      }
+    } catch (e) {
+      setWorkspaceError(String(e));
+    }
+  }
+
   async function onImportWorkspace() {
     const zipPath = String(workspaceImportZipPath ?? "").trim();
     if (!zipPath) {
@@ -560,6 +604,75 @@ export default function App() {
     } finally {
       setWorkspaceImporting(false);
     }
+  }
+
+  async function onPickSetupPipelineRoot() {
+    try {
+      const picked = await open({
+        multiple: false,
+        directory: true,
+        title: "Select jarvis-ml-pipeline root",
+      });
+      if (typeof picked === "string" && picked.trim()) {
+        setSetupPipelineRoot(picked);
+      }
+    } catch (e) {
+      setSetupError(String(e));
+    }
+  }
+
+  async function onPickSetupOutDir() {
+    try {
+      const picked = await open({
+        multiple: false,
+        directory: true,
+        title: "Select output directory",
+      });
+      if (typeof picked === "string" && picked.trim()) {
+        setSetupOutDir(picked);
+      }
+    } catch (e) {
+      setSetupError(String(e));
+    }
+  }
+
+  async function onSaveSetupPaths() {
+    const pipelineRoot = String(setupPipelineRoot ?? "").trim();
+    if (!pipelineRoot) {
+      setSetupError("pipeline_root is required");
+      return;
+    }
+    setSetupSaving(true);
+    setSetupError("");
+    try {
+      const updated = await invoke("update_runtime_paths", {
+        input: {
+          pipeline_root: pipelineRoot,
+          out_dir: String(setupOutDir ?? "").trim() || null,
+        },
+      });
+      if (updated?.pipeline_root) setSetupPipelineRoot(String(updated.pipeline_root));
+      if (updated?.out_dir) setSetupOutDir(String(updated.out_dir));
+      await Promise.all([
+        loadRuntimeConfig(true),
+        loadPreflight(),
+        loadSetupStatus(),
+        loadRuns(),
+        loadJobs(),
+        loadPipelines(),
+      ]);
+    } catch (e) {
+      setSetupError(String(e));
+    } finally {
+      setSetupSaving(false);
+    }
+  }
+
+  function onToggleSetupWarningsAcknowledged(next) {
+    setSetupWarningsAcknowledged(next);
+    try {
+      window.localStorage.setItem("jarvis_setup_warnings_ack", next ? "1" : "0");
+    } catch {}
   }
 
   async function onOpenWorkspaceExportFolder(id) {
@@ -1044,6 +1157,7 @@ export default function App() {
   useEffect(() => {
     loadRuntimeConfig(false);
     loadPreflight();
+    loadSetupStatus();
     loadTemplates();
     loadRuns();
     loadJobs();
@@ -1054,6 +1168,27 @@ export default function App() {
     loadLibraryRows();
     loadLibraryStats();
   }, []);
+
+  useEffect(() => {
+    setSetupPipelineRoot(String(runtimeCfg?.pipeline_root ?? ""));
+    setSetupOutDir(String(runtimeCfg?.out_dir ?? ""));
+  }, [runtimeCfg?.pipeline_root, runtimeCfg?.out_dir]);
+
+  useEffect(() => {
+    if (setupLoading || !setupStatus) return;
+    const hardFail = !setupStatus.runtime_ok || Number(setupStatus.hard_fail_count ?? 0) > 0;
+    const needsWarningAck =
+      !setupStatus.preflight_ok
+      && Number(setupStatus.warning_count ?? 0) > 0
+      && !setupWarningsAcknowledged;
+    if ((hardFail || needsWarningAck) && activeScreen !== "setup") {
+      setActiveScreen("setup");
+      return;
+    }
+    if (!(hardFail || needsWarningAck) && activeScreen === "setup") {
+      setActiveScreen("main");
+    }
+  }, [setupStatus, setupLoading, setupWarningsAcknowledged, activeScreen]);
 
   useEffect(() => {
     const timer = setInterval(() => {
@@ -1326,6 +1461,17 @@ export default function App() {
     : "-";
   const selectedJob = jobs.find((j) => j.job_id === selectedJobId) ?? null;
   const selectedPipelineSummary = pipelines.find((p) => p.pipeline_id === selectedPipelineId) ?? null;
+  const setupHardFailCount = Number(setupStatus?.hard_fail_count ?? 0);
+  const setupWarningCount = Number(setupStatus?.warning_count ?? 0);
+  const setupNeedsWarningAck = !setupStatus?.preflight_ok && setupWarningCount > 0 && !setupWarningsAcknowledged;
+  const setupBlocked = !setupStatus || !setupStatus.runtime_ok || setupHardFailCount > 0 || setupNeedsWarningAck;
+  const setupCanProceed = !!setupStatus && setupStatus.runtime_ok && setupHardFailCount === 0
+    && (setupStatus.preflight_ok || setupWarningsAcknowledged);
+  const setupStep = !setupStatus?.runtime_ok || setupHardFailCount > 0
+    ? 1
+    : (!setupStatus?.preflight_ok && setupWarningCount > 0 && !setupWarningsAcknowledged)
+      ? 2
+      : (!String(workspaceImportZipPath ?? "").trim() ? 3 : 4);
   const selectedPipeline = pipelineDetail && pipelineDetail.pipeline_id === selectedPipelineId
     ? pipelineDetail
     : null;
@@ -1541,30 +1687,200 @@ export default function App() {
 
       <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
         <button
+          onClick={() => setActiveScreen("setup")}
+          style={{
+            padding: "8px 12px",
+            borderRadius: 8,
+            border: "1px solid #333",
+            background: activeScreen === "setup" ? "#eef5ff" : "white",
+          }}
+        >
+          Setup{setupBlocked ? " (required)" : ""}
+        </button>
+        <button
           onClick={() => setActiveScreen("main")}
+          disabled={setupBlocked}
           style={{
             padding: "8px 12px",
             borderRadius: 8,
             border: "1px solid #333",
             background: activeScreen === "main" ? "#eef5ff" : "white",
+            opacity: setupBlocked ? 0.6 : 1,
           }}
         >
           Main
         </button>
         <button
           onClick={() => setActiveScreen("ops")}
+          disabled={setupBlocked}
           style={{
             padding: "8px 12px",
             borderRadius: 8,
             border: "1px solid #333",
             background: activeScreen === "ops" ? "#eef5ff" : "white",
+            opacity: setupBlocked ? 0.6 : 1,
           }}
         >
           Ops
         </button>
       </div>
 
-      {activeScreen === "main" ? (
+      {activeScreen === "setup" ? (
+      <div style={{ display: "grid", gap: 12 }}>
+        <div style={{ border: "1px solid #d2d2d2", borderRadius: 10, padding: 12, background: "#fafafa" }}>
+          <div style={{ fontWeight: 600, marginBottom: 6 }}>First-run setup wizard</div>
+          <div style={{ fontSize: 12, opacity: 0.9 }}>
+            Step {setupStep}/4 · runtime_ok={setupStatus?.runtime_ok ? "yes" : "no"} · preflight_ok={setupStatus?.preflight_ok ? "yes" : "no"}
+          </div>
+          <div style={{ fontSize: 12, opacity: 0.9 }}>
+            hard_fail={setupHardFailCount} warning={setupWarningCount}
+          </div>
+          {setupLoading ? <div style={{ marginTop: 6, fontSize: 12 }}>Loading setup status...</div> : null}
+          {setupError ? <div style={{ marginTop: 6, color: "#a33", fontSize: 12 }}>{setupError}</div> : null}
+        </div>
+
+        <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: 10 }}>
+          <div style={{ fontWeight: 600, marginBottom: 8 }}>1) Runtime paths</div>
+          <div style={{ display: "grid", gap: 8 }}>
+            <label style={{ display: "grid", gap: 4 }}>
+              <span style={{ fontSize: 12 }}>pipeline_root</span>
+              <div style={{ display: "flex", gap: 8 }}>
+                <input
+                  value={setupPipelineRoot}
+                  onChange={(e) => setSetupPipelineRoot(e.target.value)}
+                  style={{ flex: 1, padding: 8, borderRadius: 6, border: "1px solid #ccc" }}
+                />
+                <button
+                  onClick={onPickSetupPipelineRoot}
+                  style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+                >
+                  Browse folder
+                </button>
+              </div>
+            </label>
+            <label style={{ display: "grid", gap: 4 }}>
+              <span style={{ fontSize: 12 }}>out_dir</span>
+              <div style={{ display: "flex", gap: 8 }}>
+                <input
+                  value={setupOutDir}
+                  onChange={(e) => setSetupOutDir(e.target.value)}
+                  style={{ flex: 1, padding: 8, borderRadius: 6, border: "1px solid #ccc" }}
+                />
+                <button
+                  onClick={onPickSetupOutDir}
+                  style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+                >
+                  Browse folder
+                </button>
+              </div>
+            </label>
+          </div>
+          <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+            <button
+              onClick={onSaveSetupPaths}
+              disabled={setupSaving}
+              style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+            >
+              {setupSaving ? "Saving..." : "Save paths"}
+            </button>
+            <button
+              onClick={async () => {
+                await loadRuntimeConfig(true);
+                await loadPreflight();
+                await loadSetupStatus();
+              }}
+              disabled={setupLoading}
+              style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+            >
+              Refresh checks
+            </button>
+          </div>
+        </div>
+
+        <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: 10 }}>
+          <div style={{ fontWeight: 600, marginBottom: 8 }}>2) Preflight</div>
+          {preflightError ? <div style={{ color: "#a33", fontSize: 12, marginBottom: 6 }}>{preflightError}</div> : null}
+          <div style={{ fontSize: 12, marginBottom: 6 }}>
+            hard_fail={setupHardFailCount} / warning={setupWarningCount}
+          </div>
+          {!setupStatus?.preflight_ok && setupWarningCount > 0 ? (
+            <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
+              <input
+                type="checkbox"
+                checked={setupWarningsAcknowledged}
+                onChange={(e) => onToggleSetupWarningsAcknowledged(e.target.checked)}
+              />
+              Continue despite warnings (acknowledged)
+            </label>
+          ) : null}
+        </div>
+
+        <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: 10 }}>
+          <div style={{ fontWeight: 600, marginBottom: 8 }}>3) Optional workspace import</div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+            <input
+              readOnly
+              value={workspaceImportZipPath}
+              placeholder="No zip selected"
+              style={{ minWidth: 360, padding: 6, borderRadius: 6, border: "1px solid #ccc", fontSize: 12 }}
+            />
+            <button
+              onClick={onPickWorkspaceZip}
+              style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+            >
+              Browse zip
+            </button>
+            <button
+              onClick={() => setWorkspaceImportZipPath("")}
+              disabled={!workspaceImportZipPath}
+              style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+            >
+              Clear
+            </button>
+            <select
+              value={workspaceImportMode}
+              onChange={(e) => setWorkspaceImportMode(e.target.value)}
+              style={{ padding: 6, borderRadius: 6, border: "1px solid #ccc", fontSize: 12 }}
+            >
+              <option value="merge">merge</option>
+              <option value="replace">replace</option>
+            </select>
+            <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
+              <input
+                type="checkbox"
+                checked={workspaceImportDryRun}
+                onChange={(e) => setWorkspaceImportDryRun(e.target.checked)}
+              />
+              dry-run
+            </label>
+            <button
+              onClick={onImportWorkspace}
+              disabled={workspaceImporting || !workspaceImportZipPath}
+              style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+            >
+              {workspaceImporting ? "Importing..." : "Import workspace"}
+            </button>
+          </div>
+          {workspaceError ? <div style={{ marginTop: 6, color: "#a33", fontSize: 12 }}>{workspaceError}</div> : null}
+        </div>
+
+        <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: 10 }}>
+          <div style={{ fontWeight: 600, marginBottom: 8 }}>4) Finish</div>
+          <button
+            onClick={() => setActiveScreen("main")}
+            disabled={!setupCanProceed}
+            style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+          >
+            Continue to Main
+          </button>
+          {!setupCanProceed ? (
+            <div style={{ marginTop: 6, fontSize: 12, color: "#8a4200" }}>
+              Save valid paths and clear hard-fail checks. If only warnings remain, acknowledge them to continue.
+            </div>
+          ) : null}
+        </div>
+      </div>
+      ) : activeScreen === "main" ? (
       <>
 
       <div
@@ -2788,11 +3104,24 @@ export default function App() {
                 {workspaceExporting ? "Exporting..." : "Export workspace"}
               </button>
               <input
+                readOnly
                 value={workspaceImportZipPath}
-                onChange={(e) => setWorkspaceImportZipPath(e.target.value)}
-                placeholder="workspace.zip path"
+                placeholder="No zip selected"
                 style={{ minWidth: 340, padding: 6, borderRadius: 6, border: "1px solid #ccc", fontSize: 12 }}
               />
+              <button
+                onClick={onPickWorkspaceZip}
+                style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+              >
+                Browse zip
+              </button>
+              <button
+                onClick={() => setWorkspaceImportZipPath("")}
+                disabled={!workspaceImportZipPath}
+                style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+              >
+                Clear
+              </button>
               <select
                 value={workspaceImportMode}
                 onChange={(e) => setWorkspaceImportMode(e.target.value)}

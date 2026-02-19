@@ -195,6 +195,27 @@ struct PreflightResult {
     checks: Vec<PreflightCheckItem>,
 }
 
+#[derive(Serialize)]
+struct SetupStatusView {
+    complete: bool,
+    runtime_ok: bool,
+    preflight_ok: bool,
+    hard_fail_count: usize,
+    warning_count: usize,
+}
+
+#[derive(Deserialize)]
+struct RuntimePathsInput {
+    pipeline_root: String,
+    out_dir: Option<String>,
+}
+
+#[derive(Serialize)]
+struct RuntimePathsUpdateResult {
+    pipeline_root: String,
+    out_dir: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum JobStatus {
@@ -2666,6 +2687,95 @@ fn ensure_config_file_template(path: &Path) -> Result<(), String> {
 "#;
     std::fs::write(path, template)
         .map_err(|e| format!("Failed to create config template {}: {e}", path.display()))
+}
+
+fn is_hard_fail_check(name: &str) -> bool {
+    matches!(name, "pipeline_root" | "out_dir" | "pipeline_markers" | "config_file")
+}
+
+fn count_preflight_fail_levels(preflight: &PreflightResult) -> (usize, usize) {
+    let mut hard = 0usize;
+    let mut warn = 0usize;
+    for c in &preflight.checks {
+        if c.ok {
+            continue;
+        }
+        if is_hard_fail_check(&c.name) {
+            hard += 1;
+        } else {
+            warn += 1;
+        }
+    }
+    (hard, warn)
+}
+
+fn is_setup_complete(runtime: &RuntimeConfigView, preflight: &PreflightResult) -> bool {
+    runtime.ok && preflight.ok
+}
+
+fn update_runtime_paths_internal(input: RuntimePathsInput) -> Result<RuntimePathsUpdateResult, String> {
+    let root = repo_root();
+    let pipeline_raw = input.pipeline_root.trim();
+    if pipeline_raw.is_empty() {
+        return Err("pipeline_root is required".to_string());
+    }
+
+    let pipeline_candidate = PathBuf::from(pipeline_raw);
+    let pipeline_abs = if pipeline_candidate.is_absolute() {
+        pipeline_candidate
+    } else {
+        absolutize(&pipeline_candidate, &root)
+    };
+    let pipeline_valid = validate_pipeline_root("wizard", &pipeline_abs)?;
+
+    let out_raw = input
+        .out_dir
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("logs/runs");
+    let out_candidate = PathBuf::from(out_raw);
+    let out_abs = if out_candidate.is_absolute() {
+        out_candidate
+    } else {
+        absolutize(&out_candidate, &pipeline_valid)
+    };
+    let out_valid = validate_out_dir_writable(&out_abs)?;
+
+    let cfg_path = config_file_path();
+    ensure_config_file_template(&cfg_path)?;
+
+    let mut value = if cfg_path.exists() {
+        let raw = fs::read_to_string(&cfg_path)
+            .map_err(|e| format!("failed to read config file {}: {e}", cfg_path.display()))?;
+        serde_json::from_str::<serde_json::Value>(&raw)
+            .map_err(|e| format!("invalid config JSON at {}: {e}", cfg_path.display()))?
+    } else {
+        serde_json::json!({})
+    };
+
+    if !value.is_object() {
+        value = serde_json::json!({});
+    }
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "JARVIS_PIPELINE_ROOT".to_string(),
+            serde_json::Value::String(pipeline_valid.to_string_lossy().to_string()),
+        );
+        obj.insert(
+            "JARVIS_PIPELINE_OUT_DIR".to_string(),
+            serde_json::Value::String(out_valid.to_string_lossy().to_string()),
+        );
+    }
+
+    let text = serde_json::to_string_pretty(&value)
+        .map_err(|e| format!("failed to serialize runtime config update: {e}"))?;
+    atomic_write_text(&cfg_path, &text)?;
+
+    Ok(RuntimePathsUpdateResult {
+        pipeline_root: pipeline_valid.to_string_lossy().to_string(),
+        out_dir: out_valid.to_string_lossy().to_string(),
+    })
 }
 
 fn extract_retry_after_seconds(raw: &str) -> Option<f64> {
@@ -7189,6 +7299,25 @@ fn create_config_if_missing() -> Result<String, String> {
     Ok(path.to_string_lossy().to_string())
 }
 
+#[tauri::command]
+fn get_setup_status() -> SetupStatusView {
+    let runtime = get_runtime_config();
+    let preflight = run_preflight_checks();
+    let (hard_fail_count, warning_count) = count_preflight_fail_levels(&preflight);
+    SetupStatusView {
+        complete: is_setup_complete(&runtime, &preflight),
+        runtime_ok: runtime.ok,
+        preflight_ok: preflight.ok,
+        hard_fail_count,
+        warning_count,
+    }
+}
+
+#[tauri::command]
+fn update_runtime_paths(input: RuntimePathsInput) -> Result<RuntimePathsUpdateResult, String> {
+    update_runtime_paths_internal(input)
+}
+
 fn resume_pipelines_if_possible() {
     let (runtime, _) = match runtime_and_jobs_path() {
         Ok(v) => v,
@@ -7206,6 +7335,7 @@ fn main() {
     let _ = start_job_worker_if_needed();
     resume_pipelines_if_possible();
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             run_papers_tree,
             run_task_template,
@@ -7260,7 +7390,9 @@ fn main() {
             get_runtime_config,
             reload_runtime_config,
             open_config_file_location,
-            create_config_if_missing
+            create_config_if_missing,
+            get_setup_status,
+            update_runtime_paths
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -7269,6 +7401,132 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_temp_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("{}_{}", prefix, nanos));
+        fs::create_dir_all(&dir).expect("failed to create temp dir");
+        dir
+    }
+
+    #[test]
+    fn setup_complete_requires_runtime_and_preflight_ok() {
+        let runtime_ok = RuntimeConfigView {
+            ok: true,
+            status: "ok".to_string(),
+            message: "ok".to_string(),
+            config_file_path: "cfg.json".to_string(),
+            config_file_loaded: true,
+            pipeline_root: "C:/tmp/root".to_string(),
+            out_dir: "C:/tmp/root/logs/runs".to_string(),
+            s2_api_key_set: false,
+            s2_min_interval_ms: Some(1000),
+            s2_max_retries: Some(6),
+            s2_backoff_base_sec: Some(0.5),
+        };
+        let preflight_ok = PreflightResult {
+            ok: true,
+            checks: vec![PreflightCheckItem {
+                name: "pipeline_root".to_string(),
+                ok: true,
+                detail: "ok".to_string(),
+                fix_hint: "".to_string(),
+            }],
+        };
+        assert!(is_setup_complete(&runtime_ok, &preflight_ok));
+
+        let runtime_ng = RuntimeConfigView {
+            ok: false,
+            ..runtime_ok
+        };
+        assert!(!is_setup_complete(&runtime_ng, &preflight_ok));
+
+        let preflight_ng = PreflightResult {
+            ok: false,
+            checks: vec![PreflightCheckItem {
+                name: "python".to_string(),
+                ok: false,
+                detail: "warn".to_string(),
+                fix_hint: "check python".to_string(),
+            }],
+        };
+        let runtime_ok2 = RuntimeConfigView {
+            ok: true,
+            status: "ok".to_string(),
+            message: "ok".to_string(),
+            config_file_path: "cfg.json".to_string(),
+            config_file_loaded: true,
+            pipeline_root: "C:/tmp/root".to_string(),
+            out_dir: "C:/tmp/root/logs/runs".to_string(),
+            s2_api_key_set: false,
+            s2_min_interval_ms: Some(1000),
+            s2_max_retries: Some(6),
+            s2_backoff_base_sec: Some(0.5),
+        };
+        assert!(!is_setup_complete(&runtime_ok2, &preflight_ng));
+    }
+
+    #[test]
+    fn preflight_fail_levels_split_hard_and_warning() {
+        let preflight = PreflightResult {
+            ok: false,
+            checks: vec![
+                PreflightCheckItem {
+                    name: "pipeline_root".to_string(),
+                    ok: false,
+                    detail: "missing".to_string(),
+                    fix_hint: "set root".to_string(),
+                },
+                PreflightCheckItem {
+                    name: "out_dir".to_string(),
+                    ok: false,
+                    detail: "readonly".to_string(),
+                    fix_hint: "fix perms".to_string(),
+                },
+                PreflightCheckItem {
+                    name: "python".to_string(),
+                    ok: false,
+                    detail: "warning".to_string(),
+                    fix_hint: "install python".to_string(),
+                },
+            ],
+        };
+
+        let (hard, warn) = count_preflight_fail_levels(&preflight);
+        assert_eq!(hard, 2);
+        assert_eq!(warn, 1);
+    }
+
+    #[test]
+    fn validate_pipeline_root_accepts_valid_tree() {
+        let dir = make_temp_dir("jarvis_pipeline_root_ok");
+        let pyproject = dir.join("pyproject.toml");
+        let cli = dir.join("jarvis_cli.py");
+        let core = dir.join("jarvis_core");
+        fs::write(&pyproject, "[tool.poetry]\nname='x'\n").expect("failed to write pyproject");
+        fs::write(&cli, "print('ok')\n").expect("failed to write cli");
+        fs::create_dir_all(&core).expect("failed to create jarvis_core");
+
+        let result = validate_pipeline_root("test", &dir).expect("expected valid pipeline root");
+        assert!(result.exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_pipeline_root_rejects_missing_markers() {
+        let dir = make_temp_dir("jarvis_pipeline_root_ng");
+        fs::write(dir.join("pyproject.toml"), "[tool.poetry]\nname='x'\n")
+            .expect("failed to write pyproject");
+
+        let err = validate_pipeline_root("test", &dir).expect_err("expected invalid pipeline root");
+        assert!(err.contains("pipeline root is invalid"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn config_precedence_is_file_then_env_then_autodetect() {
