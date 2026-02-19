@@ -95,6 +95,14 @@ struct RunListItem {
     run_dir: String,
 }
 
+#[derive(Serialize)]
+struct RunSummary {
+    run_id: String,
+    created_at: String,
+    status: String,
+    run_dir: String,
+}
+
 #[derive(Deserialize, Default)]
 struct RunListFilter {
     query: Option<String>,
@@ -3644,6 +3652,31 @@ fn validate_run_id_component(run_id: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
+fn validate_pipeline_run_id_component(run_id: &str) -> Result<String, String> {
+    if run_id.is_empty() {
+        return Err("run_id is empty".to_string());
+    }
+    if run_id.trim() != run_id {
+        return Err("run_id must not contain leading or trailing whitespace".to_string());
+    }
+    if run_id == "." || run_id == ".." || run_id.contains("..") {
+        return Err("run_id must not contain parent traversal".to_string());
+    }
+    if run_id.contains('\\') || run_id.contains('/') {
+        return Err("run_id must not contain path separators".to_string());
+    }
+    if run_id.contains(':') {
+        return Err("run_id must not contain ':'".to_string());
+    }
+    if run_id.contains('\0') {
+        return Err("run_id must not contain NULL".to_string());
+    }
+    if run_id.chars().any(|c| c.is_control()) {
+        return Err("run_id must not contain control characters".to_string());
+    }
+    Ok(run_id.to_string())
+}
+
 fn parse_status_from_result(path: &Path) -> String {
     let text = match fs::read_to_string(path) {
         Ok(v) => v,
@@ -3666,6 +3699,26 @@ fn parse_status_from_result(path: &Path) -> String {
             return "ok".to_string();
         }
         return "error".to_string();
+    }
+
+    "unknown".to_string()
+}
+
+fn parse_pipeline_run_status(path: &Path) -> String {
+    let text = match fs::read_to_string(path) {
+        Ok(v) => v,
+        Err(_) => return "unknown".to_string(),
+    };
+    let value: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(_) => return "unknown".to_string(),
+    };
+
+    if let Some(ok) = value.get("ok").and_then(|v| v.as_bool()) {
+        if ok {
+            return "ok".to_string();
+        }
+        return "failed".to_string();
     }
 
     "unknown".to_string()
@@ -4385,6 +4438,133 @@ fn resolve_run_dir_from_id(runtime: &RuntimeConfig, run_id: &str) -> Result<Path
     Ok(canonical)
 }
 
+fn pipeline_runs_dir(runtime: &RuntimeConfig) -> PathBuf {
+    runtime.pipeline_root.join("logs").join("runs")
+}
+
+fn resolve_pipeline_run_dir_from_id(runtime: &RuntimeConfig, run_id: &str) -> Result<PathBuf, String> {
+    let run_component = validate_pipeline_run_id_component(run_id)?;
+    let runs_dir = pipeline_runs_dir(runtime);
+    if !runs_dir.exists() {
+        return Err(format!("runs directory does not exist: {}", runs_dir.display()));
+    }
+    if !runs_dir.is_dir() {
+        return Err(format!("runs path is not a directory: {}", runs_dir.display()));
+    }
+    let runs_dir_canonical = runs_dir
+        .canonicalize()
+        .map_err(|e| format!("failed to canonicalize runs directory {}: {e}", runs_dir.display()))?;
+
+    let candidate = runs_dir.join(&run_component);
+    if !candidate.exists() {
+        return Err(format!("run directory does not exist: {}", candidate.display()));
+    }
+    if !candidate.is_dir() {
+        return Err(format!("run path is not a directory: {}", candidate.display()));
+    }
+    let canonical = candidate
+        .canonicalize()
+        .map_err(|e| format!("failed to canonicalize run directory {}: {e}", candidate.display()))?;
+    if !canonical.starts_with(&runs_dir_canonical) {
+        return Err(format!(
+            "run directory is outside runs directory: {}",
+            canonical.display()
+        ));
+    }
+    Ok(canonical)
+}
+
+fn run_text_rel_path(kind: &str) -> Result<PathBuf, String> {
+    match kind {
+        "input" => Ok(PathBuf::from("input.json")),
+        "result" => Ok(PathBuf::from("result.json")),
+        "tree" => Ok(PathBuf::from("paper_graph").join("tree").join("tree.md")),
+        _ => Err(format!("unsupported kind: {kind}")),
+    }
+}
+
+fn list_pipeline_runs_internal(runtime: &RuntimeConfig, limit: Option<u32>) -> Result<Vec<RunSummary>, String> {
+    let runs_dir = pipeline_runs_dir(runtime);
+    if !runs_dir.exists() {
+        return Ok(Vec::new());
+    }
+    if !runs_dir.is_dir() {
+        return Err(format!("runs path is not a directory: {}", runs_dir.display()));
+    }
+    let runs_dir_canonical = runs_dir
+        .canonicalize()
+        .map_err(|e| format!("failed to canonicalize runs directory {}: {e}", runs_dir.display()))?;
+
+    let max_rows = usize::try_from(limit.unwrap_or(200).clamp(1, 2000)).unwrap_or(200);
+    let mut rows: Vec<(RunSummary, u64)> = Vec::new();
+    for entry in fs::read_dir(&runs_dir_canonical)
+        .map_err(|e| format!("failed to read runs directory {}: {e}", runs_dir_canonical.display()))?
+    {
+        let entry = match entry {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let run_id = entry.file_name().to_string_lossy().to_string();
+        if validate_pipeline_run_id_component(&run_id).is_err() {
+            continue;
+        }
+        let canonical = match path.canonicalize() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if !canonical.starts_with(&runs_dir_canonical) {
+            continue;
+        }
+        let modified = fs::metadata(&canonical)
+            .and_then(|m| m.modified())
+            .ok();
+        let created_at = modified
+            .map(to_iso_from_system_time)
+            .unwrap_or_else(|| "".to_string());
+        let ts = modified_epoch_ms(&canonical);
+        rows.push((
+            RunSummary {
+                run_id,
+                created_at,
+                status: parse_pipeline_run_status(&canonical.join("result.json")),
+                run_dir: canonical.to_string_lossy().to_string(),
+            },
+            ts,
+        ));
+    }
+
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.run_id.cmp(&b.0.run_id)));
+    let mut out = rows.into_iter().map(|(row, _)| row).collect::<Vec<_>>();
+    if out.len() > max_rows {
+        out.truncate(max_rows);
+    }
+    Ok(out)
+}
+
+fn read_run_text_internal(runtime: &RuntimeConfig, run_id: &str, kind: &str) -> Result<String, String> {
+    let rel = run_text_rel_path(kind)?;
+    let run_dir = resolve_pipeline_run_dir_from_id(runtime, run_id)?;
+    let target = run_dir.join(rel);
+    if !target.exists() || !target.is_file() {
+        return Err(format!("artifact file does not exist: {}", target.display()));
+    }
+    let canonical = target
+        .canonicalize()
+        .map_err(|e| format!("failed to canonicalize artifact {}: {e}", target.display()))?;
+    if !canonical.starts_with(&run_dir) {
+        return Err(format!(
+            "artifact path is outside run directory: {}",
+            canonical.display()
+        ));
+    }
+    fs::read_to_string(&canonical)
+        .map_err(|e| format!("failed to read artifact {}: {e}", canonical.display()))
+}
+
 #[tauri::command]
 fn list_runs(limit: Option<usize>, filters: Option<RunListFilter>) -> Result<Vec<RunListItem>, String> {
     let root = repo_root();
@@ -4472,6 +4652,32 @@ fn get_run_status(run_id: String) -> Result<String, String> {
     let run_id = validate_run_id_component(&run_id)?;
     let run_dir = resolve_run_dir_from_id(&runtime, &run_id)?;
     Ok(parse_status_from_result(&run_dir.join("result.json")))
+}
+
+#[tauri::command]
+fn list_pipeline_runs(limit: Option<u32>) -> Result<Vec<RunSummary>, String> {
+    let root = repo_root();
+    let runtime = resolve_runtime_config(&root)?;
+    list_pipeline_runs_internal(&runtime, limit)
+}
+
+#[tauri::command]
+fn read_run_text(run_id: String, kind: String) -> Result<String, String> {
+    let root = repo_root();
+    let runtime = resolve_runtime_config(&root)?;
+    read_run_text_internal(&runtime, &run_id, &kind)
+}
+
+#[tauri::command]
+fn open_run_dir(run_id: String) -> Result<(), String> {
+    let root = repo_root();
+    let runtime = resolve_runtime_config(&root)?;
+    let run_dir = resolve_pipeline_run_dir_from_id(&runtime, &run_id)?;
+    Command::new("explorer")
+        .arg(&run_dir)
+        .spawn()
+        .map_err(|e| format!("Failed to open explorer: {e}"))?;
+    Ok(())
 }
 
 fn diagnostics_root(out_dir: &Path) -> PathBuf {
@@ -7842,7 +8048,10 @@ fn main() {
             open_run_folder,
             list_task_templates,
             list_runs,
+            list_pipeline_runs,
             get_run_status,
+            read_run_text,
+            open_run_dir,
             collect_diagnostics,
             list_diagnostics,
             read_diagnostic_report,
@@ -8501,6 +8710,69 @@ mod tests {
         assert!(slash.is_err());
 
         let _ = fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn pipeline_run_id_validation_rejects_parent_and_separators() {
+        assert!(validate_pipeline_run_id_component("abc..def").is_err());
+        assert!(validate_pipeline_run_id_component("../abc").is_err());
+        assert!(validate_pipeline_run_id_component("abc/def").is_err());
+        assert!(validate_pipeline_run_id_component("abc\\def").is_err());
+    }
+
+    #[test]
+    fn read_run_text_rejects_unknown_kind() {
+        let base = std::env::temp_dir().join(format!("jarvis_run_text_kind_{}", now_epoch_ms()));
+        let runtime = build_test_runtime(&base);
+        let run_id = "20260218_120000_deadbeef";
+        let run_dir = runtime.pipeline_root.join("logs").join("runs").join(run_id);
+        let _ = fs::create_dir_all(&run_dir);
+        fs::write(run_dir.join("input.json"), r#"{"ok":true}"#).expect("write input");
+
+        let err = read_run_text_internal(&runtime, run_id, "unknown").err().unwrap_or_default();
+        assert!(err.contains("unsupported kind"));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn read_run_text_rejects_invalid_run_id() {
+        let base = std::env::temp_dir().join(format!("jarvis_run_text_id_{}", now_epoch_ms()));
+        let runtime = build_test_runtime(&base);
+
+        let err_parent = read_run_text_internal(&runtime, "..", "input").err().unwrap_or_default();
+        assert!(err_parent.contains("run_id"));
+        let err_slash = read_run_text_internal(&runtime, "a/b", "input").err().unwrap_or_default();
+        assert!(err_slash.contains("run_id"));
+        let err_backslash = read_run_text_internal(&runtime, "a\\b", "input").err().unwrap_or_default();
+        assert!(err_backslash.contains("run_id"));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pipeline_run_explorer_list_and_read_input() {
+        let base = std::env::temp_dir().join(format!("jarvis_run_explorer_{}", now_epoch_ms()));
+        let runtime = build_test_runtime(&base);
+        let run_id = "20260218_121500_deadbeef";
+        let run_dir = runtime.pipeline_root.join("logs").join("runs").join(run_id);
+        let _ = fs::create_dir_all(run_dir.join("paper_graph").join("tree"));
+        fs::write(run_dir.join("input.json"), "{\n  \"paper_id\": \"arxiv:1706.03762\"\n}\n")
+            .expect("write input");
+        fs::write(run_dir.join("result.json"), r#"{"ok":true}"#).expect("write result");
+        fs::write(
+            run_dir.join("paper_graph").join("tree").join("tree.md"),
+            "# tree\n",
+        )
+        .expect("write tree");
+
+        let rows = list_pipeline_runs_internal(&runtime, Some(50)).expect("list pipeline runs");
+        assert!(rows.iter().any(|r| r.run_id == run_id));
+
+        let content = read_run_text_internal(&runtime, run_id, "input").expect("read input");
+        assert!(content.contains("arxiv:1706.03762"));
+
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
