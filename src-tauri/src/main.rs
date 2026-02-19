@@ -19,6 +19,7 @@ const DIAG_MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
 const DIAG_MAX_TOTAL_BYTES: u64 = 30 * 1024 * 1024;
 const DIAG_AUDIT_TAIL_LINES: usize = 200;
 const DIAG_MAX_RECENT_ITEMS: usize = 20;
+const MAX_RUN_TEXT_PREVIEW_BYTES: usize = 200 * 1024;
 const DEFAULT_PIPELINE_REPO_REMOTE_URL: &str = "https://github.com/kaneko-ai/jarvis-ml-pipeline.git";
 const DEFAULT_PIPELINE_REPO_LOCAL_SUBDIR: &str = "pipeline_repo/jarvis-ml-pipeline";
 const DEFAULT_PIPELINE_REPO_REF: &str = "main";
@@ -101,6 +102,8 @@ struct RunSummary {
     created_at: String,
     status: String,
     run_dir: String,
+    canonical_id: Option<String>,
+    template_id: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -3705,6 +3708,9 @@ fn parse_status_from_result(path: &Path) -> String {
 }
 
 fn parse_pipeline_run_status(path: &Path) -> String {
+    if !path.exists() {
+        return "missing_result".to_string();
+    }
     let text = match fs::read_to_string(path) {
         Ok(v) => v,
         Err(_) => return "unknown".to_string(),
@@ -3714,14 +3720,77 @@ fn parse_pipeline_run_status(path: &Path) -> String {
         Err(_) => return "unknown".to_string(),
     };
 
+    if let Some(status) = value.get("status").and_then(|v| v.as_str()) {
+        let normalized = status.trim().to_lowercase();
+        if normalized == "ok"
+            || normalized == "success"
+            || normalized == "succeeded"
+            || normalized == "completed"
+        {
+            return "success".to_string();
+        }
+        if normalized == "needs_retry" || normalized.contains("retry") {
+            return "needs_retry".to_string();
+        }
+        if normalized == "failed"
+            || normalized == "error"
+            || normalized == "missing_dependency"
+            || normalized.contains("fail")
+            || normalized.contains("error")
+        {
+            return "failed".to_string();
+        }
+    }
+
     if let Some(ok) = value.get("ok").and_then(|v| v.as_bool()) {
         if ok {
-            return "ok".to_string();
+            return "success".to_string();
         }
         return "failed".to_string();
     }
 
     "unknown".to_string()
+}
+
+fn parse_pipeline_run_metadata(path: &Path) -> (Option<String>, Option<String>) {
+    let text = match fs::read_to_string(path) {
+        Ok(v) => v,
+        Err(_) => return (None, None),
+    };
+    let value: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(_) => return (None, None),
+    };
+
+    let mut canonical_id = value
+        .get("desktop")
+        .and_then(|v| v.get("canonical_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if canonical_id.is_none() {
+        canonical_id = value
+            .get("canonical_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+    }
+
+    let mut template_id = value
+        .get("desktop")
+        .and_then(|v| v.get("template_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if template_id.is_none() {
+        template_id = value
+            .get("template_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+    }
+
+    (canonical_id, template_id)
 }
 
 fn parse_paper_id_from_input(path: &Path) -> String {
@@ -4479,8 +4548,39 @@ fn run_text_rel_path(kind: &str) -> Result<PathBuf, String> {
         "input" => Ok(PathBuf::from("input.json")),
         "result" => Ok(PathBuf::from("result.json")),
         "tree" => Ok(PathBuf::from("paper_graph").join("tree").join("tree.md")),
+        "report" => Ok(PathBuf::from("report.md")),
+        "warnings" => Ok(PathBuf::from("warnings.jsonl")),
+        "evidence" => Ok(PathBuf::from("evidence.jsonl")),
+        "claims" => Ok(PathBuf::from("claims.jsonl")),
+        "eval_summary" => Ok(PathBuf::from("eval_summary.json")),
+        "scores" => Ok(PathBuf::from("scores.json")),
+        "papers" => Ok(PathBuf::from("papers.jsonl")),
+        "run_config" => Ok(PathBuf::from("run_config.json")),
         _ => Err(format!("unsupported kind: {kind}")),
     }
+}
+
+fn read_run_text_preview(path: &Path, max_bytes: usize) -> Result<String, String> {
+    let file = fs::File::open(path)
+        .map_err(|e| format!("failed to open artifact {}: {e}", path.display()))?;
+    let mut buf = Vec::new();
+    file
+        .take((max_bytes as u64).saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("failed to read artifact {}: {e}", path.display()))?;
+
+    let truncated = buf.len() > max_bytes;
+    if truncated {
+        buf.truncate(max_bytes);
+    }
+    let mut out = String::from_utf8_lossy(&buf).to_string();
+    if truncated {
+        out.push_str(&format!(
+            "\n\n[truncated: preview limit {} bytes]",
+            max_bytes
+        ));
+    }
+    Ok(out)
 }
 
 fn list_pipeline_runs_internal(runtime: &RuntimeConfig, limit: Option<u32>) -> Result<Vec<RunSummary>, String> {
@@ -4526,12 +4626,15 @@ fn list_pipeline_runs_internal(runtime: &RuntimeConfig, limit: Option<u32>) -> R
             .map(to_iso_from_system_time)
             .unwrap_or_else(|| "".to_string());
         let ts = modified_epoch_ms(&canonical);
+        let (canonical_id, template_id) = parse_pipeline_run_metadata(&canonical.join("input.json"));
         rows.push((
             RunSummary {
                 run_id,
                 created_at,
                 status: parse_pipeline_run_status(&canonical.join("result.json")),
                 run_dir: canonical.to_string_lossy().to_string(),
+                canonical_id,
+                template_id,
             },
             ts,
         ));
@@ -4561,8 +4664,7 @@ fn read_run_text_internal(runtime: &RuntimeConfig, run_id: &str, kind: &str) -> 
             canonical.display()
         ));
     }
-    fs::read_to_string(&canonical)
-        .map_err(|e| format!("failed to read artifact {}: {e}", canonical.display()))
+    read_run_text_preview(&canonical, MAX_RUN_TEXT_PREVIEW_BYTES)
 }
 
 #[tauri::command]
@@ -8718,6 +8820,9 @@ mod tests {
         assert!(validate_pipeline_run_id_component("../abc").is_err());
         assert!(validate_pipeline_run_id_component("abc/def").is_err());
         assert!(validate_pipeline_run_id_component("abc\\def").is_err());
+        assert!(validate_pipeline_run_id_component("abc:def").is_err());
+        assert!(validate_pipeline_run_id_component(" abc").is_err());
+        assert!(validate_pipeline_run_id_component("abc ").is_err());
     }
 
     #[test]
@@ -8757,7 +8862,10 @@ mod tests {
         let run_id = "20260218_121500_deadbeef";
         let run_dir = runtime.pipeline_root.join("logs").join("runs").join(run_id);
         let _ = fs::create_dir_all(run_dir.join("paper_graph").join("tree"));
-        fs::write(run_dir.join("input.json"), "{\n  \"paper_id\": \"arxiv:1706.03762\"\n}\n")
+        fs::write(
+            run_dir.join("input.json"),
+            "{\n  \"desktop\": {\"canonical_id\": \"arxiv:1706.03762\", \"template_id\": \"TEMPLATE_TREE\"}\n}\n",
+        )
             .expect("write input");
         fs::write(run_dir.join("result.json"), r#"{"ok":true}"#).expect("write result");
         fs::write(
@@ -8767,10 +8875,48 @@ mod tests {
         .expect("write tree");
 
         let rows = list_pipeline_runs_internal(&runtime, Some(50)).expect("list pipeline runs");
-        assert!(rows.iter().any(|r| r.run_id == run_id));
+        let row = rows.iter().find(|r| r.run_id == run_id).expect("run row not found");
+        assert_eq!(row.status, "success");
+        assert_eq!(row.canonical_id.as_deref(), Some("arxiv:1706.03762"));
+        assert_eq!(row.template_id.as_deref(), Some("TEMPLATE_TREE"));
 
         let content = read_run_text_internal(&runtime, run_id, "input").expect("read input");
         assert!(content.contains("arxiv:1706.03762"));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pipeline_run_status_extraction_covers_expected_states() {
+        let base = std::env::temp_dir().join(format!("jarvis_run_status_{}", now_epoch_ms()));
+        let _ = fs::create_dir_all(&base);
+
+        let missing = base.join("missing_result.json");
+        assert_eq!(parse_pipeline_run_status(&missing), "missing_result");
+
+        let invalid = base.join("invalid_result.json");
+        fs::write(&invalid, "not json").expect("write invalid");
+        assert_eq!(parse_pipeline_run_status(&invalid), "unknown");
+
+        let success_status = base.join("success_status.json");
+        fs::write(&success_status, r#"{"status":"succeeded"}"#).expect("write success status");
+        assert_eq!(parse_pipeline_run_status(&success_status), "success");
+
+        let retry_status = base.join("retry_status.json");
+        fs::write(&retry_status, r#"{"status":"needs_retry"}"#).expect("write retry status");
+        assert_eq!(parse_pipeline_run_status(&retry_status), "needs_retry");
+
+        let failed_status = base.join("failed_status.json");
+        fs::write(&failed_status, r#"{"status":"failed"}"#).expect("write failed status");
+        assert_eq!(parse_pipeline_run_status(&failed_status), "failed");
+
+        let success_ok = base.join("success_ok.json");
+        fs::write(&success_ok, r#"{"ok":true}"#).expect("write success ok");
+        assert_eq!(parse_pipeline_run_status(&success_ok), "success");
+
+        let failed_ok = base.join("failed_ok.json");
+        fs::write(&failed_ok, r#"{"ok":false}"#).expect("write failed ok");
+        assert_eq!(parse_pipeline_run_status(&failed_ok), "failed");
 
         let _ = fs::remove_dir_all(&base);
     }

@@ -162,6 +162,29 @@ function pathFromScreen(screen) {
   return "/";
 }
 
+const PIPELINE_RUN_ARTIFACT_OPTIONS = [
+  { kind: "input", label: "input.json" },
+  { kind: "result", label: "result.json" },
+  { kind: "tree", label: "paper_graph/tree/tree.md" },
+  { kind: "report", label: "report.md" },
+  { kind: "warnings", label: "warnings.jsonl" },
+  { kind: "evidence", label: "evidence.jsonl" },
+  { kind: "claims", label: "claims.jsonl" },
+  { kind: "eval_summary", label: "eval_summary.json" },
+  { kind: "scores", label: "scores.json" },
+  { kind: "papers", label: "papers.jsonl" },
+  { kind: "run_config", label: "run_config.json" },
+];
+
+function pipelineRunStatusColor(status) {
+  const key = String(status ?? "").toLowerCase();
+  if (key === "success") return "#1f6f3f";
+  if (key === "needs_retry") return "#8a4200";
+  if (key === "failed") return "#a33";
+  if (key === "missing_result") return "#555";
+  return "#666";
+}
+
 export default function App() {
   const [paperId, setPaperId] = useState("arxiv:1706.03762");
   const [templates, setTemplates] = useState([]);
@@ -282,6 +305,7 @@ export default function App() {
   const [pipelineRunsError, setPipelineRunsError] = useState("");
   const [selectedPipelineRunId, setSelectedPipelineRunId] = useState("");
   const [pipelineRunTab, setPipelineRunTab] = useState("input");
+  const [pipelineRunQuery, setPipelineRunQuery] = useState("");
   const [pipelineRunText, setPipelineRunText] = useState("");
   const [pipelineRunTextLoading, setPipelineRunTextLoading] = useState(false);
   const [pipelineRunTextError, setPipelineRunTextError] = useState("");
@@ -398,8 +422,13 @@ export default function App() {
       const text = await invoke("read_run_text", { runId, kind });
       setPipelineRunText(String(text ?? ""));
     } catch (e) {
+      const msg = String(e ?? "");
       setPipelineRunText("");
-      setPipelineRunTextError(String(e));
+      if (msg.toLowerCase().includes("does not exist") || msg.toLowerCase().includes("not found")) {
+        setPipelineRunTextError("存在しない");
+      } else {
+        setPipelineRunTextError(msg);
+      }
     } finally {
       setPipelineRunTextLoading(false);
     }
@@ -1522,6 +1551,13 @@ export default function App() {
   const runDisabled = running || !canRunByNormalization || !canRunByPreflight || !canRunByTemplate;
 
   const showRetryButton = status === "needs_retry" && !!lastRunRequest;
+  const pipelineRunQueryNormalized = String(pipelineRunQuery ?? "").trim().toLowerCase();
+  const visiblePipelineRuns = pipelineRunQueryNormalized
+    ? pipelineRuns.filter((row) => {
+      const hay = `${row?.run_id ?? ""} ${row?.canonical_id ?? ""} ${row?.template_id ?? ""}`.toLowerCase();
+      return hay.includes(pipelineRunQueryNormalized);
+    })
+    : pipelineRuns;
   const selectedRun = runs.find((r) => r.run_id === selectedRunId) ?? null;
   const selectedPipelineRun = pipelineRuns.find((r) => r.run_id === selectedPipelineRunId) ?? null;
   const artifactIsMissing = artifactView && artifactView.exists === false;
@@ -2881,21 +2917,29 @@ export default function App() {
       ) : activeScreen === "runs" ? (
       <div>
         <h3 style={{ marginTop: 0, marginBottom: 8 }}>Run Explorer</h3>
-        <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
-          <button
-            onClick={loadPipelineRuns}
-            disabled={pipelineRunsLoading}
-            style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
-          >
-            {pipelineRunsLoading ? "Refreshing..." : "Refresh runs"}
-          </button>
-          <button
-            onClick={() => onOpenPipelineRunDir(selectedPipelineRunId)}
-            disabled={!selectedPipelineRunId}
-            style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
-          >
-            Open selected folder
-          </button>
+        <div style={{ display: "grid", gap: 8, marginBottom: 10 }}>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button
+              onClick={loadPipelineRuns}
+              disabled={pipelineRunsLoading}
+              style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+            >
+              {pipelineRunsLoading ? "Refreshing..." : "Refresh runs"}
+            </button>
+            <button
+              onClick={() => onOpenPipelineRunDir(selectedPipelineRunId)}
+              disabled={!selectedPipelineRunId}
+              style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+            >
+              Open selected folder
+            </button>
+          </div>
+          <input
+            value={pipelineRunQuery}
+            onChange={(e) => setPipelineRunQuery(e.target.value)}
+            placeholder="Search runs (run_id / canonical_id / template_id)"
+            style={{ padding: "8px 10px", borderRadius: 8, border: "1px solid #ccc", maxWidth: 520 }}
+          />
         </div>
 
         {pipelineRunsError ? (
@@ -2904,10 +2948,14 @@ export default function App() {
 
         <div style={{ display: "grid", gridTemplateColumns: "1fr 2fr", gap: 12 }}>
           <div style={{ border: "1px solid #ddd", borderRadius: 8, maxHeight: 440, overflow: "auto" }}>
-            {pipelineRuns.length === 0 ? (
-              <div style={{ padding: 10, fontSize: 12, opacity: 0.8 }}>No runs found under pipeline_root/logs/runs.</div>
+            {visiblePipelineRuns.length === 0 ? (
+              <div style={{ padding: 10, fontSize: 12, opacity: 0.8 }}>
+                {pipelineRuns.length === 0
+                  ? "No runs found under pipeline_root/logs/runs."
+                  : "No runs matched the search query."}
+              </div>
             ) : (
-              pipelineRuns.map((row) => (
+              visiblePipelineRuns.map((row) => (
                 <div
                   key={row.run_id}
                   onClick={() => setSelectedPipelineRunId(row.run_id)}
@@ -2921,8 +2969,25 @@ export default function App() {
                   <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
                     <div style={{ minWidth: 0 }}>
                       <div style={{ fontSize: 12, fontWeight: 600 }}>{row.run_id}</div>
+                      <div style={{ fontSize: 11, opacity: 0.82 }}>canonical_id={row.canonical_id ?? "-"}</div>
+                      <div style={{ fontSize: 11, opacity: 0.82 }}>template_id={row.template_id ?? "-"}</div>
                       <div style={{ fontSize: 11, opacity: 0.82 }}>created_at={row.created_at || "-"}</div>
-                      <div style={{ fontSize: 11, opacity: 0.82 }}>status={row.status}</div>
+                      <div style={{ marginTop: 4 }}>
+                        <span
+                          style={{
+                            display: "inline-block",
+                            padding: "2px 6px",
+                            borderRadius: 999,
+                            border: `1px solid ${pipelineRunStatusColor(row.status)}`,
+                            color: pipelineRunStatusColor(row.status),
+                            fontSize: 11,
+                            fontWeight: 600,
+                            background: "#fff",
+                          }}
+                        >
+                          {row.status ?? "unknown"}
+                        </span>
+                      </div>
                     </div>
                     <button
                       onClick={(e) => {
@@ -2941,46 +3006,21 @@ export default function App() {
 
           <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: 10 }}>
             <div style={{ fontSize: 12, marginBottom: 6 }}>run_id: <code>{selectedPipelineRun?.run_id ?? "-"}</code></div>
+            <div style={{ fontSize: 12, marginBottom: 6 }}>canonical_id: <code>{selectedPipelineRun?.canonical_id ?? "-"}</code></div>
+            <div style={{ fontSize: 12, marginBottom: 6 }}>template_id: <code>{selectedPipelineRun?.template_id ?? "-"}</code></div>
             <div style={{ fontSize: 12, marginBottom: 6 }}>created_at: <code>{selectedPipelineRun?.created_at ?? "-"}</code></div>
             <div style={{ fontSize: 12, marginBottom: 10 }}>status: <code>{selectedPipelineRun?.status ?? "unknown"}</code></div>
 
-            <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
-              <button
-                onClick={() => setPipelineRunTab("input")}
-                style={{
-                  padding: "6px 10px",
-                  borderRadius: 6,
-                  border: "1px solid #333",
-                  background: pipelineRunTab === "input" ? "#eef5ff" : "white",
-                  fontSize: 12,
-                }}
+            <div style={{ marginBottom: 8 }}>
+              <select
+                value={pipelineRunTab}
+                onChange={(e) => setPipelineRunTab(e.target.value)}
+                style={{ padding: 8, borderRadius: 6, border: "1px solid #ccc", minWidth: 320 }}
               >
-                input.json
-              </button>
-              <button
-                onClick={() => setPipelineRunTab("result")}
-                style={{
-                  padding: "6px 10px",
-                  borderRadius: 6,
-                  border: "1px solid #333",
-                  background: pipelineRunTab === "result" ? "#eef5ff" : "white",
-                  fontSize: 12,
-                }}
-              >
-                result.json
-              </button>
-              <button
-                onClick={() => setPipelineRunTab("tree")}
-                style={{
-                  padding: "6px 10px",
-                  borderRadius: 6,
-                  border: "1px solid #333",
-                  background: pipelineRunTab === "tree" ? "#eef5ff" : "white",
-                  fontSize: 12,
-                }}
-              >
-                tree.md
-              </button>
+                {PIPELINE_RUN_ARTIFACT_OPTIONS.map((opt) => (
+                  <option key={opt.kind} value={opt.kind}>{opt.label}</option>
+                ))}
+              </select>
             </div>
 
             {pipelineRunTextLoading ? <div style={{ fontSize: 12, marginBottom: 8 }}>Loading preview...</div> : null}
