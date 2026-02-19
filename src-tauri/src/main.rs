@@ -21,6 +21,8 @@ const DIAG_MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
 const DIAG_MAX_TOTAL_BYTES: u64 = 30 * 1024 * 1024;
 const DIAG_AUDIT_TAIL_LINES: usize = 200;
 const DIAG_MAX_RECENT_ITEMS: usize = 20;
+const PIPELINE_BOOTSTRAP_REPO_URL: &str = "https://github.com/kaneko-ai/jarvis-ml-pipeline.git";
+const PIPELINE_BOOTSTRAP_DIR_NAME: &str = "jarvis-ml-pipeline";
 
 #[derive(Serialize)]
 struct RunResult {
@@ -81,6 +83,17 @@ struct RuntimeConfigView {
     s2_min_interval_ms: Option<u64>,
     s2_max_retries: Option<u32>,
     s2_backoff_base_sec: Option<f64>,
+}
+
+#[derive(Serialize)]
+struct PipelineBootstrapResult {
+    ok: bool,
+    action: String,
+    message: String,
+    pipeline_root: String,
+    config_file_path: String,
+    stdout: String,
+    stderr: String,
 }
 
 #[derive(Serialize)]
@@ -2429,6 +2442,132 @@ fn validate_out_dir_writable(path: &Path) -> Result<PathBuf, String> {
     f.write_all(b"ok")
         .map_err(|e| format!("out_dir is not writable (write probe failed): {}: {e}", canonical.display()))?;
     let _ = fs::remove_file(&probe);
+    Ok(canonical)
+}
+
+fn resolve_existing_dir_input(raw: &str, base: &Path, rule_prefix: &str) -> Result<PathBuf, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{rule_prefix}_EMPTY: path is empty"));
+    }
+    if has_disallowed_windows_prefix(trimmed) {
+        return Err(format!(
+            "{rule_prefix}_DISALLOWED_PREFIX: UNC/device-prefixed path is not allowed"
+        ));
+    }
+    let candidate = PathBuf::from(trimmed);
+    let absolute = if candidate.is_absolute() {
+        candidate
+    } else {
+        absolutize(&candidate, base)
+    };
+    canonicalize_existing_dir(&absolute, &format!("{rule_prefix}_INVALID"))
+}
+
+fn normalize_remote_url(raw: &str) -> String {
+    let mut s = raw.trim().to_ascii_lowercase();
+    if let Some(rest) = s.strip_prefix("git@github.com:") {
+        s = format!("https://github.com/{rest}");
+    }
+    while s.ends_with('/') {
+        s.pop();
+    }
+    if let Some(stripped) = s.strip_suffix(".git") {
+        return stripped.to_string();
+    }
+    s
+}
+
+fn is_allowed_pipeline_remote(raw: &str) -> bool {
+    normalize_remote_url(raw) == normalize_remote_url(PIPELINE_BOOTSTRAP_REPO_URL)
+}
+
+fn build_git_clone_args(target: &Path) -> Vec<String> {
+    vec![
+        "clone".to_string(),
+        "--depth".to_string(),
+        "1".to_string(),
+        PIPELINE_BOOTSTRAP_REPO_URL.to_string(),
+        target.to_string_lossy().to_string(),
+    ]
+}
+
+fn build_git_pull_args(pipeline_root: &Path) -> Vec<String> {
+    vec![
+        "-C".to_string(),
+        pipeline_root.to_string_lossy().to_string(),
+        "pull".to_string(),
+        "--ff-only".to_string(),
+    ]
+}
+
+fn build_git_remote_get_url_args(pipeline_root: &Path) -> Vec<String> {
+    vec![
+        "-C".to_string(),
+        pipeline_root.to_string_lossy().to_string(),
+        "remote".to_string(),
+        "get-url".to_string(),
+        "origin".to_string(),
+    ]
+}
+
+fn run_git_capture(args: &[String]) -> Result<(String, String), String> {
+    let out = Command::new("git")
+        .args(args)
+        .output()
+        .map_err(|e| format!("failed to run git command {:?}: {e}", args))?;
+
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+
+    if out.status.success() {
+        Ok((stdout, stderr))
+    } else {
+        Err(format!(
+            "git command failed (exit={}): {}",
+            out.status.code().unwrap_or(-1),
+            if !stderr.is_empty() { stderr } else { stdout }
+        ))
+    }
+}
+
+fn write_pipeline_root_to_config(pipeline_root: &Path) -> Result<PathBuf, String> {
+    let canonical = validate_pipeline_root("selected", pipeline_root)?;
+    let cfg_path = config_file_path();
+
+    let mut root_obj = if cfg_path.exists() {
+        let raw = fs::read_to_string(&cfg_path)
+            .map_err(|e| format!("Failed to read config file {}: {e}", cfg_path.display()))?;
+        let parsed = serde_json::from_str::<serde_json::Value>(&raw)
+            .map_err(|e| format!("Invalid config JSON at {}: {e}", cfg_path.display()))?;
+        parsed
+            .as_object()
+            .cloned()
+            .ok_or_else(|| format!("Invalid config JSON at {}: root must be object", cfg_path.display()))?
+    } else {
+        serde_json::Map::new()
+    };
+
+    root_obj.insert(
+        "JARVIS_PIPELINE_ROOT".to_string(),
+        serde_json::Value::String(canonical.to_string_lossy().to_string()),
+    );
+    let out_dir_missing = root_obj
+        .get("JARVIS_PIPELINE_OUT_DIR")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().is_empty())
+        .unwrap_or(true);
+    if out_dir_missing {
+        root_obj.insert(
+            "JARVIS_PIPELINE_OUT_DIR".to_string(),
+            serde_json::Value::String("logs/runs".to_string()),
+        );
+    }
+
+    let pretty = serde_json::to_string_pretty(&serde_json::Value::Object(root_obj))
+        .map_err(|e| format!("failed to serialize config JSON: {e}"))?;
+    atomic_write_text(&cfg_path, &(pretty + "\n"))?;
+
     Ok(canonical)
 }
 
@@ -6992,6 +7131,93 @@ fn create_desktop_shortcut(dry_run: Option<bool>) -> DesktopShortcutResult {
 }
 
 #[tauri::command]
+fn select_pipeline_repo(pipeline_root: String) -> Result<PipelineBootstrapResult, String> {
+    let root = repo_root();
+    let candidate = resolve_existing_dir_input(&pipeline_root, &root, "RULE_SELECT_PIPELINE_ROOT")?;
+    let canonical = write_pipeline_root_to_config(&candidate)?;
+    Ok(PipelineBootstrapResult {
+        ok: true,
+        action: "select".to_string(),
+        message: "Selected existing pipeline root and updated config.".to_string(),
+        pipeline_root: canonical.to_string_lossy().to_string(),
+        config_file_path: config_file_path().to_string_lossy().to_string(),
+        stdout: "".to_string(),
+        stderr: "".to_string(),
+    })
+}
+
+#[tauri::command]
+fn bootstrap_pipeline_repo(parent_dir: Option<String>) -> Result<PipelineBootstrapResult, String> {
+    let root = repo_root();
+    let parent = if let Some(raw) = parent_dir.and_then(|v| non_empty_opt(Some(v.as_str()))) {
+        resolve_existing_dir_input(&raw, &root, "RULE_CLONE_PARENT")?
+    } else {
+        let default_parent = root.parent().unwrap_or(&root);
+        canonicalize_existing_dir(default_parent, "RULE_CLONE_PARENT_DEFAULT_INVALID")?
+    };
+
+    let target = parent.join(PIPELINE_BOOTSTRAP_DIR_NAME);
+    if target.exists() {
+        return Err(format!(
+            "RULE_CLONE_TARGET_EXISTS: target already exists: {}",
+            target.display()
+        ));
+    }
+
+    let clone_args = build_git_clone_args(&target);
+    let (stdout, stderr) = run_git_capture(&clone_args)?;
+    let canonical = write_pipeline_root_to_config(&target)?;
+
+    Ok(PipelineBootstrapResult {
+        ok: true,
+        action: "clone".to_string(),
+        message: "Cloned pipeline repository and updated config.".to_string(),
+        pipeline_root: canonical.to_string_lossy().to_string(),
+        config_file_path: config_file_path().to_string_lossy().to_string(),
+        stdout,
+        stderr,
+    })
+}
+
+#[tauri::command]
+fn update_pipeline_repo(pipeline_root: String) -> Result<PipelineBootstrapResult, String> {
+    let root = repo_root();
+    let candidate = resolve_existing_dir_input(&pipeline_root, &root, "RULE_UPDATE_PIPELINE_ROOT")?;
+    let canonical = validate_pipeline_root("update target", &candidate)?;
+
+    let remote_args = build_git_remote_get_url_args(&canonical);
+    let (remote_stdout, remote_stderr) = run_git_capture(&remote_args)?;
+    if !is_allowed_pipeline_remote(&remote_stdout) {
+        return Err(format!(
+            "RULE_UPDATE_REMOTE_MISMATCH: origin remote is not allowed ({})",
+            remote_stdout
+        ));
+    }
+
+    let pull_args = build_git_pull_args(&canonical);
+    let (pull_stdout, pull_stderr) = run_git_capture(&pull_args)?;
+    let applied = write_pipeline_root_to_config(&canonical)?;
+
+    let mut stderr_lines = Vec::new();
+    if !remote_stderr.is_empty() {
+        stderr_lines.push(remote_stderr);
+    }
+    if !pull_stderr.is_empty() {
+        stderr_lines.push(pull_stderr);
+    }
+
+    Ok(PipelineBootstrapResult {
+        ok: true,
+        action: "update".to_string(),
+        message: "Updated pipeline repository and refreshed config.".to_string(),
+        pipeline_root: applied.to_string_lossy().to_string(),
+        config_file_path: config_file_path().to_string_lossy().to_string(),
+        stdout: format!("origin={}\n{}", remote_stdout, pull_stdout),
+        stderr: stderr_lines.join("\n"),
+    })
+}
+
+#[tauri::command]
 fn open_desktop_folder() -> Result<String, String> {
     #[cfg(target_os = "windows")]
     {
@@ -7425,6 +7651,9 @@ fn main() {
             retry_pipeline_step,
             get_settings,
             update_settings,
+            select_pipeline_repo,
+            bootstrap_pipeline_repo,
+            update_pipeline_repo,
             create_desktop_shortcut,
             open_desktop_folder,
             open_audit_log,
@@ -7487,6 +7716,48 @@ mod tests {
 
         let selected = first_from_precedence(None, None, Some("C:/auto"));
         assert_eq!(selected.as_deref(), Some("C:/auto"));
+    }
+
+    #[test]
+    fn remote_url_validation_accepts_only_fixed_repo() {
+        assert!(is_allowed_pipeline_remote(
+            "https://github.com/kaneko-ai/jarvis-ml-pipeline.git"
+        ));
+        assert!(is_allowed_pipeline_remote(
+            "git@github.com:kaneko-ai/jarvis-ml-pipeline.git"
+        ));
+        assert!(!is_allowed_pipeline_remote(
+            "https://github.com/kaneko-ai/jarvis-ml-pipeline-private.git"
+        ));
+    }
+
+    #[test]
+    fn git_command_args_are_fixed_and_safe() {
+        let target = PathBuf::from("C:/work/jarvis-ml-pipeline");
+        let clone = build_git_clone_args(&target);
+        assert_eq!(clone[0], "clone");
+        assert_eq!(clone[1], "--depth");
+        assert_eq!(clone[2], "1");
+        assert_eq!(clone[3], PIPELINE_BOOTSTRAP_REPO_URL);
+        assert_eq!(clone[4], "C:/work/jarvis-ml-pipeline");
+
+        let pull = build_git_pull_args(&target);
+        assert_eq!(pull, vec![
+            "-C".to_string(),
+            "C:/work/jarvis-ml-pipeline".to_string(),
+            "pull".to_string(),
+            "--ff-only".to_string(),
+        ]);
+    }
+
+    #[test]
+    fn resolve_existing_dir_input_rejects_escape_patterns() {
+        if cfg!(windows) {
+            let res = resolve_existing_dir_input(r"\\server\share", Path::new("C:/"), "RULE_TEST");
+            assert!(res.is_err());
+            let msg = res.err().unwrap_or_default();
+            assert!(msg.contains("RULE_TEST_DISALLOWED_PREFIX"));
+        }
     }
 
     #[test]

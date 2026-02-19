@@ -206,6 +206,11 @@ export default function App() {
   const [pipelineDetail, setPipelineDetail] = useState(null);
   const [pipelineDetailLoading, setPipelineDetailLoading] = useState(false);
   const [activeScreen, setActiveScreen] = useState("setup");
+  const [pipelineRootInput, setPipelineRootInput] = useState("");
+  const [cloneParentInput, setCloneParentInput] = useState("");
+  const [bootstrapBusy, setBootstrapBusy] = useState(false);
+  const [bootstrapStatus, setBootstrapStatus] = useState(null);
+  const [bootstrapError, setBootstrapError] = useState("");
   const [shortcutBusy, setShortcutBusy] = useState(false);
   const [shortcutStatus, setShortcutStatus] = useState(null);
   const [shortcutError, setShortcutError] = useState("");
@@ -425,6 +430,100 @@ export default function App() {
       return "PowerShell 実行に失敗しました。ExecutionPolicy やセキュリティ設定を確認してください。";
     }
     return text || "ショートカット作成に失敗しました。";
+  }
+
+  function parentDirOf(pathText) {
+    const raw = String(pathText ?? "").trim().replace(/[\\/]+$/, "");
+    if (!raw) return "";
+    const idx = Math.max(raw.lastIndexOf("\\"), raw.lastIndexOf("/"));
+    if (idx <= 0) return "";
+    return raw.slice(0, idx);
+  }
+
+  function formatBootstrapError(raw) {
+    const text = String(raw ?? "").trim();
+    if (!text) return "パイプライン初期化に失敗しました。";
+    if (text.includes("RULE_CLONE_TARGET_EXISTS")) {
+      return "Clone先フォルダが既に存在します。既存フォルダ選択またはUpdateを使ってください。";
+    }
+    if (text.includes("RULE_UPDATE_REMOTE_MISMATCH")) {
+      return "許可されたリポジトリ以外は更新できません。origin URLを確認してください。";
+    }
+    if (text.includes("DISALLOWED_PREFIX")) {
+      return "UNC/デバイス接頭辞付きパスは利用できません。通常のローカルパスを指定してください。";
+    }
+    return text;
+  }
+
+  async function refreshSetupState() {
+    await Promise.all([loadRuntimeConfig(true), loadPreflight(), loadRuns()]);
+  }
+
+  async function onSelectPipelineRepo() {
+    setBootstrapBusy(true);
+    setBootstrapError("");
+    setBootstrapStatus(null);
+    try {
+      const res = await invoke("select_pipeline_repo", {
+        pipelineRoot: pipelineRootInput,
+      });
+      setBootstrapStatus(res ?? null);
+      if (res?.pipeline_root) {
+        setPipelineRootInput(String(res.pipeline_root));
+        const parent = parentDirOf(res.pipeline_root);
+        if (parent) {
+          setCloneParentInput((prev) => (String(prev ?? "").trim() ? prev : parent));
+        }
+      }
+      await refreshSetupState();
+    } catch (e) {
+      setBootstrapError(formatBootstrapError(String(e)));
+    } finally {
+      setBootstrapBusy(false);
+    }
+  }
+
+  async function onClonePipelineRepo() {
+    setBootstrapBusy(true);
+    setBootstrapError("");
+    setBootstrapStatus(null);
+    try {
+      const parentDir = String(cloneParentInput ?? "").trim();
+      const res = await invoke("bootstrap_pipeline_repo", {
+        parentDir: parentDir || null,
+      });
+      setBootstrapStatus(res ?? null);
+      if (res?.pipeline_root) {
+        setPipelineRootInput(String(res.pipeline_root));
+        const parent = parentDirOf(res.pipeline_root);
+        if (parent) setCloneParentInput(parent);
+      }
+      await refreshSetupState();
+    } catch (e) {
+      setBootstrapError(formatBootstrapError(String(e)));
+    } finally {
+      setBootstrapBusy(false);
+    }
+  }
+
+  async function onUpdatePipelineRepo() {
+    setBootstrapBusy(true);
+    setBootstrapError("");
+    setBootstrapStatus(null);
+    try {
+      const res = await invoke("update_pipeline_repo", {
+        pipelineRoot: pipelineRootInput,
+      });
+      setBootstrapStatus(res ?? null);
+      if (res?.pipeline_root) {
+        setPipelineRootInput(String(res.pipeline_root));
+      }
+      await refreshSetupState();
+    } catch (e) {
+      setBootstrapError(formatBootstrapError(String(e)));
+    } finally {
+      setBootstrapBusy(false);
+    }
   }
 
   async function onCreateDesktopShortcut(dryRun = false) {
@@ -1231,6 +1330,17 @@ export default function App() {
   }, [artifactView?.kind, artifactView?.content]);
 
   useEffect(() => {
+    const current = String(runtimeCfg?.pipeline_root ?? "").trim();
+    if (current) {
+      setPipelineRootInput((prev) => (String(prev ?? "").trim() ? prev : current));
+      const parent = parentDirOf(current);
+      if (parent) {
+        setCloneParentInput((prev) => (String(prev ?? "").trim() ? prev : parent));
+      }
+    }
+  }, [runtimeCfg?.pipeline_root]);
+
+  useEffect(() => {
     const searchMode = String(librarySearchQuery ?? "").trim() !== "";
     const rows = Array.isArray(searchMode ? librarySearchRows : libraryRows)
       ? searchMode
@@ -1630,24 +1740,84 @@ export default function App() {
             preflight: <code>{preflight?.ok ? "ok" : "ng"}</code>
           </span>
         </div>
+        <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: 10, marginBottom: 10, background: "white" }}>
+          <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 8 }}>Pipeline bootstrap</div>
+          <div style={{ fontSize: 12, marginBottom: 6 }}>既存フォルダを使う / 既存Cloneを更新 / 固定URLからClone</div>
+          <div style={{ marginBottom: 8 }}>
+            <div style={{ fontSize: 12, marginBottom: 4 }}>Pipeline root (existing clone)</div>
+            <input
+              value={pipelineRootInput}
+              onChange={(e) => setPipelineRootInput(e.target.value)}
+              placeholder="C:\\Users\\<user>\\Documents\\jarvis-work\\jarvis-ml-pipeline"
+              style={{ width: "100%", padding: "8px 10px", borderRadius: 8, border: "1px solid #bbb", boxSizing: "border-box" }}
+            />
+            <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
+              <button
+                onClick={onSelectPipelineRepo}
+                disabled={bootstrapBusy}
+                style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+              >
+                Use existing folder
+              </button>
+              <button
+                onClick={onUpdatePipelineRepo}
+                disabled={bootstrapBusy}
+                style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+              >
+                Update pipeline
+              </button>
+            </div>
+          </div>
+          <div style={{ marginBottom: 8 }}>
+            <div style={{ fontSize: 12, marginBottom: 4 }}>Clone parent directory</div>
+            <input
+              value={cloneParentInput}
+              onChange={(e) => setCloneParentInput(e.target.value)}
+              placeholder="C:\\Users\\<user>\\Documents\\jarvis-work"
+              style={{ width: "100%", padding: "8px 10px", borderRadius: 8, border: "1px solid #bbb", boxSizing: "border-box" }}
+            />
+            <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
+              <button
+                onClick={onClonePipelineRepo}
+                disabled={bootstrapBusy}
+                style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+              >
+                Clone jarvis-ml-pipeline
+              </button>
+            </div>
+          </div>
+          {bootstrapBusy ? <div style={{ fontSize: 12 }}>Running pipeline bootstrap...</div> : null}
+          {bootstrapStatus?.ok ? (
+            <div style={{ fontSize: 12, color: "#1f6f3f", marginTop: 4 }}>
+              {bootstrapStatus.action}: {bootstrapStatus.message}
+              {bootstrapStatus.pipeline_root ? <div><code>{bootstrapStatus.pipeline_root}</code></div> : null}
+            </div>
+          ) : null}
+          {bootstrapStatus?.stdout ? (
+            <pre style={{ marginTop: 6, maxHeight: 120, overflow: "auto", background: "#f7f7f7", border: "1px solid #e1e1e1", borderRadius: 6, padding: 8, fontSize: 11 }}>
+              {bootstrapStatus.stdout}
+            </pre>
+          ) : null}
+          {bootstrapError ? <div style={{ fontSize: 12, color: "#a33", marginTop: 6 }}>{bootstrapError}</div> : null}
+        </div>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
           <button
             onClick={() => onCreateDesktopShortcut(false)}
-            disabled={shortcutBusy}
+            disabled={shortcutBusy || bootstrapBusy}
             style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
           >
             {shortcutBusy ? "Creating..." : "デスクトップにショートカットを作成"}
           </button>
           <button
             onClick={() => onCreateDesktopShortcut(true)}
-            disabled={shortcutBusy}
+            disabled={shortcutBusy || bootstrapBusy}
             style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
           >
             Dry-run
           </button>
           <button
             onClick={onOpenDesktopFolder}
-            disabled={shortcutBusy}
+            disabled={shortcutBusy || bootstrapBusy}
             style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
           >
             Open Desktop
