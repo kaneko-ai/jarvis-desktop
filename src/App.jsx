@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
 function escapeHtml(raw) {
   return String(raw ?? "")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/\"/g, "&quot;")
+    .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
 }
 
@@ -207,6 +208,7 @@ export default function App() {
   const [runtimeCfg, setRuntimeCfg] = useState(null);
   const [cfgLoading, setCfgLoading] = useState(false);
   const [cfgError, setCfgError] = useState("");
+  const [pipelineRootDraft, setPipelineRootDraft] = useState("");
   const [normalized, setNormalized] = useState(null);
   const [normalizeLoading, setNormalizeLoading] = useState(false);
   const [preflight, setPreflight] = useState(null);
@@ -1543,6 +1545,63 @@ export default function App() {
     }
   }
 
+  async function onSelectPipelineRootFolder() {
+    try {
+      const selected = await openDialog({
+        directory: true,
+        multiple: false,
+        title: "Select Pipeline Root",
+      });
+      if (typeof selected === "string") {
+        setPipelineRootDraft(selected);
+      }
+    } catch (e) {
+      setCfgError(String(e));
+    }
+  }
+
+  async function onApplyPipelineRootOverride() {
+    setCfgLoading(true);
+    setCfgError("");
+    try {
+      const res = await invoke("set_config_pipeline_root", { pipeline_root: pipelineRootDraft });
+      setRuntimeCfg(res);
+      if (!res?.ok) {
+        setCfgError(res?.message || "Failed to set pipeline root");
+      } else {
+        await loadPreflight();
+        await loadRuns();
+      }
+    } catch (e) {
+      setCfgError(String(e));
+    } finally {
+      setCfgLoading(false);
+    }
+  }
+
+  async function onClearPipelineRootOverride() {
+    setCfgLoading(true);
+    setCfgError("");
+    try {
+      const res = await invoke("clear_config_pipeline_root");
+      setRuntimeCfg(res);
+      if (!res?.ok) {
+        setCfgError(res?.message || "Failed to clear pipeline root");
+      } else {
+        await loadPreflight();
+        await loadRuns();
+      }
+    } catch (e) {
+      setCfgError(String(e));
+    } finally {
+      setCfgLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    setPipelineRootDraft(runtimeCfg?.pipeline_root ?? "");
+  }, [runtimeCfg?.pipeline_root]);
+
   const normalizeErrors = Array.isArray(normalized?.errors) ? normalized.errors : [];
   const normalizeWarnings = Array.isArray(normalized?.warnings) ? normalized.warnings : [];
   const canRunByNormalization = normalizeErrors.length === 0 && !!normalized?.canonical;
@@ -1924,6 +1983,38 @@ export default function App() {
         </div>
         <div style={{ fontSize: 12, opacity: 0.9 }}>
           out_dir: <code>{runtimeCfg?.out_dir ?? "-"}</code>
+        </div>
+        <div style={{ marginTop: 10, fontSize: 12, fontWeight: 600 }}>
+          Pipeline root override (config.json)
+        </div>
+        <div style={{ marginTop: 6, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <input
+            value={pipelineRootDraft}
+            onChange={(e) => setPipelineRootDraft(e.target.value)}
+            placeholder="C:\\path\\to\\jarvis-ml-pipeline"
+            style={{ padding: 8, borderRadius: 8, border: "1px solid #ccc", minWidth: 380, flex: 1 }}
+          />
+          <button
+            onClick={onSelectPipelineRootFolder}
+            disabled={cfgLoading}
+            style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+          >
+            Select folder...
+          </button>
+          <button
+            onClick={onApplyPipelineRootOverride}
+            disabled={cfgLoading}
+            style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+          >
+            Apply
+          </button>
+          <button
+            onClick={onClearPipelineRootOverride}
+            disabled={cfgLoading}
+            style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+          >
+            Clear
+          </button>
         </div>
         <div style={{ fontSize: 12, marginTop: 4 }}>
           Config validation:{" "}

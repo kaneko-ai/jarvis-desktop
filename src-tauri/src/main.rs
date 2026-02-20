@@ -2437,6 +2437,30 @@ fn read_desktop_config_file(path: &Path) -> Result<Option<DesktopConfigFile>, St
     Ok(Some(cfg))
 }
 
+fn read_config_json_root(path: &Path) -> Result<Option<serde_json::Map<String, serde_json::Value>>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read config file {}: {e}", path.display()))?;
+    let value = serde_json::from_str::<serde_json::Value>(&text)
+        .map_err(|e| format!("Invalid config JSON at {}: {e}", path.display()))?;
+
+    let obj = value
+        .as_object()
+        .ok_or_else(|| format!("Invalid config JSON at {}: root must be an object", path.display()))?;
+
+    Ok(Some(obj.clone()))
+}
+
+fn write_config_json_root(path: &Path, obj: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+    let value = serde_json::Value::Object(obj.clone());
+    let text = serde_json::to_string_pretty(&value)
+        .map_err(|e| format!("Failed to serialize config file {}: {e}", path.display()))?;
+    atomic_write_text(path, &text)
+}
+
 fn validate_pipeline_root(source: &str, path: &Path) -> Result<PathBuf, String> {
     if is_pipeline_root(path) {
         return Ok(canonical_or_self(path));
@@ -2465,9 +2489,8 @@ fn validate_out_dir_writable(path: &Path) -> Result<PathBuf, String> {
     Ok(canonical)
 }
 
-fn resolve_runtime_config(repo_root: &Path) -> Result<RuntimeConfig, String> {
-    let cfg_path = config_file_path();
-    let file_cfg_opt = read_desktop_config_file(&cfg_path)?;
+fn resolve_runtime_config_with_config_path(repo_root: &Path, cfg_path: &Path) -> Result<RuntimeConfig, String> {
+    let file_cfg_opt = read_desktop_config_file(cfg_path)?;
     let file_cfg = file_cfg_opt.clone().unwrap_or_default();
     let env_cfg = load_env_config()?;
 
@@ -2512,7 +2535,7 @@ fn resolve_runtime_config(repo_root: &Path) -> Result<RuntimeConfig, String> {
     let s2_backoff_base_sec = file_cfg.S2_BACKOFF_BASE_SEC.or(env_cfg.s2_backoff_base_sec);
 
     Ok(RuntimeConfig {
-        config_file_path: cfg_path,
+        config_file_path: cfg_path.to_path_buf(),
         config_file_loaded: file_cfg_opt.is_some(),
         pipeline_root,
         out_base_dir: out_abs,
@@ -2521,6 +2544,11 @@ fn resolve_runtime_config(repo_root: &Path) -> Result<RuntimeConfig, String> {
         s2_max_retries,
         s2_backoff_base_sec,
     })
+}
+
+fn resolve_runtime_config(repo_root: &Path) -> Result<RuntimeConfig, String> {
+    let cfg_path = config_file_path();
+    resolve_runtime_config_with_config_path(repo_root, &cfg_path)
 }
 
 fn runtime_config_view_from_result(result: Result<RuntimeConfig, String>) -> RuntimeConfigView {
@@ -8058,6 +8086,67 @@ fn create_config_if_missing() -> Result<String, String> {
     Ok(path.to_string_lossy().to_string())
 }
 
+#[tauri::command]
+fn set_config_pipeline_root(pipeline_root: String) -> RuntimeConfigView {
+    let root = repo_root();
+    let trimmed = pipeline_root.trim();
+    if trimmed.is_empty() {
+        return runtime_config_view_from_result(Err("selected pipeline root is empty".to_string()));
+    }
+
+    let candidate = PathBuf::from(trimmed);
+    let candidate_abs = absolutize(&candidate, &root);
+    let validated = match validate_pipeline_root("selected", &candidate_abs) {
+        Ok(v) => v,
+        Err(e) => return runtime_config_view_from_result(Err(e)),
+    };
+
+    let cfg_path = config_file_path();
+    if let Err(e) = ensure_config_file_template(&cfg_path) {
+        return runtime_config_view_from_result(Err(e));
+    }
+
+    let mut obj = match read_config_json_root(&cfg_path) {
+        Ok(Some(v)) => v,
+        Ok(None) => serde_json::Map::new(),
+        Err(e) => return runtime_config_view_from_result(Err(e)),
+    };
+
+    obj.insert(
+        "JARVIS_PIPELINE_ROOT".to_string(),
+        serde_json::Value::String(validated.to_string_lossy().to_string()),
+    );
+
+    if let Err(e) = write_config_json_root(&cfg_path, &obj) {
+        return runtime_config_view_from_result(Err(e));
+    }
+
+    runtime_config_view_from_result(resolve_runtime_config(&root))
+}
+
+#[tauri::command]
+fn clear_config_pipeline_root() -> RuntimeConfigView {
+    let root = repo_root();
+    let cfg_path = config_file_path();
+    if let Err(e) = ensure_config_file_template(&cfg_path) {
+        return runtime_config_view_from_result(Err(e));
+    }
+
+    let mut obj = match read_config_json_root(&cfg_path) {
+        Ok(Some(v)) => v,
+        Ok(None) => serde_json::Map::new(),
+        Err(e) => return runtime_config_view_from_result(Err(e)),
+    };
+
+    obj.remove("JARVIS_PIPELINE_ROOT");
+
+    if let Err(e) = write_config_json_root(&cfg_path, &obj) {
+        return runtime_config_view_from_result(Err(e));
+    }
+
+    runtime_config_view_from_result(resolve_runtime_config(&root))
+}
+
 fn resume_pipelines_if_possible() {
     let (runtime, _) = match runtime_and_jobs_path() {
         Ok(v) => v,
@@ -8179,7 +8268,9 @@ fn main() {
             get_runtime_config,
             reload_runtime_config,
             open_config_file_location,
-            create_config_if_missing
+            create_config_if_missing,
+            set_config_pipeline_root,
+            clear_config_pipeline_root
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -8200,6 +8291,41 @@ mod tests {
 
         let selected = first_from_precedence(None, None, Some("C:/auto"));
         assert_eq!(selected.as_deref(), Some("C:/auto"));
+    }
+
+    #[test]
+    fn resolve_runtime_config_prefers_config_file_pipeline_root() {
+        let base = std::env::temp_dir().join(format!("jarvis_cfg_precedence_{}", now_epoch_ms()));
+        let _ = fs::create_dir_all(&base);
+
+        let pipeline_file = base.join("pipeline_file");
+        let pipeline_env = base.join("pipeline_env");
+
+        let _ = fs::create_dir_all(pipeline_file.join("jarvis_core"));
+        let _ = fs::create_dir_all(pipeline_env.join("jarvis_core"));
+        fs::write(pipeline_file.join("pyproject.toml"), "[tool.poetry]").expect("write file pyproject");
+        fs::write(pipeline_file.join("jarvis_cli.py"), "print('ok')").expect("write file cli");
+        fs::write(pipeline_env.join("pyproject.toml"), "[tool.poetry]").expect("write env pyproject");
+        fs::write(pipeline_env.join("jarvis_cli.py"), "print('ok')").expect("write env cli");
+
+        let config_path = base.join("config.json");
+        let config_text = format!(
+            "{{\n  \"JARVIS_PIPELINE_ROOT\": {}\n}}\n",
+            serde_json::to_string(&pipeline_file.to_string_lossy().to_string()).expect("serialize path")
+        );
+        fs::write(&config_path, config_text).expect("write config");
+
+        unsafe {
+            std::env::set_var("JARVIS_PIPELINE_ROOT", pipeline_env.to_string_lossy().to_string());
+        }
+
+        let resolved = resolve_runtime_config_with_config_path(&base, &config_path).expect("resolve runtime config");
+        assert_eq!(resolved.pipeline_root, canonical_or_self(&pipeline_file));
+
+        unsafe {
+            std::env::remove_var("JARVIS_PIPELINE_ROOT");
+        }
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
