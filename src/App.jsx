@@ -282,6 +282,7 @@ export default function App() {
   const [workspaceImportZipPath, setWorkspaceImportZipPath] = useState("");
   const [workspaceImportMode, setWorkspaceImportMode] = useState("merge");
   const [workspaceImportDryRun, setWorkspaceImportDryRun] = useState(false);
+  const [snapshotLoading, setSnapshotLoading] = useState(false);
   const [workspaceFixingRuntime, setWorkspaceFixingRuntime] = useState(false);
   const [workspaceFixRuntimeMessage, setWorkspaceFixRuntimeMessage] = useState("");
   const [workspaceLastImportId, setWorkspaceLastImportId] = useState("");
@@ -889,6 +890,15 @@ export default function App() {
     } catch (e) {
       alert(String(e));
     }
+  }
+
+  async function onRefreshRuntimeSnapshot() {
+    setSnapshotLoading(true);
+    await loadRuntimeConfig(true);
+    await loadPreflight();
+    await loadPipelineRepoStatus();
+    await loadSettings();
+    setSnapshotLoading(false);
   }
 
   async function loadPipelineDetail(pipelineId) {
@@ -1734,6 +1744,11 @@ export default function App() {
   const normalizeWarnings = Array.isArray(normalized?.warnings) ? normalized.warnings : [];
   const canRunByNormalization = normalizeErrors.length === 0 && !!normalized?.canonical;
   const canRunByPreflight = preflight?.ok === true;
+  const preflightChecks = Array.isArray(preflight?.checks) ? preflight.checks : [];
+  const preflightPipelineRoot = preflightChecks.find((x) => x?.name === "pipeline_root");
+  const preflightOutDir = preflightChecks.find((x) => x?.name === "out_dir");
+  const preflightPython = preflightChecks.find((x) => x?.name === "python");
+  const preflightMarkers = preflightChecks.find((x) => x?.name === "pipeline_markers");
   const canRunByTemplate = !!selectedTemplate && selectedTemplate.wired === true;
   const runDisabled = running || !canRunByNormalization || !canRunByPreflight || !canRunByTemplate;
 
@@ -2343,6 +2358,89 @@ export default function App() {
               </details>
             ))
           : null}
+      </div>
+
+      <div
+        style={{
+          border: "1px solid #d2d2d2",
+          borderRadius: 10,
+          padding: 10,
+          marginTop: 10,
+          background: "#fafafa",
+        }}
+      >
+        <div style={{ fontWeight: 600, marginBottom: 8 }}>Runtime Snapshot</div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
+          <button
+            onClick={onRefreshRuntimeSnapshot}
+            disabled={snapshotLoading}
+            style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+          >
+            {snapshotLoading ? "Refreshing..." : "Refresh snapshot"}
+          </button>
+          <button
+            onClick={onOpenPipelineRepoFolder}
+            style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+          >
+            Open pipeline repo folder
+          </button>
+          <button
+            onClick={onOpenConfigLocation}
+            style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+          >
+            Open config file location
+          </button>
+          <button
+            disabled
+            title="No existing command to open out_dir directly"
+            style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #aaa", color: "#777" }}
+          >
+            Open out dir (N/A)
+          </button>
+        </div>
+
+        <div style={{ fontSize: 12, marginBottom: 4 }}>
+          runtime: pipeline_root=<code>{runtimeCfg?.pipeline_root ?? "-"}</code> / out_dir=<code>{runtimeCfg?.out_dir ?? "-"}</code>
+        </div>
+        <div style={{ fontSize: 12, marginBottom: 4 }}>
+          config: path=<code>{runtimeCfg?.config_file_path ?? "-"}</code> / loaded=<code>{runtimeCfg?.config_file_loaded ? "yes" : "no"}</code>
+        </div>
+        <div style={{ fontSize: 12, marginBottom: 4 }}>
+          preflight: pipeline_root=<code>{preflightPipelineRoot?.ok ? "ok" : "ng"}</code> / out_dir=<code>{preflightOutDir?.ok ? "ok" : "ng"}</code> / python=<code>{preflightPython?.ok ? "ok" : "ng"}</code> / markers=<code>{preflightMarkers?.ok ? "ok" : "ng"}</code>
+        </div>
+        <div style={{ fontSize: 12, marginBottom: 8 }}>
+          repo: local=<code>{pipelineRepoStatus?.local_path ?? "-"}</code> / remote=<code>{pipelineRepoStatus?.remote_url ?? "-"}</code> / ref=<code>{pipelineRepoStatus?.git_ref ?? "-"}</code> / last_sync=<code>{pipelineRepoStatus?.last_sync_at ?? "-"}</code> / dirty=<code>{pipelineRepoStatus?.dirty ? "yes" : "no"}</code>
+        </div>
+        <div style={{ fontSize: 12, marginBottom: 8 }}>
+          settings(auto-retry): enabled=<code>{desktopSettings?.auto_retry_enabled ? "yes" : "no"}</code> / max_job=<code>{desktopSettings?.auto_retry_max_per_job ?? "-"}</code> / max_pipeline=<code>{desktopSettings?.auto_retry_max_per_pipeline ?? "-"}</code> / base_delay=<code>{desktopSettings?.auto_retry_base_delay_seconds ?? "-"}</code> / max_delay=<code>{desktopSettings?.auto_retry_max_delay_seconds ?? "-"}</code>
+        </div>
+
+        <div style={{ display: "grid", gap: 8, gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))" }}>
+          <div style={{ border: "1px solid #e5e5e5", borderRadius: 6, padding: 6 }}>
+            <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 4 }}>runtimeCfg</div>
+            <pre style={{ margin: 0, maxHeight: 180, overflow: "auto", whiteSpace: "pre-wrap", wordBreak: "break-word", fontSize: 11 }}>
+{JSON.stringify(runtimeCfg ?? {}, null, 2)}
+            </pre>
+          </div>
+          <div style={{ border: "1px solid #e5e5e5", borderRadius: 6, padding: 6 }}>
+            <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 4 }}>preflight</div>
+            <pre style={{ margin: 0, maxHeight: 180, overflow: "auto", whiteSpace: "pre-wrap", wordBreak: "break-word", fontSize: 11 }}>
+{JSON.stringify(preflight ?? {}, null, 2)}
+            </pre>
+          </div>
+          <div style={{ border: "1px solid #e5e5e5", borderRadius: 6, padding: 6 }}>
+            <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 4 }}>pipelineRepoStatus</div>
+            <pre style={{ margin: 0, maxHeight: 180, overflow: "auto", whiteSpace: "pre-wrap", wordBreak: "break-word", fontSize: 11 }}>
+{JSON.stringify(pipelineRepoStatus ?? {}, null, 2)}
+            </pre>
+          </div>
+          <div style={{ border: "1px solid #e5e5e5", borderRadius: 6, padding: 6 }}>
+            <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 4 }}>desktopSettings</div>
+            <pre style={{ margin: 0, maxHeight: 180, overflow: "auto", whiteSpace: "pre-wrap", wordBreak: "break-word", fontSize: 11 }}>
+{JSON.stringify(desktopSettings ?? {}, null, 2)}
+            </pre>
+          </div>
+        </div>
       </div>
 
       <div style={{ display: "flex", gap: 10, marginTop: 14 }}>
