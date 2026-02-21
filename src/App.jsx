@@ -1894,6 +1894,47 @@ export default function App() {
   const preflightMarkers = preflightChecks.find((x) => x?.name === "pipeline_markers");
   const canRunByTemplate = !!selectedTemplate && selectedTemplate.wired === true;
   const runDisabled = running || !canRunByNormalization || !canRunByPreflight || !canRunByTemplate;
+  const templateRequiredFields = Array.isArray(selectedTemplate?.required_fields)
+    ? selectedTemplate.required_fields
+    : [];
+  const missingTemplateRequiredFields = templateRequiredFields.filter((key) => {
+    const value = templateParams?.[key];
+    if (value === null || value === undefined) return true;
+    if (typeof value === "string" && value.trim() === "") return true;
+    return false;
+  });
+  const runtimePipelineRootResolved = runtimeCfg?.ok === true
+    && String(runtimeCfg?.pipeline_root ?? "").trim() !== ""
+    && String(runtimeCfg?.pipeline_root ?? "").trim() !== "-";
+  const runtimeOutDirResolved = runtimeCfg?.ok === true
+    && String(runtimeCfg?.out_dir ?? "").trim() !== ""
+    && String(runtimeCfg?.out_dir ?? "").trim() !== "-";
+  const pipelineStartMissingRequirements = [];
+  if (!selectedTemplate || !selectedTemplateId) {
+    pipelineStartMissingRequirements.push("Template is not selected.");
+  } else if (selectedTemplate.wired !== true) {
+    pipelineStartMissingRequirements.push(`Selected template is not wired: ${selectedTemplate.id}`);
+  }
+  if (missingTemplateRequiredFields.length > 0) {
+    pipelineStartMissingRequirements.push(
+      `Missing template required fields: ${missingTemplateRequiredFields.join(", ")}`
+    );
+  }
+  if (!canRunByNormalization) {
+    pipelineStartMissingRequirements.push("Paper ID is not normalized to a canonical identifier.");
+  }
+  if (!runtimePipelineRootResolved) {
+    pipelineStartMissingRequirements.push("pipeline_root is unresolved.");
+  }
+  if (!runtimeOutDirResolved) {
+    pipelineStartMissingRequirements.push("out_dir is unresolved.");
+  }
+  if (preflightError) {
+    pipelineStartMissingRequirements.push(`preflight_check failed: ${preflightError}`);
+  } else if (preflight?.ok !== true) {
+    pipelineStartMissingRequirements.push("preflight_check is not OK.");
+  }
+  const pipelineStartDisabled = pipelineStartMissingRequirements.length > 0;
 
   const showRetryButton = status === "needs_retry" && !!lastRunRequest;
   const pipelineRunQueryNormalized = String(pipelineRunQuery ?? "").trim().toLowerCase();
@@ -2771,10 +2812,17 @@ export default function App() {
       <div style={{ display: "flex", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
         <button
           onClick={onRunAnalyzePipeline}
-          disabled={!canRunByNormalization || !canRunByPreflight}
+          disabled={pipelineStartDisabled}
           style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
         >
           Run Pipeline: Analyze Paper
+        </button>
+        <button
+          onClick={onFixRuntimeAfterImport}
+          disabled={workspaceFixingRuntime}
+          style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+        >
+          {workspaceFixingRuntime ? "Fixing runtime..." : "Fix runtime"}
         </button>
         <button
           onClick={loadPipelines}
@@ -2784,6 +2832,11 @@ export default function App() {
           {pipelinesLoading ? "Refreshing..." : "Refresh pipelines"}
         </button>
       </div>
+      {pipelineStartMissingRequirements.length > 0 ? (
+        <div style={{ color: "#a33", fontSize: 12, marginBottom: 8 }}>
+          Missing requirements: {pipelineStartMissingRequirements.join(" | ")}
+        </div>
+      ) : null}
       {pipelinesError ? <div style={{ color: "#a33", fontSize: 12, marginBottom: 8 }}>{pipelinesError}</div> : null}
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 2fr", gap: 12, marginBottom: 12 }}>
