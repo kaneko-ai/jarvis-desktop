@@ -767,6 +767,49 @@ struct TaskTemplateDef {
     wired: bool,
     disabled_reason: String,
     params: Vec<TemplateParamDef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    required_fields: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    params_schema: Option<serde_json::Value>,
+}
+
+fn build_template_params_schema(params: &[TemplateParamDef]) -> Option<serde_json::Value> {
+    if params.is_empty() {
+        return None;
+    }
+
+    let mut properties = serde_json::Map::new();
+    for p in params {
+        let mut def = serde_json::Map::new();
+        let json_type = if p.param_type == "integer" {
+            "integer"
+        } else {
+            "string"
+        };
+        def.insert("type".to_string(), serde_json::json!(json_type));
+        def.insert("title".to_string(), serde_json::json!(p.label));
+        def.insert("default".to_string(), p.default_value.clone());
+        if let Some(min) = p.min {
+            def.insert("minimum".to_string(), serde_json::json!(min));
+        }
+        if let Some(max) = p.max {
+            def.insert("maximum".to_string(), serde_json::json!(max));
+        }
+        properties.insert(p.key.clone(), serde_json::Value::Object(def));
+    }
+
+    Some(serde_json::json!({
+        "type": "object",
+        "properties": properties,
+        "additionalProperties": false
+    }))
+}
+
+fn enrich_template_schema(mut template: TaskTemplateDef) -> TaskTemplateDef {
+    if template.params_schema.is_none() {
+        template.params_schema = build_template_params_schema(&template.params);
+    }
+    template
 }
 
 fn template_registry() -> Vec<TaskTemplateDef> {
@@ -795,6 +838,8 @@ fn template_registry() -> Vec<TaskTemplateDef> {
                     max: Some(200),
                 },
             ],
+            required_fields: None,
+            params_schema: None,
         },
         TaskTemplateDef {
             id: "TEMPLATE_MAP".to_string(),
@@ -820,6 +865,8 @@ fn template_registry() -> Vec<TaskTemplateDef> {
                     max: Some(2_147_483_647),
                 },
             ],
+            required_fields: None,
+            params_schema: None,
         },
         TaskTemplateDef {
             id: "TEMPLATE_RELATED".to_string(),
@@ -845,6 +892,8 @@ fn template_registry() -> Vec<TaskTemplateDef> {
                     max: Some(200),
                 },
             ],
+            required_fields: None,
+            params_schema: None,
         },
         TaskTemplateDef {
             id: "TEMPLATE_GRAPH".to_string(),
@@ -870,6 +919,8 @@ fn template_registry() -> Vec<TaskTemplateDef> {
                     max: Some(2_147_483_647),
                 },
             ],
+            required_fields: None,
+            params_schema: None,
         },
         TaskTemplateDef {
             id: "TEMPLATE_SUMMARY".to_string(),
@@ -878,8 +929,13 @@ fn template_registry() -> Vec<TaskTemplateDef> {
             wired: false,
             disabled_reason: "not wired".to_string(),
             params: vec![],
+            required_fields: None,
+            params_schema: None,
         },
     ]
+    .into_iter()
+    .map(enrich_template_schema)
+    .collect()
 }
 
 fn find_template(id: &str) -> Option<TaskTemplateDef> {
@@ -9017,6 +9073,31 @@ mod tests {
             .find(|p| p.key == "max_per_level")
             .expect("max_per_level param missing");
         assert_eq!(max_per_level.default_value, serde_json::json!(50));
+    }
+
+    #[test]
+    fn list_task_templates_exposes_optional_schema_metadata() {
+        let templates = list_task_templates();
+        let tree = templates
+            .iter()
+            .find(|t| t.id == "TEMPLATE_TREE")
+            .expect("TEMPLATE_TREE missing");
+        assert!(tree.required_fields.is_none());
+        let schema = tree.params_schema.as_ref().expect("tree params_schema missing");
+        assert_eq!(schema.get("type"), Some(&serde_json::json!("object")));
+        let properties = schema
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .expect("properties missing");
+        assert!(properties.contains_key("depth"));
+        assert!(properties.contains_key("max_per_level"));
+
+        let summary = templates
+            .iter()
+            .find(|t| t.id == "TEMPLATE_SUMMARY")
+            .expect("TEMPLATE_SUMMARY missing");
+        assert!(summary.required_fields.is_none());
+        assert!(summary.params_schema.is_none());
     }
 
     #[test]
