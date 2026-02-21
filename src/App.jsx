@@ -209,6 +209,7 @@ export default function App() {
   const [cfgLoading, setCfgLoading] = useState(false);
   const [cfgError, setCfgError] = useState("");
   const [pipelineRootDraft, setPipelineRootDraft] = useState("");
+  const [outDirDraft, setOutDirDraft] = useState("");
   const [normalized, setNormalized] = useState(null);
   const [normalizeLoading, setNormalizeLoading] = useState(false);
   const [preflight, setPreflight] = useState(null);
@@ -1560,6 +1561,21 @@ export default function App() {
     }
   }
 
+  async function onSelectOutDirFolder() {
+    try {
+      const selected = await openDialog({
+        directory: true,
+        multiple: false,
+        title: "Select Out Dir",
+      });
+      if (typeof selected === "string") {
+        setOutDirDraft(selected);
+      }
+    } catch (e) {
+      setCfgError(String(e));
+    }
+  }
+
   async function onApplyPipelineRootOverride() {
     setCfgLoading(true);
     setCfgError("");
@@ -1598,9 +1614,51 @@ export default function App() {
     }
   }
 
+  async function onApplyOutDirOverride() {
+    setCfgLoading(true);
+    setCfgError("");
+    try {
+      const res = await invoke("set_config_out_dir", { out_dir: outDirDraft });
+      setRuntimeCfg(res);
+      if (!res?.ok) {
+        setCfgError(res?.message || "Failed to set out_dir");
+      } else {
+        await loadPreflight();
+        await loadRuns();
+      }
+    } catch (e) {
+      setCfgError(String(e));
+    } finally {
+      setCfgLoading(false);
+    }
+  }
+
+  async function onClearOutDirOverride() {
+    setCfgLoading(true);
+    setCfgError("");
+    try {
+      const res = await invoke("clear_config_out_dir");
+      setRuntimeCfg(res);
+      if (!res?.ok) {
+        setCfgError(res?.message || "Failed to clear out_dir");
+      } else {
+        await loadPreflight();
+        await loadRuns();
+      }
+    } catch (e) {
+      setCfgError(String(e));
+    } finally {
+      setCfgLoading(false);
+    }
+  }
+
   useEffect(() => {
     setPipelineRootDraft(runtimeCfg?.pipeline_root ?? "");
   }, [runtimeCfg?.pipeline_root]);
+
+  useEffect(() => {
+    setOutDirDraft(runtimeCfg?.out_dir ?? "");
+  }, [runtimeCfg?.out_dir]);
 
   const normalizeErrors = Array.isArray(normalized?.errors) ? normalized.errors : [];
   const normalizeWarnings = Array.isArray(normalized?.warnings) ? normalized.warnings : [];
@@ -2010,6 +2068,38 @@ export default function App() {
           </button>
           <button
             onClick={onClearPipelineRootOverride}
+            disabled={cfgLoading}
+            style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+          >
+            Clear
+          </button>
+        </div>
+        <div style={{ marginTop: 10, fontSize: 12, fontWeight: 600 }}>
+          Out dir override (config.json)
+        </div>
+        <div style={{ marginTop: 6, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <input
+            value={outDirDraft}
+            onChange={(e) => setOutDirDraft(e.target.value)}
+            placeholder="logs\\runs or C:\\path\\to\\runs"
+            style={{ padding: 8, borderRadius: 8, border: "1px solid #ccc", minWidth: 380, flex: 1 }}
+          />
+          <button
+            onClick={onSelectOutDirFolder}
+            disabled={cfgLoading}
+            style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+          >
+            Select folder...
+          </button>
+          <button
+            onClick={onApplyOutDirOverride}
+            disabled={cfgLoading}
+            style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+          >
+            Apply
+          </button>
+          <button
+            onClick={onClearOutDirOverride}
             disabled={cfgLoading}
             style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
           >

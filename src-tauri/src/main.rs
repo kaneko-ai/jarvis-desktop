@@ -8147,6 +8147,79 @@ fn clear_config_pipeline_root() -> RuntimeConfigView {
     runtime_config_view_from_result(resolve_runtime_config(&root))
 }
 
+#[tauri::command]
+fn set_config_out_dir(out_dir: String) -> RuntimeConfigView {
+    let root = repo_root();
+    let trimmed = out_dir.trim();
+    if trimmed.is_empty() {
+        return runtime_config_view_from_result(Err("selected out_dir is empty".to_string()));
+    }
+
+    let candidate = PathBuf::from(trimmed);
+    if candidate
+        .components()
+        .all(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir))
+    {
+        return runtime_config_view_from_result(Err("selected out_dir is invalid: path traversal only".to_string()));
+    }
+
+    let runtime = match resolve_runtime_config(&root) {
+        Ok(v) => v,
+        Err(e) => return runtime_config_view_from_result(Err(e)),
+    };
+
+    let candidate_abs = absolutize(&candidate, &runtime.pipeline_root);
+    let validated = match validate_out_dir_writable(&candidate_abs) {
+        Ok(v) => v,
+        Err(e) => return runtime_config_view_from_result(Err(e)),
+    };
+
+    let cfg_path = config_file_path();
+    if let Err(e) = ensure_config_file_template(&cfg_path) {
+        return runtime_config_view_from_result(Err(e));
+    }
+
+    let mut obj = match read_config_json_root(&cfg_path) {
+        Ok(Some(v)) => v,
+        Ok(None) => serde_json::Map::new(),
+        Err(e) => return runtime_config_view_from_result(Err(e)),
+    };
+
+    obj.insert(
+        "JARVIS_PIPELINE_OUT_DIR".to_string(),
+        serde_json::Value::String(validated.to_string_lossy().to_string()),
+    );
+
+    if let Err(e) = write_config_json_root(&cfg_path, &obj) {
+        return runtime_config_view_from_result(Err(e));
+    }
+
+    runtime_config_view_from_result(resolve_runtime_config(&root))
+}
+
+#[tauri::command]
+fn clear_config_out_dir() -> RuntimeConfigView {
+    let root = repo_root();
+    let cfg_path = config_file_path();
+    if let Err(e) = ensure_config_file_template(&cfg_path) {
+        return runtime_config_view_from_result(Err(e));
+    }
+
+    let mut obj = match read_config_json_root(&cfg_path) {
+        Ok(Some(v)) => v,
+        Ok(None) => serde_json::Map::new(),
+        Err(e) => return runtime_config_view_from_result(Err(e)),
+    };
+
+    obj.remove("JARVIS_PIPELINE_OUT_DIR");
+
+    if let Err(e) = write_config_json_root(&cfg_path, &obj) {
+        return runtime_config_view_from_result(Err(e));
+    }
+
+    runtime_config_view_from_result(resolve_runtime_config(&root))
+}
+
 fn resume_pipelines_if_possible() {
     let (runtime, _) = match runtime_and_jobs_path() {
         Ok(v) => v,
@@ -8270,7 +8343,9 @@ fn main() {
             open_config_file_location,
             create_config_if_missing,
             set_config_pipeline_root,
-            clear_config_pipeline_root
+            clear_config_pipeline_root,
+            set_config_out_dir,
+            clear_config_out_dir
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -8325,6 +8400,33 @@ mod tests {
         unsafe {
             std::env::remove_var("JARVIS_PIPELINE_ROOT");
         }
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn resolve_runtime_config_uses_config_file_out_dir() {
+        let base = std::env::temp_dir().join(format!("jarvis_cfg_out_dir_{}", now_epoch_ms()));
+        let _ = fs::create_dir_all(&base);
+
+        let pipeline_root = base.join("pipeline");
+        let out_dir_rel = "custom_runs";
+        let expected_out = pipeline_root.join(out_dir_rel);
+
+        let _ = fs::create_dir_all(pipeline_root.join("jarvis_core"));
+        fs::write(pipeline_root.join("pyproject.toml"), "[tool.poetry]").expect("write pyproject");
+        fs::write(pipeline_root.join("jarvis_cli.py"), "print('ok')").expect("write cli");
+
+        let config_path = base.join("config.json");
+        let config_text = format!(
+            "{{\n  \"JARVIS_PIPELINE_ROOT\": {},\n  \"JARVIS_PIPELINE_OUT_DIR\": {}\n}}\n",
+            serde_json::to_string(&pipeline_root.to_string_lossy().to_string()).expect("serialize root"),
+            serde_json::to_string(out_dir_rel).expect("serialize out dir")
+        );
+        fs::write(&config_path, config_text).expect("write config");
+
+        let resolved = resolve_runtime_config_with_config_path(&base, &config_path).expect("resolve runtime config");
+        assert_eq!(resolved.out_base_dir, canonical_or_self(&expected_out));
+
         let _ = fs::remove_dir_all(&base);
     }
 
