@@ -194,6 +194,8 @@ export default function App() {
   const [templatesError, setTemplatesError] = useState("");
   const [selectedTemplateId, setSelectedTemplateId] = useState("TEMPLATE_TREE");
   const [templateParams, setTemplateParams] = useState({});
+  const [templateParamsRawDraft, setTemplateParamsRawDraft] = useState("{}");
+  const [templateParamsRawError, setTemplateParamsRawError] = useState("");
 
   const [running, setRunning] = useState(false);
   const [stdout, setStdout] = useState("");
@@ -1564,6 +1566,8 @@ export default function App() {
   useEffect(() => {
     if (!selectedTemplate) {
       setTemplateParams({});
+      setTemplateParamsRawDraft("{}");
+      setTemplateParamsRawError("");
       return;
     }
     const defaults = {};
@@ -1571,7 +1575,29 @@ export default function App() {
       defaults[p.key] = p.default_value;
     }
     setTemplateParams(defaults);
+    setTemplateParamsRawDraft(JSON.stringify(defaults, null, 2));
+    setTemplateParamsRawError("");
   }, [selectedTemplateId, selectedTemplate?.id]);
+
+  function updateTemplateParams(next) {
+    setTemplateParams(next);
+    setTemplateParamsRawDraft(JSON.stringify(next, null, 2));
+    setTemplateParamsRawError("");
+  }
+
+  function onApplyTemplateParamsRaw() {
+    try {
+      const parsed = JSON.parse(String(templateParamsRawDraft ?? "{}"));
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("raw JSON must be an object");
+      }
+      setTemplateParams(parsed);
+      setTemplateParamsRawDraft(JSON.stringify(parsed, null, 2));
+      setTemplateParamsRawError("");
+    } catch (e) {
+      setTemplateParamsRawError(String(e));
+    }
+  }
 
   useEffect(() => {
     const timer = setTimeout(async () => {
@@ -1885,6 +1911,42 @@ export default function App() {
 
   const normalizeErrors = Array.isArray(normalized?.errors) ? normalized.errors : [];
   const normalizeWarnings = Array.isArray(normalized?.warnings) ? normalized.warnings : [];
+  const templateSchemaProperties = selectedTemplate?.params_schema
+    && typeof selectedTemplate.params_schema === "object"
+    && !Array.isArray(selectedTemplate.params_schema)
+    && selectedTemplate.params_schema.properties
+    && typeof selectedTemplate.params_schema.properties === "object"
+    && !Array.isArray(selectedTemplate.params_schema.properties)
+    ? selectedTemplate.params_schema.properties
+    : null;
+  const templateSchemaFieldEntries = templateSchemaProperties
+    ? Object.entries(templateSchemaProperties).map(([key, rawSpec]) => {
+      const spec = rawSpec && typeof rawSpec === "object" && !Array.isArray(rawSpec) ? rawSpec : {};
+      const enumValues = Array.isArray(spec.enum) ? spec.enum : null;
+      let fieldType = String(spec.type ?? "string");
+      if (enumValues && enumValues.length > 0) fieldType = "enum";
+      return {
+        key,
+        label: String(spec.title ?? key),
+        fieldType,
+        enumValues,
+        minimum: Number.isFinite(spec.minimum) ? spec.minimum : undefined,
+        maximum: Number.isFinite(spec.maximum) ? spec.maximum : undefined,
+      };
+    })
+    : [];
+  const templateLegacyFieldEntries = (selectedTemplate?.params ?? []).map((p) => ({
+    key: p.key,
+    label: p.label,
+    fieldType: p.param_type === "integer" ? "integer" : "string",
+    enumValues: null,
+    minimum: p.min ?? undefined,
+    maximum: p.max ?? undefined,
+  }));
+  const templateDynamicFields = templateSchemaFieldEntries.length > 0
+    ? templateSchemaFieldEntries
+    : templateLegacyFieldEntries;
+  const templateSchemaUnavailable = !templateSchemaProperties;
   const canRunByNormalization = normalizeErrors.length === 0 && !!normalized?.canonical;
   const canRunByPreflight = preflight?.ok === true;
   const preflightChecks = Array.isArray(preflight?.checks) ? preflight.checks : [];
@@ -1934,6 +1996,18 @@ export default function App() {
   } else if (preflight?.ok !== true) {
     pipelineStartMissingRequirements.push("preflight_check is not OK.");
   }
+  const generatedTemplateInputPreview = JSON.stringify(
+    {
+      desktop: {
+        canonical_id: normalized?.canonical ?? String(paperId ?? "").trim(),
+        template_id: selectedTemplateId,
+        params: templateParams,
+      },
+      params: templateParams,
+    },
+    null,
+    2
+  );
   const pipelineStartDisabled = pipelineStartMissingRequirements.length > 0;
 
   const showRetryButton = status === "needs_retry" && !!lastRunRequest;
@@ -2493,26 +2567,103 @@ export default function App() {
             "No template selected"
           )}
         </div>
+        {templateSchemaUnavailable ? (
+          <div style={{ fontSize: 12, marginBottom: 6, color: "#8a4200" }}>
+            params_schema is not provided by this template. Using fallback parameter definitions.
+          </div>
+        ) : null}
         <div style={{ display: "grid", gap: 8, gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))" }}>
-          {(selectedTemplate?.params ?? []).map((p) => (
-            <label key={p.key} style={{ display: "grid", gap: 4 }}>
-              <span style={{ fontSize: 12 }}>{p.label}</span>
-              <input
-                type={p.param_type === "integer" ? "number" : "text"}
-                min={p.min ?? undefined}
-                max={p.max ?? undefined}
-                value={templateParams[p.key] ?? ""}
-                onChange={(e) => {
-                  const raw = e.target.value;
-                  setTemplateParams((prev) => ({
-                    ...prev,
-                    [p.key]: p.param_type === "integer" ? Number(raw) : raw,
-                  }));
-                }}
-                style={{ padding: 8, borderRadius: 6, border: "1px solid #ccc" }}
-              />
+          {templateDynamicFields.map((field) => (
+            <label key={field.key} style={{ display: "grid", gap: 4 }}>
+              <span style={{ fontSize: 12 }}>{field.label}</span>
+              {field.fieldType === "enum" ? (
+                <select
+                  value={String(templateParams[field.key] ?? "")}
+                  onChange={(e) => {
+                    const next = { ...templateParams, [field.key]: e.target.value };
+                    updateTemplateParams(next);
+                  }}
+                  style={{ padding: 8, borderRadius: 6, border: "1px solid #ccc" }}
+                >
+                  <option value="">(select)</option>
+                  {(field.enumValues ?? []).map((v) => (
+                    <option key={`${field.key}-${String(v)}`} value={String(v)}>
+                      {String(v)}
+                    </option>
+                  ))}
+                </select>
+              ) : field.fieldType === "boolean" ? (
+                <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
+                  <input
+                    type="checkbox"
+                    checked={templateParams[field.key] === true}
+                    onChange={(e) => {
+                      const next = { ...templateParams, [field.key]: e.target.checked };
+                      updateTemplateParams(next);
+                    }}
+                  />
+                  true/false
+                </label>
+              ) : (
+                <input
+                  type={field.fieldType === "integer" || field.fieldType === "number" ? "number" : "text"}
+                  min={field.minimum}
+                  max={field.maximum}
+                  value={templateParams[field.key] ?? ""}
+                  onChange={(e) => {
+                    const raw = e.target.value;
+                    let value = raw;
+                    if (field.fieldType === "integer") {
+                      value = raw === "" ? "" : Number.parseInt(raw, 10);
+                    } else if (field.fieldType === "number") {
+                      value = raw === "" ? "" : Number(raw);
+                    }
+                    const next = { ...templateParams, [field.key]: value };
+                    updateTemplateParams(next);
+                  }}
+                  style={{ padding: 8, borderRadius: 6, border: "1px solid #ccc" }}
+                />
+              )}
             </label>
           ))}
+        </div>
+        <details style={{ marginTop: 8 }}>
+          <summary style={{ cursor: "pointer", fontSize: 12 }}>Advanced: raw JSON params</summary>
+          <div style={{ marginTop: 6 }}>
+            <textarea
+              value={templateParamsRawDraft}
+              onChange={(e) => {
+                setTemplateParamsRawDraft(e.target.value);
+                setTemplateParamsRawError("");
+              }}
+              style={{
+                width: "100%",
+                minHeight: 120,
+                padding: 8,
+                borderRadius: 6,
+                border: "1px solid #ccc",
+                fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+                fontSize: 12,
+              }}
+            />
+            <div style={{ display: "flex", gap: 8, marginTop: 6, alignItems: "center", flexWrap: "wrap" }}>
+              <button
+                onClick={onApplyTemplateParamsRaw}
+                style={{ padding: "6px 10px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+              >
+                Apply raw JSON
+              </button>
+              {templateParamsRawError ? (
+                <div style={{ color: "#a33", fontSize: 12 }}>{templateParamsRawError}</div>
+              ) : null}
+            </div>
+          </div>
+        </details>
+        <div style={{ marginTop: 8 }}>
+          <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 4 }}>Generated input preview</div>
+          <pre style={{ margin: 0, maxHeight: 180, overflow: "auto", whiteSpace: "pre-wrap", wordBreak: "break-word", fontSize: 11, border: "1px solid #ddd", borderRadius: 6, padding: 8, background: "#fff" }}>
+            {generatedTemplateInputPreview}
+          </pre>
         </div>
       </div>
 
