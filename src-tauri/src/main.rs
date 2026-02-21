@@ -5365,7 +5365,7 @@ fn is_safe_archive_relpath(path: &str) -> bool {
 }
 
 fn is_allowed_workspace_entry(rel: &str) -> bool {
-    matches!(rel, "settings.json" | "jobs.json" | "pipelines.json" | "audit.jsonl")
+    matches!(rel, "settings.json" | "jobs.json" | "pipelines.json" | "audit.jsonl" | "config.json")
         || rel.starts_with("diag/")
 }
 
@@ -5498,6 +5498,33 @@ fn decode_imported_pipelines(bytes: &[u8]) -> Result<Vec<PipelineRecord>, String
     Ok(payload.pipelines)
 }
 
+fn decode_imported_config_root(bytes: &[u8]) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    let raw = String::from_utf8(bytes.to_vec())
+        .map_err(|e| format!("invalid config.json encoding: {e}"))?;
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("invalid config.json: {e}"))?;
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "invalid config.json: root must be an object".to_string())?;
+
+    let _cfg = DesktopConfigFile {
+        JARVIS_PIPELINE_ROOT: obj
+            .get("JARVIS_PIPELINE_ROOT")
+            .and_then(|v| v.as_str().map(|s| s.to_string())),
+        JARVIS_PIPELINE_OUT_DIR: obj
+            .get("JARVIS_PIPELINE_OUT_DIR")
+            .and_then(|v| v.as_str().map(|s| s.to_string())),
+        S2_API_KEY: obj
+            .get("S2_API_KEY")
+            .and_then(|v| v.as_str().map(|s| s.to_string())),
+        S2_MIN_INTERVAL_MS: parse_u64_field_from_json(obj.get("S2_MIN_INTERVAL_MS"), "S2_MIN_INTERVAL_MS")?,
+        S2_MAX_RETRIES: parse_u32_field_from_json(obj.get("S2_MAX_RETRIES"), "S2_MAX_RETRIES")?,
+        S2_BACKOFF_BASE_SEC: parse_f64_field_from_json(obj.get("S2_BACKOFF_BASE_SEC"), "S2_BACKOFF_BASE_SEC")?,
+    };
+
+    Ok(obj.clone())
+}
+
 fn parse_updated_epoch_ms(text: &str) -> u128 {
     text.trim().parse::<u128>().unwrap_or(0)
 }
@@ -5526,6 +5553,24 @@ fn merge_settings_keep_current(
         }
     }
     serde_json::from_value::<DesktopSettings>(merged).unwrap_or_else(|_| current.clone())
+}
+
+fn merge_config_keep_current(
+    current: &serde_json::Map<String, serde_json::Value>,
+    imported: &serde_json::Map<String, serde_json::Value>,
+    warnings: &mut Vec<String>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut merged = current.clone();
+    for (k, v) in imported {
+        if let Some(cv) = current.get(k) {
+            if cv != v {
+                warnings.push(format!("config conflict on key `{k}`: keep current value"));
+            }
+        } else {
+            merged.insert(k.clone(), v.clone());
+        }
+    }
+    merged
 }
 
 fn merge_jobs_keep_newest(current: &[JobRecord], imported: &[JobRecord], warnings: &mut Vec<String>) -> Vec<JobRecord> {
@@ -5730,6 +5775,10 @@ fn export_workspace_internal(
         (jobs_file_path(&runtime.out_base_dir), ".jarvis-desktop/jobs.json".to_string()),
         (pipelines_file_path(&runtime.out_base_dir), ".jarvis-desktop/pipelines.json".to_string()),
     ];
+    let config_path = config_file_path();
+    if config_path.exists() && config_path.is_file() {
+        candidates.push((config_path, "state/config.json".to_string()));
+    }
 
     if include_audit {
         let audit_path = audit_jsonl_path(&runtime.out_base_dir);
@@ -5865,6 +5914,7 @@ fn import_workspace_internal(
     let mut imported_jobs: Option<Vec<JobRecord>> = None;
     let mut imported_pipelines: Option<Vec<PipelineRecord>> = None;
     let mut imported_audit: Option<String> = None;
+    let mut imported_config: Option<serde_json::Map<String, serde_json::Value>> = None;
 
     for idx in 0..archive.len() {
         let mut entry = archive.by_index(idx)
@@ -5876,11 +5926,14 @@ fn import_workspace_internal(
         if !is_safe_archive_relpath(&name) {
             return Err(format!("zip-slip rejected entry: {name}"));
         }
-        if !name.starts_with(".jarvis-desktop/") {
+        let rel = if name.starts_with(".jarvis-desktop/") {
+            name.trim_start_matches(".jarvis-desktop/").to_string()
+        } else if name.starts_with("state/") {
+            name.trim_start_matches("state/").to_string()
+        } else {
             warnings.push(format!("ignored non-workspace entry: {name}"));
             continue;
-        }
-        let rel = name.trim_start_matches(".jarvis-desktop/").to_string();
+        };
         if !is_allowed_workspace_entry(&rel) {
             warnings.push(format!("ignored disallowed entry: {name}"));
             continue;
@@ -5921,6 +5974,9 @@ fn import_workspace_internal(
             "audit.jsonl" => {
                 imported_audit = Some(String::from_utf8(bytes).unwrap_or_default());
             }
+            "config.json" => {
+                imported_config = Some(decode_imported_config_root(&bytes)?);
+            }
             _ => {}
         }
     }
@@ -5929,17 +5985,22 @@ fn import_workspace_internal(
     let current_jobs = load_jobs_from_file(&jobs_file_path(&runtime.out_base_dir))?;
     let current_pipelines = load_pipelines_from_file(&pipelines_file_path(&runtime.out_base_dir))?;
     let current_audit = fs::read_to_string(audit_jsonl_path(&runtime.out_base_dir)).unwrap_or_default();
+    let current_config_path = config_file_path();
+    let current_config_opt = read_config_json_root(&current_config_path)?;
+    let current_config = current_config_opt.clone().unwrap_or_default();
 
     let final_settings;
     let final_jobs;
     let final_pipelines;
     let final_audit;
+    let final_config_opt: Option<serde_json::Map<String, serde_json::Value>>;
 
     if mode == "replace" {
         final_settings = imported_settings.unwrap_or_default();
         final_jobs = imported_jobs.unwrap_or_default();
         final_pipelines = imported_pipelines.unwrap_or_default();
         final_audit = imported_audit.unwrap_or_default();
+        final_config_opt = imported_config.or(current_config_opt.clone());
     } else {
         final_settings = match imported_settings {
             Some(s) => merge_settings_keep_current(&current_settings, &s, &mut warnings),
@@ -5968,11 +6029,26 @@ fn import_workspace_internal(
         } else {
             current_audit.clone()
         };
+        final_config_opt = match imported_config {
+            Some(c) => {
+                let merged = merge_config_keep_current(&current_config, &c, &mut warnings);
+                if current_config_opt.is_some() || !merged.is_empty() {
+                    Some(merged)
+                } else {
+                    None
+                }
+            }
+            None => current_config_opt.clone(),
+        };
     }
 
     let settings_text = encode_settings_with_schema(&final_settings)?;
     let jobs_text = encode_jobs_with_schema(&final_jobs)?;
     let pipelines_text = encode_pipelines_with_schema(&final_pipelines)?;
+    let config_text = final_config_opt
+        .map(|obj| serde_json::to_string_pretty(&serde_json::Value::Object(obj)))
+        .transpose()
+        .map_err(|e| format!("failed to serialize config payload: {e}"))?;
 
     let report_path = import_dir.join("import_report.md");
     let mut applied = false;
@@ -5987,6 +6063,7 @@ fn import_workspace_internal(
                 jobs_file_path(&runtime.out_base_dir),
                 pipelines_file_path(&runtime.out_base_dir),
                 audit_jsonl_path(&runtime.out_base_dir),
+                current_config_path.clone(),
             ] {
                 if path.exists() {
                     let dst = backup_dir.join(path.file_name().unwrap_or_default());
@@ -5995,12 +6072,15 @@ fn import_workspace_internal(
             }
         }
 
-        let files = vec![
+        let mut files = vec![
             (settings_file_path(&runtime.out_base_dir), settings_text),
             (jobs_file_path(&runtime.out_base_dir), jobs_text),
             (pipelines_file_path(&runtime.out_base_dir), pipelines_text),
             (audit_jsonl_path(&runtime.out_base_dir), final_audit),
         ];
+        if let Some(config_text) = config_text {
+            files.push((current_config_path.clone(), config_text));
+        }
         apply_workspace_text_files_atomically(&files)?;
         applied = true;
     }
@@ -8355,6 +8435,11 @@ fn main() {
 mod tests {
     use super::*;
 
+    fn config_file_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().expect("lock config file guard")
+    }
+
     #[test]
     fn config_precedence_is_file_then_env_then_autodetect() {
         let selected =
@@ -9863,10 +9948,25 @@ mod tests {
 
     #[test]
     fn workspace_export_creates_zip_and_manifest() {
+        let _guard = config_file_test_guard();
         let base = std::env::temp_dir().join(format!("jarvis_ws_export_{}", now_epoch_ms()));
         let repo_root = base.join("repo");
         let _ = fs::create_dir_all(repo_root.join("scripts"));
         fs::write(repo_root.join("smoke_tauri_e2e.ps1"), "# smoke").expect("smoke");
+        let config_path = config_file_path();
+        let backup = if config_path.exists() {
+            Some(fs::read_to_string(&config_path).expect("backup config"))
+        } else {
+            None
+        };
+        if let Some(parent) = config_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        fs::write(
+            &config_path,
+            r#"{"JARVIS_PIPELINE_ROOT":"C:/tmp/pipeline","JARVIS_PIPELINE_OUT_DIR":"logs/runs"}"#,
+        )
+        .expect("write config");
         let runtime = build_test_runtime(&base);
 
         save_settings(&runtime.out_base_dir, &DesktopSettings::default()).expect("save settings");
@@ -9894,6 +9994,7 @@ mod tests {
         let manifest_raw = fs::read_to_string(&res.manifest_path).expect("read manifest");
         let manifest: WorkspaceExportManifest = serde_json::from_str(&manifest_raw).expect("parse manifest");
         assert!(!manifest.included.is_empty());
+        assert!(manifest.included.iter().any(|x| x.path == "state/config.json"));
         let sorted = manifest
             .included
             .iter()
@@ -9903,6 +10004,20 @@ mod tests {
         expected.sort();
         assert_eq!(sorted, expected);
 
+        let zip_file = fs::File::open(&res.zip_path).expect("open zip");
+        let mut archive = zip::ZipArchive::new(zip_file).expect("read zip");
+        let mut names = Vec::new();
+        for i in 0..archive.len() {
+            let f = archive.by_index(i).expect("zip entry");
+            names.push(f.name().to_string());
+        }
+        assert!(names.iter().any(|x| x == "state/config.json"));
+
+        if let Some(old) = backup {
+            fs::write(&config_path, old).expect("restore config");
+        } else if config_path.exists() {
+            let _ = fs::remove_file(&config_path);
+        }
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -10005,6 +10120,71 @@ mod tests {
         };
         assert!(err.contains("unsupported schema_version"));
 
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn workspace_import_restores_config_and_runtime_uses_file_values() {
+        let _guard = config_file_test_guard();
+        let base = std::env::temp_dir().join(format!("jarvis_ws_cfg_import_{}", now_epoch_ms()));
+        let runtime = build_test_runtime(&base);
+        let imported_pipeline = base.join("pipeline_imported");
+        let _ = fs::create_dir_all(imported_pipeline.join("jarvis_core"));
+        fs::write(imported_pipeline.join("pyproject.toml"), "[tool.poetry]").expect("write pyproject");
+        fs::write(imported_pipeline.join("jarvis_cli.py"), "print('ok')").expect("write cli");
+
+        let imported_cfg = format!(
+            "{{\"JARVIS_PIPELINE_ROOT\":{},\"JARVIS_PIPELINE_OUT_DIR\":\"imported_runs\"}}",
+            serde_json::to_string(&imported_pipeline.to_string_lossy().to_string()).expect("serialize root")
+        );
+        let zip_path = base.join("config.zip");
+        write_test_zip(&zip_path, &[("state/config.json", imported_cfg.as_bytes())]);
+
+        let config_path = config_file_path();
+        let backup = if config_path.exists() {
+            Some(fs::read_to_string(&config_path).expect("backup config"))
+        } else {
+            None
+        };
+        if let Some(parent) = config_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::remove_file(&config_path);
+
+        let res = import_workspace_internal(
+            &base,
+            &runtime,
+            ImportWorkspaceOptions {
+                zip_path: zip_path.to_string_lossy().to_string(),
+                mode: Some("merge".to_string()),
+                dry_run: Some(false),
+            },
+        )
+        .expect("import with config");
+        assert!(res.applied);
+
+        let cfg = read_config_json_root(&config_path)
+            .expect("read config")
+            .expect("config object");
+        assert_eq!(
+            cfg.get("JARVIS_PIPELINE_ROOT")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default(),
+            imported_pipeline.to_string_lossy()
+        );
+
+        let resolved = resolve_runtime_config_with_config_path(&base, &config_path).expect("resolve runtime");
+        assert_eq!(resolved.pipeline_root, canonical_or_self(&imported_pipeline));
+        assert_eq!(
+            resolved.out_base_dir,
+            canonical_or_self(&imported_pipeline.join("imported_runs"))
+        );
+
+        if let Some(old) = backup {
+            fs::write(&config_path, old).expect("restore config");
+        } else if config_path.exists() {
+            let _ = fs::remove_file(&config_path);
+        }
         let _ = fs::remove_dir_all(&base);
     }
 
