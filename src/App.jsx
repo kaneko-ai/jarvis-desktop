@@ -282,6 +282,9 @@ export default function App() {
   const [workspaceImportZipPath, setWorkspaceImportZipPath] = useState("");
   const [workspaceImportMode, setWorkspaceImportMode] = useState("merge");
   const [workspaceImportDryRun, setWorkspaceImportDryRun] = useState(false);
+  const [workspaceFixingRuntime, setWorkspaceFixingRuntime] = useState(false);
+  const [workspaceFixRuntimeMessage, setWorkspaceFixRuntimeMessage] = useState("");
+  const [workspaceLastImportId, setWorkspaceLastImportId] = useState("");
   const [selectedWorkspaceReport, setSelectedWorkspaceReport] = useState({ scope: "", id: "" });
   const [workspaceReport, setWorkspaceReport] = useState("");
   const [workspaceReportLoading, setWorkspaceReportLoading] = useState(false);
@@ -752,18 +755,85 @@ export default function App() {
     setWorkspaceImporting(true);
     setWorkspaceError("");
     try {
-      await invoke("import_workspace", {
+      const res = await invoke("import_workspace", {
         opts: {
           zip_path: zipPath,
           mode: workspaceImportMode,
           dry_run: workspaceImportDryRun,
         },
       });
-      await Promise.all([loadWorkspaceHistory(), loadPipelines(), loadJobs(), loadRuns(), loadSettings()]);
+      if (res?.import_id) {
+        setWorkspaceLastImportId(String(res.import_id));
+      }
+      setWorkspaceFixRuntimeMessage("Import completed. Click Fix runtime if pipeline_root is unresolved.");
+      await Promise.all([
+        loadWorkspaceHistory(),
+        loadPipelines(),
+        loadJobs(),
+        loadRuns(),
+        loadSettings(),
+        loadRuntimeConfig(true),
+        loadPreflight(),
+      ]);
     } catch (e) {
       setWorkspaceError(String(e));
     } finally {
       setWorkspaceImporting(false);
+    }
+  }
+
+  async function onFixRuntimeAfterImport() {
+    setWorkspaceFixingRuntime(true);
+    setWorkspaceError("");
+    setCfgError("");
+    setWorkspaceFixRuntimeMessage("");
+    try {
+      const firstRuntime = await invoke("reload_runtime_config");
+      setRuntimeCfg(firstRuntime ?? null);
+      const firstPreflight = await invoke("preflight_check");
+      setPreflight(firstPreflight ?? null);
+
+      let usedBootstrap = false;
+      const checks = Array.isArray(firstPreflight?.checks) ? firstPreflight.checks : [];
+      const pipelineRootCheck = checks.find((item) => item?.name === "pipeline_root");
+      if (!pipelineRootCheck?.ok) {
+        const boot = await invoke("bootstrap_pipeline_repo");
+        const pipelineRoot = String(boot?.local_path ?? "").trim();
+        if (!pipelineRoot) {
+          throw new Error("bootstrap_pipeline_repo succeeded but local_path is empty");
+        }
+        const setResult = await invoke("set_config_pipeline_root", { pipeline_root: pipelineRoot });
+        setRuntimeCfg(setResult ?? null);
+        if (!setResult?.ok) {
+          throw new Error(setResult?.message || "Failed to persist pipeline_root from bootstrap result");
+        }
+        usedBootstrap = true;
+      }
+
+      const finalRuntime = await invoke("reload_runtime_config");
+      setRuntimeCfg(finalRuntime ?? null);
+      const finalPreflight = await invoke("preflight_check");
+      setPreflight(finalPreflight ?? null);
+      await Promise.all([loadPipelineRepoStatus(), loadSettings(), loadRuns()]);
+
+      if (!finalRuntime?.ok) {
+        throw new Error(finalRuntime?.message || "runtime config unresolved after fix");
+      }
+      if (!finalPreflight?.ok) {
+        throw new Error("preflight still NG after fix");
+      }
+
+      setWorkspaceFixRuntimeMessage(
+        usedBootstrap
+          ? "Runtime fixed: bootstrap + pipeline_root save completed."
+          : "Runtime already healthy: reload + preflight are OK."
+      );
+    } catch (e) {
+      const msg = String(e);
+      setCfgError(msg);
+      setWorkspaceFixRuntimeMessage(`Fix runtime failed: ${msg}`);
+    } finally {
+      setWorkspaceFixingRuntime(false);
     }
   }
 
@@ -3505,6 +3575,43 @@ export default function App() {
               </button>
             </div>
             {workspaceError ? <div style={{ color: "#c00", fontSize: 12, marginBottom: 6 }}>{workspaceError}</div> : null}
+            <div
+              style={{
+                display: "flex",
+                gap: 8,
+                marginBottom: 8,
+                flexWrap: "wrap",
+                alignItems: "center",
+                border: "1px solid #eee",
+                borderRadius: 6,
+                padding: 8,
+                background: "#fafafa",
+              }}
+            >
+              <span style={{ fontSize: 12, fontWeight: 600 }}>After import</span>
+              <button
+                onClick={onFixRuntimeAfterImport}
+                disabled={workspaceFixingRuntime || workspaceImporting}
+                style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+              >
+                {workspaceFixingRuntime ? "Fixing runtime..." : "Fix runtime"}
+              </button>
+              {workspaceLastImportId ? (
+                <span style={{ fontSize: 11, opacity: 0.8 }}>
+                  last_import_id=<code>{workspaceLastImportId}</code>
+                </span>
+              ) : null}
+              {workspaceFixRuntimeMessage ? (
+                <span
+                  style={{
+                    fontSize: 12,
+                    color: workspaceFixRuntimeMessage.toLowerCase().includes("failed") ? "#a33" : "#1f6f3f",
+                  }}
+                >
+                  {workspaceFixRuntimeMessage}
+                </span>
+              ) : null}
+            </div>
 
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
               <div style={{ border: "1px solid #eee", borderRadius: 6, padding: 8 }}>
