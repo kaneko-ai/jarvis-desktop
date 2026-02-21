@@ -272,6 +272,11 @@ export default function App() {
   const [diagnosticsLoading, setDiagnosticsLoading] = useState(false);
   const [diagnosticsError, setDiagnosticsError] = useState("");
   const [collectingDiagnostics, setCollectingDiagnostics] = useState(false);
+  const [diagnosticsOneClickBusy, setDiagnosticsOneClickBusy] = useState(false);
+  const [diagnosticsOneClickMessage, setDiagnosticsOneClickMessage] = useState("");
+  const [latestDiagnosticId, setLatestDiagnosticId] = useState("");
+  const [latestDiagnosticZipPath, setLatestDiagnosticZipPath] = useState("");
+  const [latestDiagnosticFolderPath, setLatestDiagnosticFolderPath] = useState("");
   const [selectedDiagId, setSelectedDiagId] = useState("");
   const [diagReport, setDiagReport] = useState("");
   const [diagReportLoading, setDiagReportLoading] = useState(false);
@@ -719,6 +724,94 @@ export default function App() {
       setDiagnosticsError(String(e));
     } finally {
       setCollectingDiagnostics(false);
+    }
+  }
+
+  async function onGenerateDiagnosticsZipOneClick() {
+    setDiagnosticsOneClickBusy(true);
+    setDiagnosticsError("");
+    setDiagnosticsOneClickMessage("");
+    try {
+      const collected = await invoke("collect_diagnostics", {
+        opts: {
+          include_audit: true,
+          include_recent_runs: true,
+          include_zip: true,
+        },
+      });
+
+      let diagId = String(collected?.diag_id ?? "").trim();
+      let folderPath = String(collected?.diag_dir ?? "").trim();
+      let zipPath = String(collected?.zip_path ?? "").trim();
+
+      if (!diagId) {
+        const rows = await invoke("list_diagnostics");
+        const list = Array.isArray(rows) ? rows : [];
+        diagId = String(list[0]?.diag_id ?? "").trim();
+        if (!zipPath) {
+          zipPath = String(list[0]?.zip_path ?? "").trim();
+        }
+      }
+
+      if (!diagId) {
+        throw new Error("diagnostics bundle ID not found after collect_diagnostics");
+      }
+
+      const openedZipPath = await invoke("open_diagnostic_zip", { diagId });
+      if (String(openedZipPath ?? "").trim()) {
+        zipPath = String(openedZipPath).trim();
+      }
+
+      const rows = await invoke("list_diagnostics");
+      const list = Array.isArray(rows) ? rows : [];
+      setDiagnosticsRows(list);
+      setSelectedDiagId(diagId);
+      const matched = list.find((item) => item?.diag_id === diagId) ?? null;
+      if (!zipPath) {
+        zipPath = String(matched?.zip_path ?? "").trim();
+      }
+
+      setLatestDiagnosticId(diagId);
+      setLatestDiagnosticZipPath(zipPath);
+      setLatestDiagnosticFolderPath(folderPath);
+      setDiagnosticsOneClickMessage(
+        zipPath
+          ? `Generated diagnostics zip: ${diagId} (${zipPath})`
+          : `Generated diagnostics bundle: ${diagId}`
+      );
+    } catch (e) {
+      setDiagnosticsError(String(e));
+      setDiagnosticsOneClickMessage("");
+    } finally {
+      setDiagnosticsOneClickBusy(false);
+    }
+  }
+
+  async function onOpenLatestDiagnosticFolder() {
+    if (!latestDiagnosticId) return;
+    setDiagnosticsError("");
+    try {
+      const opened = await invoke("open_diagnostic_folder", { diagId: latestDiagnosticId });
+      const path = String(opened ?? "").trim();
+      if (path) {
+        setLatestDiagnosticFolderPath(path);
+      }
+    } catch (e) {
+      setDiagnosticsError(String(e));
+    }
+  }
+
+  async function onOpenLatestDiagnosticZip() {
+    if (!latestDiagnosticId) return;
+    setDiagnosticsError("");
+    try {
+      const opened = await invoke("open_diagnostic_zip", { diagId: latestDiagnosticId });
+      const path = String(opened ?? "").trim();
+      if (path) {
+        setLatestDiagnosticZipPath(path);
+      }
+    } catch (e) {
+      setDiagnosticsError(String(e));
     }
   }
 
@@ -3563,10 +3656,40 @@ export default function App() {
               <div style={{ fontWeight: 600 }}>Diagnostics</div>
               <button
                 onClick={onCollectDiagnostics}
-                disabled={collectingDiagnostics}
+                disabled={collectingDiagnostics || diagnosticsOneClickBusy}
                 style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
               >
                 {collectingDiagnostics ? "Collecting..." : "Collect Diagnostics"}
+              </button>
+              <button
+                onClick={onGenerateDiagnosticsZipOneClick}
+                disabled={collectingDiagnostics || diagnosticsOneClickBusy}
+                style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+              >
+                {diagnosticsOneClickBusy
+                  ? "Generating diagnostics zip..."
+                  : "Generate diagnostics zip (for sharing)"}
+              </button>
+              <button
+                onClick={onOpenLatestDiagnosticFolder}
+                disabled={!latestDiagnosticId || collectingDiagnostics || diagnosticsOneClickBusy}
+                style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+              >
+                Open latest diagnostics folder
+              </button>
+              <button
+                onClick={onOpenLatestDiagnosticZip}
+                disabled={!latestDiagnosticId || collectingDiagnostics || diagnosticsOneClickBusy}
+                style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+              >
+                Open latest diagnostics zip
+              </button>
+              <button
+                onClick={() => onCopyZipPath(latestDiagnosticZipPath || latestDiagnosticFolderPath)}
+                disabled={!(latestDiagnosticZipPath || latestDiagnosticFolderPath)}
+                style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+              >
+                Copy path
               </button>
               <button
                 onClick={loadDiagnostics}
@@ -3576,6 +3699,18 @@ export default function App() {
                 Reload list
               </button>
             </div>
+            {diagnosticsOneClickMessage ? (
+              <div style={{ color: "#1f6f3f", fontSize: 12, marginBottom: 6 }}>
+                {diagnosticsOneClickMessage}
+                {latestDiagnosticId ? ` / diag_id=${latestDiagnosticId}` : ""}
+              </div>
+            ) : null}
+            {latestDiagnosticZipPath || latestDiagnosticFolderPath ? (
+              <div style={{ fontSize: 11, marginBottom: 6 }}>
+                <div>latest_zip: <code>{latestDiagnosticZipPath || "-"}</code></div>
+                <div>latest_folder: <code>{latestDiagnosticFolderPath || "-"}</code></div>
+              </div>
+            ) : null}
             {diagnosticsError ? <div style={{ color: "#c00", fontSize: 12, marginBottom: 6 }}>{diagnosticsError}</div> : null}
             {diagnosticsRows.length === 0 ? (
               <div style={{ fontSize: 12, opacity: 0.8 }}>No diagnostic bundles.</div>
