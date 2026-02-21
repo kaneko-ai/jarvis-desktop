@@ -248,6 +248,9 @@ export default function App() {
   const [pipelines, setPipelines] = useState([]);
   const [pipelinesLoading, setPipelinesLoading] = useState(false);
   const [pipelinesError, setPipelinesError] = useState("");
+  const [pipelineValidationMissing, setPipelineValidationMissing] = useState([]);
+  const [pipelineValidationInvalid, setPipelineValidationInvalid] = useState([]);
+  const [pipelineValidationWarnings, setPipelineValidationWarnings] = useState([]);
   const [selectedPipelineId, setSelectedPipelineId] = useState("");
   const [pipelineDetail, setPipelineDetail] = useState(null);
   const [pipelineDetailLoading, setPipelineDetailLoading] = useState(false);
@@ -1065,11 +1068,45 @@ export default function App() {
 
   async function onRunAnalyzePipeline() {
     const idForRun = normalized?.canonical?.trim() ? normalized.canonical : paperId;
+    setPipelineValidationMissing([]);
+    setPipelineValidationInvalid([]);
+    setPipelineValidationWarnings([]);
+    setPipelinesError("");
     try {
+      const steps = buildAnalyzePipelineSteps();
+      const missing = [];
+      const invalid = [];
+      const warnings = [];
+      for (const step of steps) {
+        const check = await invoke("validate_template_inputs", {
+          templateId: step.template_id,
+          params: step.params ?? {},
+        });
+        const stepMissing = Array.isArray(check?.missing) ? check.missing : [];
+        const stepInvalid = Array.isArray(check?.invalid) ? check.invalid : [];
+        const stepWarnings = Array.isArray(check?.warnings) ? check.warnings : [];
+        for (const msg of stepMissing) {
+          missing.push(`${step.template_id}: ${msg}`);
+        }
+        for (const msg of stepInvalid) {
+          invalid.push(`${step.template_id}: ${msg}`);
+        }
+        for (const msg of stepWarnings) {
+          warnings.push(`${step.template_id}: ${msg}`);
+        }
+      }
+
+      setPipelineValidationMissing(missing);
+      setPipelineValidationInvalid(invalid);
+      setPipelineValidationWarnings(warnings);
+      if (missing.length > 0 || invalid.length > 0) {
+        return;
+      }
+
       const pipelineId = await invoke("create_pipeline", {
         name: "Analyze Paper",
         canonicalId: idForRun,
-        steps: buildAnalyzePipelineSteps(),
+        steps,
       });
       await invoke("start_pipeline", { pipelineId });
       await loadPipelines();
@@ -2986,6 +3023,21 @@ export default function App() {
       {pipelineStartMissingRequirements.length > 0 ? (
         <div style={{ color: "#a33", fontSize: 12, marginBottom: 8 }}>
           Missing requirements: {pipelineStartMissingRequirements.join(" | ")}
+        </div>
+      ) : null}
+      {pipelineValidationMissing.length > 0 ? (
+        <div style={{ color: "#a33", fontSize: 12, marginBottom: 6 }}>
+          Validation missing: {pipelineValidationMissing.join(" | ")}
+        </div>
+      ) : null}
+      {pipelineValidationInvalid.length > 0 ? (
+        <div style={{ color: "#a33", fontSize: 12, marginBottom: 6 }}>
+          Validation invalid: {pipelineValidationInvalid.join(" | ")}
+        </div>
+      ) : null}
+      {pipelineValidationWarnings.length > 0 ? (
+        <div style={{ color: "#8a4200", fontSize: 12, marginBottom: 6 }}>
+          Validation warnings: {pipelineValidationWarnings.join(" | ")}
         </div>
       ) : null}
       {pipelinesError ? <div style={{ color: "#a33", fontSize: 12, marginBottom: 8 }}>{pipelinesError}</div> : null}
