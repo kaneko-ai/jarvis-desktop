@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::{fs, io::{Read, Write}};
+use std::{fs, io::{Read, Seek, SeekFrom, Write}};
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use tauri::Emitter;
@@ -21,6 +21,7 @@ const DIAG_MAX_TOTAL_BYTES: u64 = 30 * 1024 * 1024;
 const DIAG_AUDIT_TAIL_LINES: usize = 200;
 const DIAG_MAX_RECENT_ITEMS: usize = 20;
 const MAX_RUN_TEXT_PREVIEW_BYTES: usize = 200 * 1024;
+const DEFAULT_RUN_TEXT_TAIL_BYTES: u64 = 200_000;
 const DEFAULT_PIPELINE_REPO_REMOTE_URL: &str = "https://github.com/kaneko-ai/jarvis-ml-pipeline.git";
 const DEFAULT_PIPELINE_REPO_LOCAL_SUBDIR: &str = "pipeline_repo/jarvis-ml-pipeline";
 const DEFAULT_PIPELINE_REPO_REF: &str = "main";
@@ -144,6 +145,12 @@ struct NamedArtifactView {
     content: String,
     truncated: bool,
     warnings: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct RunTextTailView {
+    content: String,
+    truncated: bool,
 }
 
 #[derive(Clone)]
@@ -4896,6 +4903,53 @@ fn read_run_text_internal(runtime: &RuntimeConfig, run_id: &str, kind: &str) -> 
     read_run_text_preview(&canonical, MAX_RUN_TEXT_PREVIEW_BYTES)
 }
 
+fn read_text_file_tail(path: &Path, max_bytes: u64) -> Result<(String, bool), String> {
+    let mut file =
+        fs::File::open(path).map_err(|e| format!("failed to open artifact {}: {e}", path.display()))?;
+    let size = file
+        .metadata()
+        .map_err(|e| format!("failed to stat artifact {}: {e}", path.display()))?
+        .len();
+    let truncated = size > max_bytes;
+    let start = if truncated {
+        size.saturating_sub(max_bytes)
+    } else {
+        0
+    };
+    file.seek(SeekFrom::Start(start))
+        .map_err(|e| format!("failed to seek artifact {}: {e}", path.display()))?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)
+        .map_err(|e| format!("failed to read artifact {}: {e}", path.display()))?;
+    Ok((String::from_utf8_lossy(&buf).to_string(), truncated))
+}
+
+fn read_run_text_tail_internal(
+    runtime: &RuntimeConfig,
+    run_id: &str,
+    kind: &str,
+    max_bytes: Option<u64>,
+) -> Result<RunTextTailView, String> {
+    let rel = run_text_rel_path(kind)?;
+    let run_dir = resolve_pipeline_run_dir_from_id(runtime, run_id)?;
+    let target = run_dir.join(rel);
+    if !target.exists() || !target.is_file() {
+        return Err(format!("artifact file does not exist: {}", target.display()));
+    }
+    let canonical = target
+        .canonicalize()
+        .map_err(|e| format!("failed to canonicalize artifact {}: {e}", target.display()))?;
+    if !canonical.starts_with(&run_dir) {
+        return Err(format!(
+            "artifact path is outside run directory: {}",
+            canonical.display()
+        ));
+    }
+    let limit = max_bytes.unwrap_or(DEFAULT_RUN_TEXT_TAIL_BYTES).clamp(1, 2_000_000);
+    let (content, truncated) = read_text_file_tail(&canonical, limit)?;
+    Ok(RunTextTailView { content, truncated })
+}
+
 #[tauri::command]
 fn list_runs(limit: Option<usize>, filters: Option<RunListFilter>) -> Result<Vec<RunListItem>, String> {
     let root = repo_root();
@@ -4997,6 +5051,17 @@ fn read_run_text(run_id: String, kind: String) -> Result<String, String> {
     let root = repo_root();
     let runtime = resolve_runtime_config(&root)?;
     read_run_text_internal(&runtime, &run_id, &kind)
+}
+
+#[tauri::command]
+fn read_run_text_tail(
+    run_id: String,
+    kind: String,
+    max_bytes: Option<u64>,
+) -> Result<RunTextTailView, String> {
+    let root = repo_root();
+    let runtime = resolve_runtime_config(&root)?;
+    read_run_text_tail_internal(&runtime, &run_id, &kind, max_bytes)
 }
 
 #[tauri::command]
@@ -8951,6 +9016,7 @@ fn main() {
             list_pipeline_runs,
             get_run_status,
             read_run_text,
+            read_run_text_tail,
             open_run_dir,
             collect_diagnostics,
             list_diagnostics,
@@ -9793,6 +9859,38 @@ mod tests {
         assert!(err_slash.contains("run_id"));
         let err_backslash = read_run_text_internal(&runtime, "a\\b", "input").err().unwrap_or_default();
         assert!(err_backslash.contains("run_id"));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn read_run_text_tail_returns_end_and_truncation_flag() {
+        let base = std::env::temp_dir().join(format!("jarvis_run_text_tail_{}", now_epoch_ms()));
+        let runtime = build_test_runtime(&base);
+
+        let run_large = "20260218_130000_deadbeef";
+        let run_large_dir = runtime.pipeline_root.join("logs").join("runs").join(run_large);
+        let _ = fs::create_dir_all(&run_large_dir);
+        fs::write(
+            run_large_dir.join("result.json"),
+            "line-1\nline-2\nline-3\nline-4\nline-5\n",
+        )
+        .expect("write large result");
+
+        let tail = read_run_text_tail_internal(&runtime, run_large, "result", Some(12))
+            .expect("read tail");
+        assert!(tail.truncated);
+        assert!(tail.content.ends_with("line-5\n"));
+
+        let run_small = "20260218_130100_deadbeef";
+        let run_small_dir = runtime.pipeline_root.join("logs").join("runs").join(run_small);
+        let _ = fs::create_dir_all(&run_small_dir);
+        fs::write(run_small_dir.join("result.json"), "ok\n").expect("write small result");
+
+        let small_tail = read_run_text_tail_internal(&runtime, run_small, "result", Some(128))
+            .expect("read small tail");
+        assert!(!small_tail.truncated);
+        assert_eq!(small_tail.content, "ok\n");
 
         let _ = fs::remove_dir_all(&base);
     }
