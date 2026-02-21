@@ -347,6 +347,14 @@ struct PipelineRepoValidateResult {
     checks: Vec<PreflightCheckItem>,
 }
 
+#[derive(Serialize, Default)]
+struct TemplateInputValidationResult {
+    ok: bool,
+    missing: Vec<String>,
+    invalid: Vec<String>,
+    warnings: Vec<String>,
+}
+
 impl Default for DesktopSettings {
     fn default() -> Self {
         Self {
@@ -7174,6 +7182,150 @@ fn list_task_templates() -> Vec<TaskTemplateDef> {
     template_registry()
 }
 
+fn validate_template_inputs_internal(
+    template: &TaskTemplateDef,
+    params: &serde_json::Value,
+) -> TemplateInputValidationResult {
+    let mut result = TemplateInputValidationResult::default();
+    let obj = match params.as_object() {
+        Some(v) => v,
+        None => {
+            result.invalid.push("params must be a JSON object".to_string());
+            result.ok = false;
+            return result;
+        }
+    };
+
+    let required_fields = template.required_fields.clone().unwrap_or_default();
+    if required_fields.is_empty() && template.params_schema.is_none() {
+        result
+            .warnings
+            .push("validation unavailable: template schema is not provided".to_string());
+        result.ok = true;
+        return result;
+    }
+
+    for key in required_fields {
+        let missing = match obj.get(&key) {
+            None => true,
+            Some(v) if v.is_null() => true,
+            Some(serde_json::Value::String(s)) if s.trim().is_empty() => true,
+            _ => false,
+        };
+        if missing {
+            result.missing.push(key);
+        }
+    }
+
+    let properties = template
+        .params_schema
+        .as_ref()
+        .and_then(|s| s.get("properties"))
+        .and_then(|v| v.as_object());
+    if let Some(props) = properties {
+        for (key, spec) in props {
+            let Some(value) = obj.get(key) else {
+                continue;
+            };
+            if value.is_null() {
+                continue;
+            }
+
+            let expected_type = spec.get("type").and_then(|v| v.as_str()).unwrap_or("string");
+            let valid_type = match expected_type {
+                "integer" => value
+                    .as_i64()
+                    .is_some()
+                    || value
+                        .as_str()
+                        .and_then(|s| s.trim().parse::<i64>().ok())
+                        .is_some(),
+                "number" => value
+                    .as_f64()
+                    .is_some()
+                    || value
+                        .as_str()
+                        .and_then(|s| s.trim().parse::<f64>().ok())
+                        .is_some(),
+                "boolean" => value.as_bool().is_some(),
+                "string" => value.as_str().is_some(),
+                _ => true,
+            };
+            if !valid_type {
+                result
+                    .invalid
+                    .push(format!("{key}: expected {expected_type}"));
+                continue;
+            }
+
+            if let Some(enum_values) = spec.get("enum").and_then(|v| v.as_array()) {
+                if !enum_values.contains(value) {
+                    result.invalid.push(format!("{key}: must be one of enum values"));
+                    continue;
+                }
+            }
+
+            if expected_type == "integer" || expected_type == "number" {
+                let numeric = if expected_type == "integer" {
+                    value
+                        .as_i64()
+                        .map(|v| v as f64)
+                        .or_else(|| value.as_str().and_then(|s| s.trim().parse::<i64>().ok().map(|v| v as f64)))
+                } else {
+                    value
+                        .as_f64()
+                        .or_else(|| value.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+                };
+                if let Some(v) = numeric {
+                    if let Some(min) = spec.get("minimum").and_then(|x| x.as_f64()) {
+                        if v < min {
+                            result.invalid.push(format!("{key}: must be >= {min}"));
+                        }
+                    }
+                    if let Some(max) = spec.get("maximum").and_then(|x| x.as_f64()) {
+                        if v > max {
+                            result.invalid.push(format!("{key}: must be <= {max}"));
+                        }
+                    }
+                }
+            }
+        }
+
+        if template
+            .params_schema
+            .as_ref()
+            .and_then(|s| s.get("additionalProperties"))
+            .and_then(|v| v.as_bool())
+            == Some(false)
+        {
+            for key in obj.keys() {
+                if !props.contains_key(key) {
+                    result
+                        .warnings
+                        .push(format!("{key}: unknown parameter (not in schema)"));
+                }
+            }
+        }
+    } else {
+        result
+            .warnings
+            .push("validation unavailable: schema properties are missing".to_string());
+    }
+
+    result.ok = result.missing.is_empty() && result.invalid.is_empty();
+    result
+}
+
+#[tauri::command]
+fn validate_template_inputs(
+    template_id: String,
+    params: serde_json::Value,
+) -> Result<TemplateInputValidationResult, String> {
+    let template =
+        find_template(&template_id).ok_or_else(|| format!("unknown template id: {template_id}"))?;
+    Ok(validate_template_inputs_internal(&template, &params))
+}
+
 fn enqueue_job_internal(
     state: &Arc<Mutex<JobRuntimeState>>,
     jobs_path: &Path,
@@ -8794,6 +8946,7 @@ fn main() {
             library_stats,
             open_run_folder,
             list_task_templates,
+            validate_template_inputs,
             list_runs,
             list_pipeline_runs,
             get_run_status,
@@ -9098,6 +9251,54 @@ mod tests {
             .expect("TEMPLATE_SUMMARY missing");
         assert!(summary.required_fields.is_none());
         assert!(summary.params_schema.is_none());
+    }
+
+    #[test]
+    fn validate_template_inputs_detects_missing_required_fields() {
+        let template = TaskTemplateDef {
+            id: "TEST_TEMPLATE".to_string(),
+            title: "Test".to_string(),
+            description: "test".to_string(),
+            wired: true,
+            disabled_reason: "".to_string(),
+            params: vec![],
+            required_fields: Some(vec!["depth".to_string()]),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "depth": { "type": "integer", "minimum": 1, "maximum": 3 }
+                },
+                "additionalProperties": false
+            })),
+        };
+
+        let missing = validate_template_inputs_internal(&template, &serde_json::json!({}));
+        assert!(!missing.ok);
+        assert_eq!(missing.missing, vec!["depth".to_string()]);
+
+        let invalid = validate_template_inputs_internal(&template, &serde_json::json!({"depth": "x"}));
+        assert!(!invalid.ok);
+        assert!(invalid.invalid.iter().any(|v| v.contains("depth")));
+    }
+
+    #[test]
+    fn validate_template_inputs_warns_when_schema_is_unavailable() {
+        let template = TaskTemplateDef {
+            id: "TEST_NO_SCHEMA".to_string(),
+            title: "No Schema".to_string(),
+            description: "test".to_string(),
+            wired: true,
+            disabled_reason: "".to_string(),
+            params: vec![],
+            required_fields: None,
+            params_schema: None,
+        };
+
+        let result = validate_template_inputs_internal(&template, &serde_json::json!({}));
+        assert!(result.ok);
+        assert!(result.missing.is_empty());
+        assert!(result.invalid.is_empty());
+        assert!(!result.warnings.is_empty());
     }
 
     #[test]
