@@ -280,7 +280,7 @@ export default function App() {
   const [workspaceExporting, setWorkspaceExporting] = useState(false);
   const [workspaceImporting, setWorkspaceImporting] = useState(false);
   const [workspaceImportZipPath, setWorkspaceImportZipPath] = useState("");
-  const [workspaceImportMode, setWorkspaceImportMode] = useState("merge");
+  const [workspaceImportMode, setWorkspaceImportMode] = useState("keep_current");
   const [workspaceImportDryRun, setWorkspaceImportDryRun] = useState(false);
   const [snapshotLoading, setSnapshotLoading] = useState(false);
   const [workspaceFixingRuntime, setWorkspaceFixingRuntime] = useState(false);
@@ -3646,8 +3646,9 @@ export default function App() {
                 onChange={(e) => setWorkspaceImportMode(e.target.value)}
                 style={{ padding: 6, borderRadius: 6, border: "1px solid #ccc", fontSize: 12 }}
               >
-                <option value="merge">merge</option>
-                <option value="replace">replace</option>
+                <option value="keep_current">Keep current (recommended)</option>
+                <option value="replace">Replace with imported</option>
+                <option value="merge">Merge (prefer imported)</option>
               </select>
               <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
                 <input

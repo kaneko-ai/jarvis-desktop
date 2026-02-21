@@ -538,6 +538,36 @@ struct ImportWorkspaceOptions {
     dry_run: Option<bool>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImportConflictMode {
+    KeepCurrent,
+    Replace,
+    Merge,
+}
+
+impl ImportConflictMode {
+    fn parse(raw: Option<&str>) -> Result<Self, String> {
+        let normalized = raw
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "keep_current".to_string());
+        match normalized.as_str() {
+            "keep_current" | "keep-current" | "keepcurrent" => Ok(Self::KeepCurrent),
+            "replace" => Ok(Self::Replace),
+            "merge" => Ok(Self::Merge),
+            _ => Err("mode must be keep_current, replace, or merge".to_string()),
+        }
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::KeepCurrent => "keep_current",
+            Self::Replace => "replace",
+            Self::Merge => "merge",
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct ImportWorkspaceResult {
     import_id: String,
@@ -5555,6 +5585,37 @@ fn merge_settings_keep_current(
     serde_json::from_value::<DesktopSettings>(merged).unwrap_or_else(|_| current.clone())
 }
 
+fn merge_settings_keep_imported(
+    current: &DesktopSettings,
+    imported: &DesktopSettings,
+    warnings: &mut Vec<String>,
+) -> DesktopSettings {
+    let cur_v = serde_json::to_value(current).unwrap_or_else(|_| serde_json::json!({}));
+    let imp_v = serde_json::to_value(imported).unwrap_or_else(|_| serde_json::json!({}));
+    let mut merged = cur_v.clone();
+    if let (Some(cur_obj), Some(imp_obj), Some(dst_obj)) = (
+        cur_v.as_object(),
+        imp_v.as_object(),
+        merged.as_object_mut(),
+    ) {
+        for (k, v) in imp_obj {
+            if let Some(cv) = cur_obj.get(k) {
+                if cv != v {
+                    warnings.push(format!("settings conflict on key `{k}`: keep imported value"));
+                }
+            }
+            dst_obj.insert(k.clone(), v.clone());
+        }
+    }
+    match serde_json::from_value::<DesktopSettings>(merged) {
+        Ok(v) => v,
+        Err(e) => {
+            warnings.push(format!("settings merge fallback to current: {e}"));
+            current.clone()
+        }
+    }
+}
+
 fn merge_config_keep_current(
     current: &serde_json::Map<String, serde_json::Value>,
     imported: &serde_json::Map<String, serde_json::Value>,
@@ -5569,6 +5630,49 @@ fn merge_config_keep_current(
         } else {
             merged.insert(k.clone(), v.clone());
         }
+    }
+    merged
+}
+
+fn sanitize_imported_config_values(
+    imported: &serde_json::Map<String, serde_json::Value>,
+    warnings: &mut Vec<String>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::<String, serde_json::Value>::new();
+    for (k, v) in imported {
+        match k.as_str() {
+            "JARVIS_PIPELINE_ROOT" | "JARVIS_PIPELINE_OUT_DIR" => match v.as_str() {
+                Some(text) if !text.trim().is_empty() => {
+                    out.insert(k.clone(), serde_json::Value::String(text.to_string()));
+                }
+                Some(_) => {
+                    warnings.push(format!("config key `{k}` ignored: empty value"));
+                }
+                None => {
+                    warnings.push(format!("config key `{k}` ignored: expected string"));
+                }
+            },
+            _ => {
+                out.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    out
+}
+
+fn merge_config_keep_imported(
+    current: &serde_json::Map<String, serde_json::Value>,
+    imported: &serde_json::Map<String, serde_json::Value>,
+    warnings: &mut Vec<String>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut merged = current.clone();
+    for (k, v) in imported {
+        if let Some(cv) = current.get(k) {
+            if cv != v {
+                warnings.push(format!("config conflict on key `{k}`: keep imported value"));
+            }
+        }
+        merged.insert(k.clone(), v.clone());
     }
     merged
 }
@@ -5891,10 +5995,7 @@ fn import_workspace_internal(
         return Err(format!("zip file not found: {}", zip_path.display()));
     }
 
-    let mode = opts.mode.unwrap_or_else(|| "merge".to_string()).to_lowercase();
-    if mode != "merge" && mode != "replace" {
-        return Err("mode must be merge or replace".to_string());
-    }
+    let mode = ImportConflictMode::parse(opts.mode.as_deref())?;
     let dry_run = opts.dry_run.unwrap_or(false);
 
     let import_id = make_workspace_transfer_id();
@@ -5904,6 +6005,7 @@ fn import_workspace_internal(
         .map_err(|e| format!("failed to create import staging dir {}: {e}", staging_dir.display()))?;
 
     let mut warnings = Vec::<String>::new();
+    warnings.push(format!("mode applied: {}", mode.as_str()));
     let file = fs::File::open(&zip_path)
         .map_err(|e| format!("failed to open workspace zip {}: {e}", zip_path.display()))?;
     let mut archive = zip::ZipArchive::new(file)
@@ -5975,7 +6077,14 @@ fn import_workspace_internal(
                 imported_audit = Some(String::from_utf8(bytes).unwrap_or_default());
             }
             "config.json" => {
-                imported_config = Some(decode_imported_config_root(&bytes)?);
+                match decode_imported_config_root(&bytes) {
+                    Ok(cfg) => {
+                        imported_config = Some(cfg);
+                    }
+                    Err(e) => {
+                        warnings.push(format!("ignored invalid config.json: {e}"));
+                    }
+                }
             }
             _ => {}
         }
@@ -5988,6 +6097,9 @@ fn import_workspace_internal(
     let current_config_path = config_file_path();
     let current_config_opt = read_config_json_root(&current_config_path)?;
     let current_config = current_config_opt.clone().unwrap_or_default();
+    let imported_config_sanitized = imported_config
+        .as_ref()
+        .map(|obj| sanitize_imported_config_values(obj, &mut warnings));
 
     let final_settings;
     let final_jobs;
@@ -5995,15 +6107,28 @@ fn import_workspace_internal(
     let final_audit;
     let final_config_opt: Option<serde_json::Map<String, serde_json::Value>>;
 
-    if mode == "replace" {
-        final_settings = imported_settings.unwrap_or_default();
+    if mode == ImportConflictMode::Replace {
+        final_settings = imported_settings.unwrap_or_else(|| current_settings.clone());
         final_jobs = imported_jobs.unwrap_or_default();
         final_pipelines = imported_pipelines.unwrap_or_default();
         final_audit = imported_audit.unwrap_or_default();
-        final_config_opt = imported_config.or(current_config_opt.clone());
+        final_config_opt = match imported_config_sanitized {
+            Some(c) if !c.is_empty() => Some(c),
+            Some(_) => {
+                warnings.push("replace mode: imported config has no valid keys; keep current config".to_string());
+                current_config_opt.clone()
+            }
+            None => current_config_opt.clone(),
+        };
     } else {
         final_settings = match imported_settings {
-            Some(s) => merge_settings_keep_current(&current_settings, &s, &mut warnings),
+            Some(s) => {
+                if mode == ImportConflictMode::Merge {
+                    merge_settings_keep_imported(&current_settings, &s, &mut warnings)
+                } else {
+                    merge_settings_keep_current(&current_settings, &s, &mut warnings)
+                }
+            }
             None => current_settings.clone(),
         };
         final_jobs = match imported_jobs {
@@ -6029,9 +6154,13 @@ fn import_workspace_internal(
         } else {
             current_audit.clone()
         };
-        final_config_opt = match imported_config {
+        final_config_opt = match imported_config_sanitized {
             Some(c) => {
-                let merged = merge_config_keep_current(&current_config, &c, &mut warnings);
+                let merged = if mode == ImportConflictMode::Merge {
+                    merge_config_keep_imported(&current_config, &c, &mut warnings)
+                } else {
+                    merge_config_keep_current(&current_config, &c, &mut warnings)
+                };
                 if current_config_opt.is_some() || !merged.is_empty() {
                     Some(merged)
                 } else {
@@ -6054,7 +6183,7 @@ fn import_workspace_internal(
     let mut applied = false;
 
     if !dry_run {
-        if mode == "replace" {
+        if mode == ImportConflictMode::Replace {
             let backup_dir = workspace_backups_root(&runtime.out_base_dir).join(&import_id);
             fs::create_dir_all(&backup_dir)
                 .map_err(|e| format!("failed to create backup directory {}: {e}", backup_dir.display()))?;
@@ -6085,7 +6214,7 @@ fn import_workspace_internal(
         applied = true;
     }
 
-    let report = render_workspace_import_report(&import_id, &mode, dry_run, applied, &warnings);
+    let report = render_workspace_import_report(&import_id, mode.as_str(), dry_run, applied, &warnings);
     atomic_write_text(&report_path, &report)?;
 
     Ok(ImportWorkspaceResult {
@@ -10178,6 +10307,128 @@ mod tests {
         assert_eq!(
             resolved.out_base_dir,
             canonical_or_self(&imported_pipeline.join("imported_runs"))
+        );
+
+        if let Some(old) = backup {
+            fs::write(&config_path, old).expect("restore config");
+        } else if config_path.exists() {
+            let _ = fs::remove_file(&config_path);
+        }
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn workspace_import_settings_replace_uses_imported_values() {
+        let base = std::env::temp_dir().join(format!("jarvis_ws_settings_replace_{}", now_epoch_ms()));
+        let runtime = build_test_runtime(&base);
+        let mut current = DesktopSettings::default();
+        current.auto_retry_max_per_job = 9;
+        save_settings(&runtime.out_base_dir, &current).expect("save current settings");
+
+        let mut imported = DesktopSettings::default();
+        imported.auto_retry_max_per_job = 2;
+        let imported_text = serde_json::to_string(&imported).expect("serialize imported settings");
+        let zip_path = base.join("settings_replace.zip");
+        write_test_zip(
+            &zip_path,
+            &[(".jarvis-desktop/settings.json", imported_text.as_bytes())],
+        );
+
+        let res = import_workspace_internal(
+            &base,
+            &runtime,
+            ImportWorkspaceOptions {
+                zip_path: zip_path.to_string_lossy().to_string(),
+                mode: Some("replace".to_string()),
+                dry_run: Some(false),
+            },
+        )
+        .expect("replace import");
+        assert!(res.applied);
+        assert!(res.warnings.iter().any(|w| w.contains("mode applied: replace")));
+
+        let loaded = load_settings(&runtime.out_base_dir).expect("load replaced settings");
+        assert_eq!(loaded.auto_retry_max_per_job, 2);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn workspace_import_config_modes_keep_current_and_replace() {
+        let _guard = config_file_test_guard();
+        let base = std::env::temp_dir().join(format!("jarvis_ws_cfg_modes_{}", now_epoch_ms()));
+        let runtime = build_test_runtime(&base);
+        let current_pipeline = base.join("pipeline_current");
+        let imported_pipeline = base.join("pipeline_imported");
+        let _ = fs::create_dir_all(current_pipeline.join("jarvis_core"));
+        let _ = fs::create_dir_all(imported_pipeline.join("jarvis_core"));
+        fs::write(current_pipeline.join("pyproject.toml"), "[tool.poetry]").expect("write current pyproject");
+        fs::write(current_pipeline.join("jarvis_cli.py"), "print('ok')").expect("write current cli");
+        fs::write(imported_pipeline.join("pyproject.toml"), "[tool.poetry]").expect("write imported pyproject");
+        fs::write(imported_pipeline.join("jarvis_cli.py"), "print('ok')").expect("write imported cli");
+
+        let config_path = config_file_path();
+        let backup = if config_path.exists() {
+            Some(fs::read_to_string(&config_path).expect("backup config"))
+        } else {
+            None
+        };
+        if let Some(parent) = config_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let current_config_text = format!(
+            "{{\"JARVIS_PIPELINE_ROOT\":{},\"JARVIS_PIPELINE_OUT_DIR\":\"current_runs\"}}",
+            serde_json::to_string(&current_pipeline.to_string_lossy().to_string()).expect("serialize current root")
+        );
+        fs::write(&config_path, current_config_text).expect("write current config");
+
+        let imported_config_text = format!(
+            "{{\"JARVIS_PIPELINE_ROOT\":{},\"JARVIS_PIPELINE_OUT_DIR\":\"imported_runs\"}}",
+            serde_json::to_string(&imported_pipeline.to_string_lossy().to_string()).expect("serialize imported root")
+        );
+        let zip_path = base.join("config_modes.zip");
+        write_test_zip(
+            &zip_path,
+            &[("state/config.json", imported_config_text.as_bytes())],
+        );
+
+        let keep_res = import_workspace_internal(
+            &base,
+            &runtime,
+            ImportWorkspaceOptions {
+                zip_path: zip_path.to_string_lossy().to_string(),
+                mode: Some("keep_current".to_string()),
+                dry_run: Some(false),
+            },
+        )
+        .expect("keep_current import");
+        assert!(keep_res.applied);
+
+        let after_keep = read_config_json_root(&config_path)
+            .expect("read config after keep")
+            .expect("config object");
+        assert_eq!(
+            after_keep.get("JARVIS_PIPELINE_ROOT").and_then(|v| v.as_str()).unwrap_or_default(),
+            current_pipeline.to_string_lossy()
+        );
+
+        let replace_res = import_workspace_internal(
+            &base,
+            &runtime,
+            ImportWorkspaceOptions {
+                zip_path: zip_path.to_string_lossy().to_string(),
+                mode: Some("replace".to_string()),
+                dry_run: Some(false),
+            },
+        )
+        .expect("replace import");
+        assert!(replace_res.applied);
+
+        let after_replace = read_config_json_root(&config_path)
+            .expect("read config after replace")
+            .expect("config object");
+        assert_eq!(
+            after_replace.get("JARVIS_PIPELINE_ROOT").and_then(|v| v.as_str()).unwrap_or_default(),
+            imported_pipeline.to_string_lossy()
         );
 
         if let Some(old) = backup {
