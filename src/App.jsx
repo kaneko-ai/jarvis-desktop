@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
 function escapeHtml(raw) {
@@ -259,6 +260,8 @@ export default function App() {
   const [pipelineRepoRemoteUrl, setPipelineRepoRemoteUrl] = useState("");
   const [pipelineRepoLocalPath, setPipelineRepoLocalPath] = useState("");
   const [pipelineRepoRef, setPipelineRepoRef] = useState("main");
+  const [bootstrapLogBusy, setBootstrapLogBusy] = useState(false);
+  const [bootstrapLogLines, setBootstrapLogLines] = useState([]);
   const [opsNeedsAttentionOnly, setOpsNeedsAttentionOnly] = useState(false);
   const [opsAutoRetryPendingOnly, setOpsAutoRetryPendingOnly] = useState(false);
   const [desktopSettings, setDesktopSettings] = useState(null);
@@ -566,6 +569,53 @@ export default function App() {
       setPipelineRepoError(String(e));
       await loadPipelineRepoStatus();
     } finally {
+      setPipelineRepoBusy(false);
+    }
+  }
+
+  function onClearBootstrapLogs() {
+    setBootstrapLogLines([]);
+  }
+
+  async function onBootstrapPipelineRepoWithLogs() {
+    setBootstrapLogBusy(true);
+    setPipelineRepoBusy(true);
+    setPipelineRepoError("");
+    setBootstrapLogLines([]);
+
+    let unlistenLog = null;
+    let unlistenDone = null;
+    try {
+      unlistenLog = await listen("bootstrap_pipeline_repo:log", (event) => {
+        const line = String(event?.payload ?? "");
+        if (!line) return;
+        setBootstrapLogLines((prev) => [...prev, line]);
+      });
+
+      unlistenDone = await listen("bootstrap_pipeline_repo:done", (event) => {
+        const payload = event?.payload ?? {};
+        const ok = payload?.ok === true;
+        const message = String(payload?.message ?? "").trim();
+        const suffix = message ? `: ${message}` : "";
+        setBootstrapLogLines((prev) => [...prev, `[done] ${ok ? "ok" : "error"}${suffix}`]);
+      });
+
+      const status = await invoke("bootstrap_pipeline_repo_stream");
+      setPipelineRepoStatus(status ?? null);
+      await Promise.all([loadRuntimeConfig(true), loadPreflight(), loadSettings(), loadPipelineRepoStatus()]);
+    } catch (e) {
+      const msg = String(e);
+      setPipelineRepoError(msg);
+      setBootstrapLogLines((prev) => [...prev, `[error] ${msg}`]);
+      await loadPipelineRepoStatus();
+    } finally {
+      if (typeof unlistenLog === "function") {
+        unlistenLog();
+      }
+      if (typeof unlistenDone === "function") {
+        unlistenDone();
+      }
+      setBootstrapLogBusy(false);
       setPipelineRepoBusy(false);
     }
   }
@@ -2065,8 +2115,11 @@ export default function App() {
           <button onClick={onSavePipelineRepoSettings} disabled={pipelineRepoBusy} style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}>
             Save settings
           </button>
-          <button onClick={onBootstrapPipelineRepo} disabled={pipelineRepoBusy} style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}>
+          <button onClick={onBootstrapPipelineRepo} disabled={pipelineRepoBusy || bootstrapLogBusy} style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}>
             Clone / Setup
+          </button>
+          <button onClick={onBootstrapPipelineRepoWithLogs} disabled={pipelineRepoBusy || bootstrapLogBusy} style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}>
+            {bootstrapLogBusy ? "Bootstrap (show logs)..." : "Bootstrap (show logs)"}
           </button>
           <button onClick={onUpdatePipelineRepo} disabled={pipelineRepoBusy} style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}>
             Update
@@ -2077,12 +2130,31 @@ export default function App() {
           <button onClick={onOpenPipelineRepoFolder} disabled={pipelineRepoBusy} style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}>
             Open folder
           </button>
+          <button onClick={onClearBootstrapLogs} disabled={bootstrapLogBusy} style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}>
+            Clear logs
+          </button>
           <button onClick={() => setActiveScreen("main")} style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}>
             Continue to Main
           </button>
         </div>
 
-        {pipelineRepoBusy ? <div style={{ marginTop: 8, fontSize: 12 }}>実行中...</div> : null}
+        {pipelineRepoBusy || bootstrapLogBusy ? <div style={{ marginTop: 8, fontSize: 12 }}>実行中...</div> : null}
+        <div
+          style={{
+            marginTop: 8,
+            border: "1px solid #ddd",
+            borderRadius: 8,
+            background: "#fff",
+            padding: 8,
+            maxHeight: 220,
+            overflow: "auto",
+          }}
+        >
+          <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>Bootstrap logs</div>
+          <pre style={{ margin: 0, fontSize: 11, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
+            {bootstrapLogLines.length ? bootstrapLogLines.join("\n") : "(no logs)"}
+          </pre>
+        </div>
         {pipelineRepoStatus ? (
           <div style={{ marginTop: 8, fontSize: 12 }}>
             <div>status: <code>{pipelineRepoStatus.ok ? "ok" : "ng"}</code> / {pipelineRepoStatus.message}</div>

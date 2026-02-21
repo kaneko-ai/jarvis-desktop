@@ -11,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::{fs, io::{Read, Write}};
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
+use tauri::Emitter;
 use zip::write::SimpleFileOptions;
 
 const MAX_ARTIFACT_READ_BYTES: u64 = 3 * 1024 * 1024;
@@ -3017,6 +3018,112 @@ fn run_git_capture(args: &[String]) -> Result<(String, String), String> {
             if !stderr.is_empty() { stderr } else { stdout }
         ))
     }
+}
+
+fn emit_bootstrap_log(window: &tauri::Window, line: &str) {
+    let _ = window.emit("bootstrap_pipeline_repo:log", line.to_string());
+}
+
+fn emit_bootstrap_done(window: &tauri::Window, ok: bool, message: &str) {
+    let _ = window.emit(
+        "bootstrap_pipeline_repo:done",
+        serde_json::json!({
+            "ok": ok,
+            "message": message,
+        }),
+    );
+}
+
+fn append_non_empty_lines_with_prefix(lines: &str, prefix: &str, out: &mut Vec<String>) {
+    for line in lines.lines() {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            out.push(format!("{prefix}{trimmed}"));
+        }
+    }
+}
+
+fn run_git_capture_with_logging(
+    window: &tauri::Window,
+    label: &str,
+    args: &[String],
+) -> Result<(String, String), String> {
+    emit_bootstrap_log(window, &format!("[bootstrap] {label}: start"));
+    match run_git_capture(args) {
+        Ok((stdout, stderr)) => {
+            let mut lines = Vec::<String>::new();
+            append_non_empty_lines_with_prefix(&stdout, "stdout: ", &mut lines);
+            append_non_empty_lines_with_prefix(&stderr, "stderr: ", &mut lines);
+            for line in lines {
+                emit_bootstrap_log(window, &format!("[bootstrap] {label}: {line}"));
+            }
+            emit_bootstrap_log(window, &format!("[bootstrap] {label}: done"));
+            Ok((stdout, stderr))
+        }
+        Err(e) => {
+            emit_bootstrap_log(window, &format!("[bootstrap] {label}: error: {e}"));
+            Err(e)
+        }
+    }
+}
+
+fn run_pipeline_repo_update_internal_with_logging(
+    window: &tauri::Window,
+    local_path: &Path,
+    settings: &PipelineRepoSettings,
+) -> Result<String, String> {
+    let current_remote_args = vec![
+        "-C".to_string(),
+        local_path.to_string_lossy().to_string(),
+        "remote".to_string(),
+        "get-url".to_string(),
+        "origin".to_string(),
+    ];
+    let (remote_stdout, remote_stderr) =
+        run_git_capture_with_logging(window, "git remote get-url origin", &current_remote_args)?;
+    if normalize_remote_url(&remote_stdout) != normalize_remote_url(&settings.remote_url) {
+        return Err(format!(
+            "RULE_PIPELINE_REPO_REMOTE_MISMATCH: origin remote mismatch. expected={} actual={}",
+            settings.remote_url,
+            remote_stdout
+        ));
+    }
+
+    let fetch_args = vec![
+        "-C".to_string(),
+        local_path.to_string_lossy().to_string(),
+        "fetch".to_string(),
+        "origin".to_string(),
+        settings.git_ref.clone(),
+    ];
+    let (fetch_stdout, fetch_stderr) =
+        run_git_capture_with_logging(window, "git fetch", &fetch_args)?;
+
+    let pull_args = vec![
+        "-C".to_string(),
+        local_path.to_string_lossy().to_string(),
+        "pull".to_string(),
+        "--ff-only".to_string(),
+        "origin".to_string(),
+        settings.git_ref.clone(),
+    ];
+    let (pull_stdout, pull_stderr) = run_git_capture_with_logging(window, "git pull --ff-only", &pull_args)?;
+
+    let stdout = format!(
+        "remote={}\n{}\n{}",
+        remote_stdout,
+        fetch_stdout,
+        pull_stdout
+    )
+    .trim()
+    .to_string();
+    let stderr = [remote_stderr, fetch_stderr, pull_stderr]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Ok([stdout, stderr].join("\n").trim().to_string())
 }
 
 fn append_audit_pipeline_repo_event(
@@ -7841,6 +7948,116 @@ fn bootstrap_pipeline_repo() -> Result<PipelineRepoStatus, String> {
 }
 
 #[tauri::command]
+fn bootstrap_pipeline_repo_stream(window: tauri::Window) -> Result<PipelineRepoStatus, String> {
+    emit_bootstrap_log(&window, "[bootstrap] start");
+
+    let result = (|| -> Result<PipelineRepoStatus, String> {
+        let (runtime, _) = runtime_and_jobs_path()?;
+        emit_bootstrap_log(
+            &window,
+            &format!(
+                "[bootstrap] runtime resolved: out_dir={}",
+                runtime.out_base_dir.display()
+            ),
+        );
+
+        let mut settings = load_settings(&runtime.out_base_dir)?;
+        emit_bootstrap_log(&window, "[bootstrap] settings loaded");
+        settings.pipeline_repo.remote_url = validate_pipeline_repo_url(&settings.pipeline_repo.remote_url)?;
+        settings.pipeline_repo.git_ref = validate_pipeline_repo_ref(&settings.pipeline_repo.git_ref)?;
+        let local_path = validate_pipeline_repo_local_path(&settings.pipeline_repo.local_path, &runtime.out_base_dir)?;
+        emit_bootstrap_log(
+            &window,
+            &format!("[bootstrap] local_path={}", local_path.display()),
+        );
+
+        let action_result = (|| -> Result<String, String> {
+            let _ = run_git_capture_with_logging(
+                &window,
+                "git --version",
+                &["--version".to_string()],
+            )?;
+            if !local_path.exists() {
+                if let Some(parent) = local_path.parent() {
+                    emit_bootstrap_log(
+                        &window,
+                        &format!("[bootstrap] creating parent dir: {}", parent.display()),
+                    );
+                    fs::create_dir_all(parent)
+                        .map_err(|e| format!("failed to create parent directory {}: {e}", parent.display()))?;
+                }
+                let clone_args = vec![
+                    "clone".to_string(),
+                    "--depth".to_string(),
+                    "1".to_string(),
+                    "--branch".to_string(),
+                    settings.pipeline_repo.git_ref.clone(),
+                    settings.pipeline_repo.remote_url.clone(),
+                    local_path.to_string_lossy().to_string(),
+                ];
+                let (stdout, stderr) = run_git_capture_with_logging(&window, "git clone", &clone_args)?;
+                return Ok([stdout, stderr].join("\n").trim().to_string());
+            }
+
+            emit_bootstrap_log(
+                &window,
+                "[bootstrap] repo already exists, running fetch/pull update",
+            );
+            let detail = run_pipeline_repo_update_internal_with_logging(
+                &window,
+                &local_path,
+                &settings.pipeline_repo,
+            )?;
+            Ok(detail)
+        })();
+
+        match action_result {
+            Ok(detail) => {
+                settings.pipeline_repo.local_path = local_path.to_string_lossy().to_string();
+                settings.pipeline_repo.last_sync_at = Some(Utc::now().to_rfc3339());
+                save_settings(&runtime.out_base_dir, &settings)?;
+                let _ = append_audit_pipeline_repo_event(
+                    &runtime.out_base_dir,
+                    "bootstrap",
+                    "ok",
+                    &detail,
+                    &settings.pipeline_repo,
+                );
+                emit_bootstrap_log(&window, "[bootstrap] settings updated and audit logged");
+            }
+            Err(e) => {
+                let _ = append_audit_pipeline_repo_event(
+                    &runtime.out_base_dir,
+                    "bootstrap",
+                    "error",
+                    &e,
+                    &settings.pipeline_repo,
+                );
+                return Err(e);
+            }
+        }
+
+        get_pipeline_repo_status()
+    })();
+
+    match &result {
+        Ok(status) => {
+            emit_bootstrap_log(
+                &window,
+                &format!("[bootstrap] done: ok ({})", status.local_path),
+            );
+            emit_bootstrap_done(&window, true, "bootstrap completed");
+        }
+        Err(e) => {
+            emit_bootstrap_log(&window, &format!("[bootstrap] done: error: {e}"));
+            emit_bootstrap_done(&window, false, e);
+        }
+    }
+
+    result
+}
+
+#[tauri::command]
 fn update_pipeline_repo() -> Result<PipelineRepoStatus, String> {
     let (runtime, _) = runtime_and_jobs_path()?;
     let mut settings = load_settings(&runtime.out_base_dir)?;
@@ -8505,6 +8722,7 @@ fn main() {
             update_pipeline_repo_settings,
             get_pipeline_repo_status,
             bootstrap_pipeline_repo,
+            bootstrap_pipeline_repo_stream,
             update_pipeline_repo,
             validate_pipeline_repo,
             open_pipeline_repo_folder,
