@@ -329,6 +329,9 @@ export default function App() {
   const [pipelineRunText, setPipelineRunText] = useState("");
   const [pipelineRunTextLoading, setPipelineRunTextLoading] = useState(false);
   const [pipelineRunTextError, setPipelineRunTextError] = useState("");
+  const [liveRunFollow, setLiveRunFollow] = useState(false);
+  const [liveRunTailUsed, setLiveRunTailUsed] = useState(false);
+  const [liveRunTailTruncated, setLiveRunTailTruncated] = useState(false);
 
   const combined = useMemo(() => {
     const parts = [];
@@ -429,29 +432,58 @@ export default function App() {
     }
   }
 
-  async function loadPipelineRunText(runId, kind) {
+  async function loadPipelineRunText(runId, kind, options = {}) {
+    const silent = options?.silent === true;
     if (!runId) {
       setPipelineRunText("");
       setPipelineRunTextError("");
+      setLiveRunTailUsed(false);
+      setLiveRunTailTruncated(false);
       setPipelineRunTextLoading(false);
       return;
     }
-    setPipelineRunTextLoading(true);
-    setPipelineRunTextError("");
+    if (!silent) {
+      setPipelineRunTextLoading(true);
+      setPipelineRunTextError("");
+    }
     try {
-      const text = await invoke("read_run_text", { runId, kind });
-      setPipelineRunText(String(text ?? ""));
+      try {
+        const tail = await invoke("read_run_text_tail", { runId, kind, maxBytes: 200000 });
+        setPipelineRunText(String(tail?.content ?? ""));
+        setLiveRunTailUsed(true);
+        setLiveRunTailTruncated(tail?.truncated === true);
+      } catch {
+        const text = await invoke("read_run_text", { runId, kind });
+        setPipelineRunText(String(text ?? ""));
+        setLiveRunTailUsed(false);
+        setLiveRunTailTruncated(false);
+      }
     } catch (e) {
       const msg = String(e ?? "");
       setPipelineRunText("");
+      setLiveRunTailUsed(false);
+      setLiveRunTailTruncated(false);
       if (msg.toLowerCase().includes("does not exist") || msg.toLowerCase().includes("not found")) {
-        setPipelineRunTextError("存在しない");
+        setPipelineRunTextError("run text does not exist.");
       } else {
         setPipelineRunTextError(msg);
       }
     } finally {
-      setPipelineRunTextLoading(false);
+      if (!silent) {
+        setPipelineRunTextLoading(false);
+      }
     }
+  }
+
+  async function onRefreshLiveRunLogs() {
+    await loadPipelineRunText(selectedPipelineRunId, pipelineRunTab);
+  }
+
+  function onClearLiveRunLogs() {
+    setPipelineRunText("");
+    setPipelineRunTextError("");
+    setLiveRunTailUsed(false);
+    setLiveRunTailTruncated(false);
   }
 
   async function onOpenPipelineRunDir(runId) {
@@ -1671,6 +1703,18 @@ export default function App() {
   }, [selectedPipelineRunId, pipelineRunTab]);
 
   useEffect(() => {
+    if (!selectedPipelineRunId) {
+      setLiveRunFollow(false);
+      return;
+    }
+    if (activeScreen !== "runs" || !liveRunFollow) return;
+    const timer = setInterval(() => {
+      loadPipelineRunText(selectedPipelineRunId, pipelineRunTab, { silent: true });
+    }, 2000);
+    return () => clearInterval(timer);
+  }, [activeScreen, liveRunFollow, selectedPipelineRunId, pipelineRunTab]);
+
+  useEffect(() => {
     const kind = artifactView?.kind ?? "";
     if (kind !== "graph_json" || !artifactView?.content) {
       setGraphParsed(null);
@@ -2327,7 +2371,7 @@ export default function App() {
       <div style={{ border: "1px solid #ddd", borderRadius: 10, padding: 12, background: "#fafafa" }}>
         <div style={{ fontWeight: 600, marginBottom: 8 }}>Pipeline Engine</div>
         <div style={{ fontSize: 12, marginBottom: 8 }}>
-          remote_url / local_path / ref を確認して、Clone/Update/Validate を実行します。
+          remote_url / local_path / ref を確認して、Clone/Update/Validate を実行します、E
         </div>
         <div style={{ display: "grid", gap: 8 }}>
           <label style={{ display: "grid", gap: 4 }}>
@@ -3781,19 +3825,45 @@ export default function App() {
             <div style={{ fontSize: 12, marginBottom: 6 }}>created_at: <code>{selectedPipelineRun?.created_at ?? "-"}</code></div>
             <div style={{ fontSize: 12, marginBottom: 10 }}>status: <code>{selectedPipelineRun?.status ?? "unknown"}</code></div>
 
-            <div style={{ marginBottom: 8 }}>
+            <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>Live run logs</div>
+            <div style={{ marginBottom: 8, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
               <select
                 value={pipelineRunTab}
                 onChange={(e) => setPipelineRunTab(e.target.value)}
-                style={{ padding: 8, borderRadius: 6, border: "1px solid #ccc", minWidth: 320 }}
+                style={{ padding: 8, borderRadius: 6, border: "1px solid #ccc", minWidth: 260 }}
               >
                 {PIPELINE_RUN_ARTIFACT_OPTIONS.map((opt) => (
                   <option key={opt.kind} value={opt.kind}>{opt.label}</option>
                 ))}
               </select>
+              <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
+                <input
+                  type="checkbox"
+                  checked={liveRunFollow}
+                  disabled={!selectedPipelineRunId}
+                  onChange={(e) => setLiveRunFollow(e.target.checked)}
+                />
+                Follow (2s)
+              </label>
+              <button
+                onClick={onRefreshLiveRunLogs}
+                disabled={!selectedPipelineRunId || pipelineRunTextLoading}
+                style={{ padding: "6px 10px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+              >
+                Refresh
+              </button>
+              <button
+                onClick={onClearLiveRunLogs}
+                style={{ padding: "6px 10px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+              >
+                Clear
+              </button>
+              <span style={{ fontSize: 11, opacity: 0.8 }}>
+                source={liveRunTailUsed ? "tail" : "preview"}{liveRunTailTruncated ? " (truncated)" : ""}
+              </span>
             </div>
 
-            {pipelineRunTextLoading ? <div style={{ fontSize: 12, marginBottom: 8 }}>Loading preview...</div> : null}
+            {pipelineRunTextLoading ? <div style={{ fontSize: 12, marginBottom: 8 }}>Loading logs...</div> : null}
             {pipelineRunTextError ? (
               <div style={{ color: "#a33", fontSize: 12, marginBottom: 8 }}>{pipelineRunTextError}</div>
             ) : null}
@@ -4354,3 +4424,4 @@ export default function App() {
     </div>
   );
 }
+
