@@ -126,6 +126,28 @@ function toCanonicalLibraryQuery(node) {
   return candidates[0] ?? "";
 }
 
+function artifactBadgeText(item) {
+  const kind = String(item?.kind ?? "").toLowerCase();
+  if (kind === "markdown") return "md";
+  if (kind === "graph_json") return "graph";
+  if (kind === "json") return "json";
+  if (kind === "html") return "html";
+  const name = String(item?.name ?? "").toLowerCase();
+  if (/\.(png|jpe?g|webp|gif|bmp)$/.test(name)) return "img";
+  if (name.endsWith(".pdf")) return "pdf";
+  if (name.endsWith(".md")) return "md";
+  if (name.endsWith(".json")) return "json";
+  return "other";
+}
+
+function formatBytes(size) {
+  const n = Number(size);
+  if (!Number.isFinite(n) || n < 0) return "-";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 function buildAnalyzePipelineSteps() {
   return [
     {
@@ -242,6 +264,7 @@ export default function App() {
   const [runArtifactCatalog, setRunArtifactCatalog] = useState([]);
   const [runArtifactCatalogLoading, setRunArtifactCatalogLoading] = useState(false);
   const [runArtifactCatalogError, setRunArtifactCatalogError] = useState("");
+  const [runArtifactCatalogQuery, setRunArtifactCatalogQuery] = useState("");
   const [artifactCatalogByRun, setArtifactCatalogByRun] = useState({});
   const [jobs, setJobs] = useState([]);
   const [jobsLoading, setJobsLoading] = useState(false);
@@ -2263,6 +2286,15 @@ export default function App() {
   const selectedPipeline = pipelineDetail && pipelineDetail.pipeline_id === selectedPipelineId
     ? pipelineDetail
     : null;
+  const runArtifactCatalogFiltered = useMemo(() => {
+    const rows = Array.isArray(runArtifactCatalog) ? runArtifactCatalog : [];
+    const q = String(runArtifactCatalogQuery ?? "").trim().toLowerCase();
+    if (!q) return rows;
+    return rows.filter((item) => {
+      const hay = `${item?.name ?? ""} ${item?.rel_path ?? ""} ${item?.kind ?? ""}`.toLowerCase();
+      return hay.includes(q);
+    });
+  }, [runArtifactCatalog, runArtifactCatalogQuery]);
   const opsPipelineRows = useMemo(() => {
     const rows = Array.isArray(pipelines) ? pipelines : [];
     if (!opsNeedsAttentionOnly) return rows;
@@ -3620,13 +3652,19 @@ export default function App() {
 
           <div style={{ border: "1px solid #eee", borderRadius: 6, padding: 8, marginBottom: 8 }}>
             <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>Artifact catalog</div>
+            <input
+              placeholder="Search artifacts (name/path/kind)"
+              value={runArtifactCatalogQuery}
+              onChange={(e) => setRunArtifactCatalogQuery(e.target.value)}
+              style={{ width: "100%", marginBottom: 8, padding: 8, borderRadius: 6, border: "1px solid #ccc", fontSize: 12 }}
+            />
             {runArtifactCatalogLoading ? <div style={{ fontSize: 12 }}>Loading catalog...</div> : null}
             {runArtifactCatalogError ? <div style={{ color: "#a33", fontSize: 12 }}>{runArtifactCatalogError}</div> : null}
-            {!runArtifactCatalogLoading && runArtifactCatalog.length === 0 ? (
+            {!runArtifactCatalogLoading && runArtifactCatalogFiltered.length === 0 ? (
               <div style={{ fontSize: 12, opacity: 0.8 }}>No artifacts found.</div>
             ) : null}
             <div style={{ display: "grid", gap: 6 }}>
-              {runArtifactCatalog.map((item) => (
+              {runArtifactCatalogFiltered.map((item) => (
                 <div
                   key={`${item.rel_path}:${item.name}`}
                   style={{
@@ -3639,8 +3677,21 @@ export default function App() {
                   }}
                 >
                   <div style={{ fontSize: 11 }}>
-                    <div style={{ fontWeight: 600 }}>{item.name}</div>
-                    <div style={{ opacity: 0.8 }}>kind={item.kind} size={item.size_bytes ?? "-"}</div>
+                    <div style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 2 }}>
+                      <span style={{ fontWeight: 600 }}>{item.name}</span>
+                      <span
+                        style={{
+                          fontSize: 10,
+                          padding: "1px 6px",
+                          borderRadius: 999,
+                          border: "1px solid #cfd8e3",
+                          background: "#f7fafc",
+                        }}
+                      >
+                        {artifactBadgeText(item)}
+                      </span>
+                    </div>
+                    <div style={{ opacity: 0.8 }}>kind={item.kind} size={formatBytes(item.size_bytes)}</div>
                     <div style={{ opacity: 0.8 }}>mtime={item.mtime_iso ?? "-"}</div>
                   </div>
                   <button
