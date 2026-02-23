@@ -4702,6 +4702,24 @@ fn resolve_named_artifact_from_catalog(run_dir: &Path, name: &str) -> Result<Art
     Ok(hits.remove(0))
 }
 
+fn resolve_named_artifact_absolute_path(run_dir: &Path, name: &str) -> Result<PathBuf, String> {
+    let item = resolve_named_artifact_from_catalog(run_dir, name)?;
+    let run_dir_canonical = run_dir
+        .canonicalize()
+        .map_err(|e| format!("failed to canonicalize run directory {}: {e}", run_dir.display()))?;
+    let target = run_dir_canonical.join(rel_path_to_pathbuf(&item.rel_path));
+    let canonical = target
+        .canonicalize()
+        .map_err(|e| format!("failed to canonicalize artifact {}: {e}", target.display()))?;
+    if !canonical.starts_with(&run_dir_canonical) {
+        return Err("artifact path is outside run directory".to_string());
+    }
+    if !canonical.is_file() {
+        return Err(format!("artifact is not a file: {}", canonical.display()));
+    }
+    Ok(canonical)
+}
+
 fn read_artifact_content_internal(run_dir: &Path, item: &ArtifactItem) -> Result<NamedArtifactView, String> {
     let run_dir_canonical = run_dir
         .canonicalize()
@@ -7038,6 +7056,16 @@ fn read_run_artifact_named(run_id: String, name: String) -> Result<NamedArtifact
     read_artifact_content_internal(&run_dir, &item)
 }
 
+#[tauri::command]
+fn get_run_artifact_path(run_id: String, name: String) -> Result<String, String> {
+    let root = repo_root();
+    let runtime = resolve_runtime_config(&root)?;
+    let run_id = validate_run_id_component(&run_id)?;
+    let run_dir = resolve_run_dir_from_id(&runtime, &run_id)?;
+    let canonical = resolve_named_artifact_absolute_path(&run_dir, &name)?;
+    Ok(canonical.to_string_lossy().to_string())
+}
+
 fn merge_desktop_input_metadata(
     run_dir: &Path,
     template_id: &str,
@@ -9095,6 +9123,7 @@ fn main() {
             read_run_artifact,
             list_run_artifacts,
             read_run_artifact_named,
+            get_run_artifact_path,
             parse_graph_json,
             normalize_identifier,
             preflight_check,
@@ -9945,6 +9974,26 @@ mod tests {
         let bad = resolve_named_artifact_from_catalog(&run_dir, "../result.json");
         assert!(bad.is_err());
         let slash = resolve_named_artifact_from_catalog(&run_dir, "paper_graph/tree/tree.md");
+        assert!(slash.is_err());
+
+        let _ = fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn resolve_named_artifact_absolute_path_rejects_traversal_patterns() {
+        let run_dir = std::env::temp_dir().join(format!("jarvis_artifacts_path_api_{}", now_epoch_ms()));
+        let _ = fs::create_dir_all(&run_dir);
+        fs::write(run_dir.join("result.json"), "{}")
+            .expect("write result");
+
+        let ok = resolve_named_artifact_absolute_path(&run_dir, "result.json")
+            .expect("resolve result");
+        assert!(ok.is_absolute());
+        assert!(ok.ends_with(Path::new("result.json")));
+
+        let bad = resolve_named_artifact_absolute_path(&run_dir, "../result.json");
+        assert!(bad.is_err());
+        let slash = resolve_named_artifact_absolute_path(&run_dir, "paper_graph/tree/tree.md");
         assert!(slash.is_err());
 
         let _ = fs::remove_dir_all(&run_dir);
