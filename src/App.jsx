@@ -1098,6 +1098,36 @@ export default function App() {
     }
   }
 
+  async function focusLatestPipelineRun(options = {}) {
+    const attemptsRaw = Number(options?.attempts ?? 5);
+    const delayMsRaw = Number(options?.delayMs ?? 700);
+    const attempts = Number.isFinite(attemptsRaw) ? Math.max(1, Math.trunc(attemptsRaw)) : 5;
+    const delayMs = Number.isFinite(delayMsRaw) ? Math.max(0, Math.trunc(delayMsRaw)) : 700;
+
+    for (let i = 0; i < attempts; i += 1) {
+      try {
+        const rows = await invoke("list_pipeline_runs", { limit: 200 });
+        const list = Array.isArray(rows) ? rows : [];
+        setPipelineRuns(list);
+        setPipelineRunsError("");
+        const latestRunId = list[0]?.run_id ?? "";
+        if (latestRunId) {
+          setSelectedPipelineRunId(latestRunId);
+          return latestRunId;
+        }
+      } catch (e) {
+        setPipelineRunsError(String(e));
+      }
+
+      if (i + 1 < attempts && delayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
+
+    setSelectedPipelineRunId("");
+    return "";
+  }
+
   async function onRunAnalyzePipeline() {
     const idForRun = normalized?.canonical?.trim() ? normalized.canonical : paperId;
     setPipelineValidationMissing([]);
@@ -1144,6 +1174,8 @@ export default function App() {
       await loadPipelines();
       await loadJobs();
       setSelectedPipelineId(pipelineId);
+      setActiveScreen("runs");
+      await focusLatestPipelineRun({ attempts: 6, delayMs: 700 });
     } catch (e) {
       alert(String(e));
     }
@@ -1791,6 +1823,8 @@ export default function App() {
       setLastRunRequest(params);
       await loadJobs();
       setSelectedJobId(jobId);
+      setActiveScreen("runs");
+      await focusLatestPipelineRun({ attempts: 8, delayMs: 500 });
     } catch (e) {
       setStderr(String(e));
       setStatus("error");
