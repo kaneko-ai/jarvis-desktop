@@ -160,6 +160,60 @@ Rejected:
 - UNC / device prefixes (`\\`, `\\?\`, `\\.\`)
 - paths outside allowed roots after canonicalization
 
+## Template Required Inference Rules
+
+`list_task_templates` returns `required_fields` using deterministic rules:
+1. Use explicit `required_fields` when present in template definition.
+2. Else use `params_schema.required` when present.
+3. Else infer from params whose `default_value` is `null` (no default).
+4. Else return `required_fields: null`.
+
+Notes:
+- This is rule-based, not heuristic guessing.
+- `required_fields` is optional for backward compatibility.
+
+## Validation UI Guide
+
+Start Pipeline validation uses `validate_template_inputs` on every start attempt.
+
+Result buckets:
+- `missing`: required fields not provided.
+- `invalid`: type/range/enum violations.
+- `warnings`: schema unavailable or non-blocking hints.
+
+Behavior:
+- Start is blocked when `missing` or `invalid` is non-empty.
+- `warnings` do not block execution.
+- UI shows a single "Validation results" panel with counts/details.
+
+## CI Flake Guard
+
+Workflow: `.github/workflows/rust-flake-guard.yml`
+
+Purpose:
+- Catch intermittent test failures by running `cargo test` twice on the same CI job.
+
+Current scope:
+- Single `windows-latest` runner to limit cost.
+
+Fast triage when it fails:
+1. Open the failed run and identify whether first/second pass failed.
+2. Reproduce locally with repeated parallel test runs.
+3. Find colliding shared state (temp paths, config file, env, global locks).
+4. Fix for parallel safety (preferred) and rerun repeated tests.
+
+## Start -> Run -> Logs Expected Flow
+
+Expected behavior after starting a template or pipeline:
+1. App navigates to `Run Explorer`.
+2. App retries `list_pipeline_runs` and focuses the latest run.
+3. Live logs `Follow` is enabled automatically.
+4. Preferred log kind is selected.
+5. If `audit.jsonl` exists, use `audit` kind.
+6. If not, fallback to current/default kind.
+7. If latest run is not available yet, UI shows `Still starting...`.
+8. `Show runs` button is available as manual fallback.
+
 ## Troubleshooting
 
 ### 429 / transient API failures
