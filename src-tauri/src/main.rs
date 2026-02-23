@@ -9059,7 +9059,10 @@ mod tests {
 
     fn config_file_test_guard() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().expect("lock config file guard")
+        LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     #[test]
@@ -10750,6 +10753,7 @@ mod tests {
 
     #[test]
     fn workspace_import_rejects_zip_slip_entry() {
+        let _guard = config_file_test_guard();
         let base = std::env::temp_dir().join(format!("jarvis_ws_zipslip_{}", now_epoch_ms()));
         let runtime = build_test_runtime(&base);
         let zip_path = base.join("bad.zip");
@@ -10777,6 +10781,7 @@ mod tests {
 
     #[test]
     fn workspace_import_enforces_allowlist_and_caps() {
+        let _guard = config_file_test_guard();
         let base = std::env::temp_dir().join(format!("jarvis_ws_caps_{}", now_epoch_ms()));
         let runtime = build_test_runtime(&base);
 
@@ -10825,6 +10830,7 @@ mod tests {
 
     #[test]
     fn workspace_import_refuses_higher_schema_version() {
+        let _guard = config_file_test_guard();
         let base = std::env::temp_dir().join(format!("jarvis_ws_schema_{}", now_epoch_ms()));
         let runtime = build_test_runtime(&base);
         let zip_path = base.join("schema.zip");
@@ -10917,6 +10923,7 @@ mod tests {
 
     #[test]
     fn workspace_import_settings_replace_uses_imported_values() {
+        let _guard = config_file_test_guard();
         let base = std::env::temp_dir().join(format!("jarvis_ws_settings_replace_{}", now_epoch_ms()));
         let runtime = build_test_runtime(&base);
         let mut current = DesktopSettings::default();
