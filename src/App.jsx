@@ -243,6 +243,12 @@ export default function App() {
   const [runArtifactCatalogLoading, setRunArtifactCatalogLoading] = useState(false);
   const [runArtifactCatalogError, setRunArtifactCatalogError] = useState("");
   const [artifactCatalogByRun, setArtifactCatalogByRun] = useState({});
+  const [compareRunIdA, setCompareRunIdA] = useState("");
+  const [compareRunIdB, setCompareRunIdB] = useState("");
+  const [compareArtifactsA, setCompareArtifactsA] = useState([]);
+  const [compareArtifactsB, setCompareArtifactsB] = useState([]);
+  const [compareArtifactsLoading, setCompareArtifactsLoading] = useState(false);
+  const [compareArtifactsError, setCompareArtifactsError] = useState("");
   const [jobs, setJobs] = useState([]);
   const [jobsLoading, setJobsLoading] = useState(false);
   const [jobsError, setJobsError] = useState("");
@@ -1654,6 +1660,31 @@ export default function App() {
     }
   }
 
+  async function loadCompareArtifacts(runIdA, runIdB) {
+    if (!runIdA || !runIdB) {
+      setCompareArtifactsA([]);
+      setCompareArtifactsB([]);
+      setCompareArtifactsError("");
+      return;
+    }
+    setCompareArtifactsLoading(true);
+    setCompareArtifactsError("");
+    try {
+      const [aRows, bRows] = await Promise.all([
+        invoke("list_run_artifacts", { runId: runIdA }),
+        invoke("list_run_artifacts", { runId: runIdB }),
+      ]);
+      setCompareArtifactsA(Array.isArray(aRows) ? aRows : []);
+      setCompareArtifactsB(Array.isArray(bRows) ? bRows : []);
+    } catch (e) {
+      setCompareArtifactsA([]);
+      setCompareArtifactsB([]);
+      setCompareArtifactsError(String(e));
+    } finally {
+      setCompareArtifactsLoading(false);
+    }
+  }
+
   useEffect(() => {
     loadRuntimeConfig(false);
     loadPreflight();
@@ -1811,6 +1842,27 @@ export default function App() {
   useEffect(() => {
     loadSelectedRunArtifactCatalog(selectedRunId);
   }, [selectedRunId]);
+
+  useEffect(() => {
+    const list = Array.isArray(runs) ? runs : [];
+    if (list.length === 0) {
+      setCompareRunIdA("");
+      setCompareRunIdB("");
+      return;
+    }
+    setCompareRunIdA((prev) => {
+      if (prev && list.some((r) => r.run_id === prev)) return prev;
+      return list[0]?.run_id ?? "";
+    });
+    setCompareRunIdB((prev) => {
+      if (prev && list.some((r) => r.run_id === prev)) return prev;
+      return list[1]?.run_id ?? list[0]?.run_id ?? "";
+    });
+  }, [runs]);
+
+  useEffect(() => {
+    loadCompareArtifacts(compareRunIdA, compareRunIdB);
+  }, [compareRunIdA, compareRunIdB]);
 
   useEffect(() => {
     liveRunTextRequestSeqRef.current += 1;
@@ -2284,6 +2336,33 @@ export default function App() {
   const artifactKind = artifactView?.kind ?? "";
   const isHtmlArtifact = artifactKind === "html";
   const isGraphJsonArtifact = artifactKind === "graph_json";
+  const artifactCompareSummary = useMemo(() => {
+    const mapA = new Map();
+    const mapB = new Map();
+    for (const item of compareArtifactsA) mapA.set(item.name, item);
+    for (const item of compareArtifactsB) mapB.set(item.name, item);
+
+    const onlyA = [];
+    const onlyB = [];
+    const common = [];
+
+    for (const [name, itemA] of mapA.entries()) {
+      if (mapB.has(name)) {
+        common.push({ name, itemA, itemB: mapB.get(name) });
+      } else {
+        onlyA.push(itemA);
+      }
+    }
+    for (const [name, itemB] of mapB.entries()) {
+      if (!mapA.has(name)) {
+        onlyB.push(itemB);
+      }
+    }
+    onlyA.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    onlyB.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    common.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    return { onlyA, onlyB, common };
+  }, [compareArtifactsA, compareArtifactsB]);
   const graphNodes = Array.isArray(graphParsed?.nodes) ? graphParsed.nodes : [];
   const graphEdges = Array.isArray(graphParsed?.edges) ? graphParsed.edges : [];
   const graphTypes = useMemo(() => {
@@ -3916,6 +3995,108 @@ export default function App() {
               )}
             </div>
           ) : null}
+        </div>
+      </div>
+
+      <div style={{ marginTop: 12, border: "1px solid #ddd", borderRadius: 8, padding: 10 }}>
+        <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 8 }}>Compare runs (artifacts diff)</div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
+          <select
+            value={compareRunIdA}
+            onChange={(e) => setCompareRunIdA(e.target.value)}
+            style={{ padding: 8, borderRadius: 6, border: "1px solid #ccc", minWidth: 220 }}
+          >
+            {runs.map((row) => (
+              <option key={`compare-a-${row.run_id}`} value={row.run_id}>
+                A: {row.run_id}
+              </option>
+            ))}
+          </select>
+          <select
+            value={compareRunIdB}
+            onChange={(e) => setCompareRunIdB(e.target.value)}
+            style={{ padding: 8, borderRadius: 6, border: "1px solid #ccc", minWidth: 220 }}
+          >
+            {runs.map((row) => (
+              <option key={`compare-b-${row.run_id}`} value={row.run_id}>
+                B: {row.run_id}
+              </option>
+            ))}
+          </select>
+          <button
+            onClick={() => loadCompareArtifacts(compareRunIdA, compareRunIdB)}
+            disabled={!compareRunIdA || !compareRunIdB || compareArtifactsLoading}
+            style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #333" }}
+          >
+            {compareArtifactsLoading ? "Comparing..." : "Refresh compare"}
+          </button>
+        </div>
+        {compareArtifactsError ? (
+          <div style={{ color: "#a33", fontSize: 12, marginBottom: 8 }}>{compareArtifactsError}</div>
+        ) : null}
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
+          <div style={{ border: "1px solid #eee", borderRadius: 6, padding: 8 }}>
+            <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>
+              only in A ({artifactCompareSummary.onlyA.length})
+            </div>
+            <div style={{ maxHeight: 180, overflow: "auto", display: "grid", gap: 4 }}>
+              {artifactCompareSummary.onlyA.map((item) => (
+                <div key={`only-a-${item.rel_path}`} style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 6 }}>
+                  <div style={{ fontSize: 11 }}>{item.name}</div>
+                  <button
+                    onClick={() => onOpenNamedArtifactForRun(compareRunIdA, item.name)}
+                    style={{ padding: "2px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 10 }}
+                  >
+                    Open A
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div style={{ border: "1px solid #eee", borderRadius: 6, padding: 8 }}>
+            <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>
+              only in B ({artifactCompareSummary.onlyB.length})
+            </div>
+            <div style={{ maxHeight: 180, overflow: "auto", display: "grid", gap: 4 }}>
+              {artifactCompareSummary.onlyB.map((item) => (
+                <div key={`only-b-${item.rel_path}`} style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 6 }}>
+                  <div style={{ fontSize: 11 }}>{item.name}</div>
+                  <button
+                    onClick={() => onOpenNamedArtifactForRun(compareRunIdB, item.name)}
+                    style={{ padding: "2px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 10 }}
+                  >
+                    Open B
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div style={{ border: "1px solid #eee", borderRadius: 6, padding: 8 }}>
+            <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6 }}>
+              common ({artifactCompareSummary.common.length})
+            </div>
+            <div style={{ maxHeight: 180, overflow: "auto", display: "grid", gap: 4 }}>
+              {artifactCompareSummary.common.map((pair) => (
+                <div key={`common-${pair.name}`} style={{ display: "grid", gap: 4 }}>
+                  <div style={{ fontSize: 11 }}>{pair.name}</div>
+                  <div style={{ display: "flex", gap: 6 }}>
+                    <button
+                      onClick={() => onOpenNamedArtifactForRun(compareRunIdA, pair.name)}
+                      style={{ padding: "2px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 10 }}
+                    >
+                      Open A
+                    </button>
+                    <button
+                      onClick={() => onOpenNamedArtifactForRun(compareRunIdB, pair.name)}
+                      style={{ padding: "2px 8px", borderRadius: 6, border: "1px solid #333", fontSize: 10 }}
+                    >
+                      Open B
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
         </div>
       </div>
       </>
