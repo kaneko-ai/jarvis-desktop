@@ -813,17 +813,74 @@ fn build_template_params_schema(params: &[TemplateParamDef]) -> Option<serde_jso
         properties.insert(p.key.clone(), serde_json::Value::Object(def));
     }
 
-    Some(serde_json::json!({
+    let mut schema = serde_json::json!({
         "type": "object",
         "properties": properties,
         "additionalProperties": false
-    }))
+    });
+    if let Some(required) = infer_required_fields_from_params(params) {
+        if let Some(obj) = schema.as_object_mut() {
+            obj.insert("required".to_string(), serde_json::json!(required));
+        }
+    }
+    Some(schema)
+}
+
+fn infer_required_fields_from_params(params: &[TemplateParamDef]) -> Option<Vec<String>> {
+    let inferred = params
+        .iter()
+        .filter(|p| p.default_value.is_null())
+        .map(|p| p.key.clone())
+        .collect::<Vec<_>>();
+    if inferred.is_empty() {
+        None
+    } else {
+        Some(inferred)
+    }
+}
+
+fn parse_required_fields_from_schema(schema: &serde_json::Value) -> Option<Vec<String>> {
+    let required = schema
+        .get("required")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| item.as_str().map(|s| s.to_string()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if required.is_empty() {
+        None
+    } else {
+        Some(required)
+    }
+}
+
+fn resolve_template_required_fields(template: &TaskTemplateDef) -> Option<Vec<String>> {
+    if let Some(explicit) = template.required_fields.as_ref() {
+        let out = explicit
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
+        if !out.is_empty() {
+            return Some(out);
+        }
+    }
+    if let Some(schema) = template.params_schema.as_ref() {
+        if let Some(from_schema) = parse_required_fields_from_schema(schema) {
+            return Some(from_schema);
+        }
+    }
+    infer_required_fields_from_params(&template.params)
 }
 
 fn enrich_template_schema(mut template: TaskTemplateDef) -> TaskTemplateDef {
     if template.params_schema.is_none() {
         template.params_schema = build_template_params_schema(&template.params);
     }
+    template.required_fields = resolve_template_required_fields(&template);
     template
 }
 
@@ -9320,6 +9377,73 @@ mod tests {
             .expect("TEMPLATE_SUMMARY missing");
         assert!(summary.required_fields.is_none());
         assert!(summary.params_schema.is_none());
+    }
+
+    #[test]
+    fn required_fields_are_inferred_when_param_default_is_missing() {
+        let template = TaskTemplateDef {
+            id: "TEST_INFER_REQUIRED".to_string(),
+            title: "Test".to_string(),
+            description: "test".to_string(),
+            wired: true,
+            disabled_reason: "".to_string(),
+            params: vec![
+                TemplateParamDef {
+                    key: "must_fill".to_string(),
+                    label: "Must fill".to_string(),
+                    param_type: "string".to_string(),
+                    default_value: serde_json::Value::Null,
+                    min: None,
+                    max: None,
+                },
+                TemplateParamDef {
+                    key: "optional_with_default".to_string(),
+                    label: "Optional".to_string(),
+                    param_type: "integer".to_string(),
+                    default_value: serde_json::json!(3),
+                    min: Some(1),
+                    max: Some(5),
+                },
+            ],
+            required_fields: None,
+            params_schema: None,
+        };
+
+        let enriched = enrich_template_schema(template);
+        assert_eq!(
+            enriched.required_fields,
+            Some(vec!["must_fill".to_string()])
+        );
+    }
+
+    #[test]
+    fn explicit_required_fields_take_priority_over_inference() {
+        let template = TaskTemplateDef {
+            id: "TEST_EXPLICIT_REQUIRED".to_string(),
+            title: "Test".to_string(),
+            description: "test".to_string(),
+            wired: true,
+            disabled_reason: "".to_string(),
+            params: vec![TemplateParamDef {
+                key: "inferred_candidate".to_string(),
+                label: "Inferred candidate".to_string(),
+                param_type: "string".to_string(),
+                default_value: serde_json::Value::Null,
+                min: None,
+                max: None,
+            }],
+            required_fields: Some(vec!["explicit_required".to_string()]),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "inferred_candidate": {"type": "string"}
+                },
+                "required": ["schema_required"]
+            })),
+        };
+
+        let resolved = resolve_template_required_fields(&template);
+        assert_eq!(resolved, Some(vec!["explicit_required".to_string()]));
     }
 
     #[test]
