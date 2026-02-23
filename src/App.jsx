@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -332,6 +332,10 @@ export default function App() {
   const [liveRunFollow, setLiveRunFollow] = useState(false);
   const [liveRunTailUsed, setLiveRunTailUsed] = useState(false);
   const [liveRunTailTruncated, setLiveRunTailTruncated] = useState(false);
+  const [liveRunStickToBottom, setLiveRunStickToBottom] = useState(true);
+  const liveRunTextPreRef = useRef(null);
+  const liveRunTextDebounceRef = useRef(null);
+  const liveRunTextRequestSeqRef = useRef(0);
 
   const combined = useMemo(() => {
     const parts = [];
@@ -432,8 +436,11 @@ export default function App() {
     }
   }
 
-  async function loadPipelineRunText(runId, kind, options = {}) {
+  const loadPipelineRunText = useCallback(async (runId, kind, options = {}) => {
     const silent = options?.silent === true;
+    const requestSeq = liveRunTextRequestSeqRef.current + 1;
+    liveRunTextRequestSeqRef.current = requestSeq;
+    const isStale = () => requestSeq !== liveRunTextRequestSeqRef.current;
     if (!runId) {
       setPipelineRunText("");
       setPipelineRunTextError("");
@@ -449,16 +456,19 @@ export default function App() {
     try {
       try {
         const tail = await invoke("read_run_text_tail", { runId, kind, maxBytes: 200000 });
+        if (isStale()) return;
         setPipelineRunText(String(tail?.content ?? ""));
         setLiveRunTailUsed(true);
         setLiveRunTailTruncated(tail?.truncated === true);
       } catch {
         const text = await invoke("read_run_text", { runId, kind });
+        if (isStale()) return;
         setPipelineRunText(String(text ?? ""));
         setLiveRunTailUsed(false);
         setLiveRunTailTruncated(false);
       }
     } catch (e) {
+      if (isStale()) return;
       const msg = String(e ?? "");
       setPipelineRunText("");
       setLiveRunTailUsed(false);
@@ -469,11 +479,28 @@ export default function App() {
         setPipelineRunTextError(msg);
       }
     } finally {
-      if (!silent) {
+      if (!silent && !isStale()) {
         setPipelineRunTextLoading(false);
       }
     }
-  }
+  }, []);
+
+  const schedulePipelineRunTextLoad = useCallback((runId, kind, options = {}) => {
+    const debounceMsRaw = Number(options?.debounceMs ?? 150);
+    const debounceMs = Number.isFinite(debounceMsRaw) ? Math.max(0, Math.trunc(debounceMsRaw)) : 150;
+    if (liveRunTextDebounceRef.current) {
+      clearTimeout(liveRunTextDebounceRef.current);
+      liveRunTextDebounceRef.current = null;
+    }
+    if (debounceMs === 0) {
+      void loadPipelineRunText(runId, kind, options);
+      return;
+    }
+    liveRunTextDebounceRef.current = setTimeout(() => {
+      liveRunTextDebounceRef.current = null;
+      void loadPipelineRunText(runId, kind, options);
+    }, debounceMs);
+  }, [loadPipelineRunText]);
 
   async function onRefreshLiveRunLogs() {
     await loadPipelineRunText(selectedPipelineRunId, pipelineRunTab);
@@ -484,6 +511,21 @@ export default function App() {
     setPipelineRunTextError("");
     setLiveRunTailUsed(false);
     setLiveRunTailTruncated(false);
+  }
+
+  function scrollLiveRunTextToBottom() {
+    const el = liveRunTextPreRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }
+
+  function onLiveRunTextScroll(e) {
+    if (!liveRunFollow || !liveRunStickToBottom) return;
+    const el = e.currentTarget;
+    const nearBottom = (el.scrollHeight - el.scrollTop - el.clientHeight) <= 8;
+    if (!nearBottom) {
+      setLiveRunStickToBottom(false);
+    }
   }
 
   async function onOpenPipelineRunDir(runId) {
@@ -1731,20 +1773,43 @@ export default function App() {
   }, [selectedRunId]);
 
   useEffect(() => {
-    loadPipelineRunText(selectedPipelineRunId, pipelineRunTab);
-  }, [selectedPipelineRunId, pipelineRunTab]);
+    liveRunTextRequestSeqRef.current += 1;
+    schedulePipelineRunTextLoad(selectedPipelineRunId, pipelineRunTab, { debounceMs: 120 });
+  }, [selectedPipelineRunId, pipelineRunTab, schedulePipelineRunTextLoad]);
 
   useEffect(() => {
     if (!selectedPipelineRunId) {
       setLiveRunFollow(false);
+      setLiveRunStickToBottom(true);
       return;
     }
+    setLiveRunStickToBottom(true);
+  }, [selectedPipelineRunId]);
+
+  useEffect(() => {
     if (activeScreen !== "runs" || !liveRunFollow) return;
     const timer = setInterval(() => {
-      loadPipelineRunText(selectedPipelineRunId, pipelineRunTab, { silent: true });
+      schedulePipelineRunTextLoad(selectedPipelineRunId, pipelineRunTab, { silent: true, debounceMs: 200 });
     }, 2000);
     return () => clearInterval(timer);
-  }, [activeScreen, liveRunFollow, selectedPipelineRunId, pipelineRunTab]);
+  }, [activeScreen, liveRunFollow, selectedPipelineRunId, pipelineRunTab, schedulePipelineRunTextLoad]);
+
+  useEffect(() => {
+    if (activeScreen !== "runs" || !liveRunFollow || !liveRunStickToBottom) return;
+    const timer = setTimeout(() => {
+      scrollLiveRunTextToBottom();
+    }, 0);
+    return () => clearTimeout(timer);
+  }, [activeScreen, liveRunFollow, liveRunStickToBottom, pipelineRunText]);
+
+  useEffect(() => {
+    return () => {
+      if (liveRunTextDebounceRef.current) {
+        clearTimeout(liveRunTextDebounceRef.current);
+        liveRunTextDebounceRef.current = null;
+      }
+    };
+  }, []);
 
   useEffect(() => {
     const kind = artifactView?.kind ?? "";
@@ -3875,9 +3940,23 @@ export default function App() {
                   type="checkbox"
                   checked={liveRunFollow}
                   disabled={!selectedPipelineRunId}
-                  onChange={(e) => setLiveRunFollow(e.target.checked)}
+                  onChange={(e) => {
+                    const checked = e.target.checked;
+                    setLiveRunFollow(checked);
+                    if (checked) {
+                      setLiveRunStickToBottom(true);
+                    }
+                  }}
                 />
                 Follow (2s)
+              </label>
+              <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
+                <input
+                  type="checkbox"
+                  checked={liveRunStickToBottom}
+                  onChange={(e) => setLiveRunStickToBottom(e.target.checked)}
+                />
+                Stick to bottom
               </label>
               <button
                 onClick={onRefreshLiveRunLogs}
@@ -3892,6 +3971,16 @@ export default function App() {
               >
                 Clear
               </button>
+              <button
+                onClick={() => {
+                  setLiveRunStickToBottom(true);
+                  scrollLiveRunTextToBottom();
+                }}
+                disabled={!selectedPipelineRunId}
+                style={{ padding: "6px 10px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+              >
+                Jump to bottom
+              </button>
               <span style={{ fontSize: 11, opacity: 0.8 }}>
                 source={liveRunTailUsed ? "tail" : "preview"}{liveRunTailTruncated ? " (truncated)" : ""}
               </span>
@@ -3903,6 +3992,8 @@ export default function App() {
             ) : null}
 
             <pre
+              ref={liveRunTextPreRef}
+              onScroll={onLiveRunTextScroll}
               style={{
                 margin: 0,
                 minHeight: 320,
