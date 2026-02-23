@@ -2189,6 +2189,10 @@ export default function App() {
     2
   );
   const pipelineStartDisabled = pipelineStartMissingRequirements.length > 0;
+  const hasPipelineValidationMessages =
+    pipelineValidationMissing.length > 0
+    || pipelineValidationInvalid.length > 0
+    || pipelineValidationWarnings.length > 0;
 
   const showRetryButton = status === "needs_retry" && !!lastRunRequest;
   const pipelineRunQueryNormalized = String(pipelineRunQuery ?? "").trim().toLowerCase();
@@ -3168,20 +3172,39 @@ export default function App() {
           Missing requirements: {pipelineStartMissingRequirements.join(" | ")}
         </div>
       ) : null}
-      {pipelineValidationMissing.length > 0 ? (
-        <div style={{ color: "#a33", fontSize: 12, marginBottom: 6 }}>
-          Validation missing: {pipelineValidationMissing.join(" | ")}
-        </div>
-      ) : null}
-      {pipelineValidationInvalid.length > 0 ? (
-        <div style={{ color: "#a33", fontSize: 12, marginBottom: 6 }}>
-          Validation invalid: {pipelineValidationInvalid.join(" | ")}
-        </div>
-      ) : null}
-      {pipelineValidationWarnings.length > 0 ? (
-        <div style={{ color: "#8a4200", fontSize: 12, marginBottom: 6 }}>
-          Validation warnings: {pipelineValidationWarnings.join(" | ")}
-        </div>
+      {hasPipelineValidationMessages ? (
+        <details
+          open
+          style={{
+            border: "1px solid #ddd",
+            borderRadius: 8,
+            padding: 8,
+            marginBottom: 8,
+            background: "#fff",
+          }}
+        >
+          <summary style={{ cursor: "pointer", fontSize: 12, fontWeight: 600 }}>
+            Validation results
+            {pipelineValidationMissing.length > 0 ? ` | missing=${pipelineValidationMissing.length}` : ""}
+            {pipelineValidationInvalid.length > 0 ? ` | invalid=${pipelineValidationInvalid.length}` : ""}
+            {pipelineValidationWarnings.length > 0 ? ` | warnings=${pipelineValidationWarnings.length}` : ""}
+          </summary>
+          {pipelineValidationMissing.length > 0 ? (
+            <div style={{ color: "#a33", fontSize: 12, marginTop: 6 }}>
+              missing: {pipelineValidationMissing.join(" | ")}
+            </div>
+          ) : null}
+          {pipelineValidationInvalid.length > 0 ? (
+            <div style={{ color: "#a33", fontSize: 12, marginTop: 6 }}>
+              invalid: {pipelineValidationInvalid.join(" | ")}
+            </div>
+          ) : null}
+          {pipelineValidationWarnings.length > 0 ? (
+            <div style={{ color: "#8a4200", fontSize: 12, marginTop: 6 }}>
+              warnings: {pipelineValidationWarnings.join(" | ")}
+            </div>
+          ) : null}
+        </details>
       ) : null}
       {pipelinesError ? <div style={{ color: "#a33", fontSize: 12, marginBottom: 8 }}>{pipelinesError}</div> : null}
 
