@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
@@ -230,6 +230,8 @@ export default function App() {
   const [artifactView, setArtifactView] = useState(null);
   const [artifactWarnings, setArtifactWarnings] = useState([]);
   const [artifactWrap, setArtifactWrap] = useState(true);
+  const [artifactPreviewPath, setArtifactPreviewPath] = useState("");
+  const [artifactPreviewError, setArtifactPreviewError] = useState("");
   const [graphParsed, setGraphParsed] = useState(null);
   const [graphParseLoading, setGraphParseLoading] = useState(false);
   const [graphParseError, setGraphParseError] = useState("");
@@ -1351,6 +1353,15 @@ export default function App() {
     return "";
   }
 
+  function mapLegacyKeyToArtifactName(artifactKey) {
+    if (artifactKey === "tree_md") return "tree.md";
+    if (artifactKey === "result_json") return "result.json";
+    if (artifactKey === "input_json") return "input.json";
+    if (artifactKey === "stdout_log") return "stdout.log";
+    if (artifactKey === "stderr_log") return "stderr.log";
+    return "";
+  }
+
   async function fetchArtifactCatalogForRun(runId, force = false) {
     if (!runId) return;
     let shouldFetch = false;
@@ -1811,6 +1822,38 @@ export default function App() {
   useEffect(() => {
     loadSelectedRunArtifactCatalog(selectedRunId);
   }, [selectedRunId]);
+
+  useEffect(() => {
+    if (!selectedRunId) {
+      setArtifactPreviewPath("");
+      setArtifactPreviewError("");
+      return;
+    }
+    const currentArtifactName = String(artifactView?.artifact ?? "").trim();
+    const selectedName = mapLegacyKeyToArtifactName(selectedArtifact);
+    const artifactName = currentArtifactName && !mapLegacyKeyToArtifactName(currentArtifactName)
+      ? currentArtifactName
+      : (selectedName || (currentArtifactName ? (mapLegacyKeyToArtifactName(currentArtifactName) || currentArtifactName) : ""));
+    if (!artifactName) {
+      setArtifactPreviewPath("");
+      setArtifactPreviewError("");
+      return;
+    }
+    (async () => {
+      setArtifactPreviewError("");
+      try {
+        const resolved = await invoke("get_run_artifact_path", { runId: selectedRunId, name: artifactName });
+        setArtifactPreviewPath(String(resolved ?? ""));
+      } catch {
+        const fallback = String(artifactView?.path ?? "").trim();
+        if (fallback && (/^[a-zA-Z]:\\/.test(fallback) || fallback.startsWith("/"))) {
+          setArtifactPreviewPath(fallback);
+        } else {
+          setArtifactPreviewPath("");
+        }
+      }
+    })();
+  }, [selectedRunId, selectedArtifact, artifactView?.artifact, artifactView?.path]);
 
   useEffect(() => {
     liveRunTextRequestSeqRef.current += 1;
@@ -2284,6 +2327,24 @@ export default function App() {
   const artifactKind = artifactView?.kind ?? "";
   const isHtmlArtifact = artifactKind === "html";
   const isGraphJsonArtifact = artifactKind === "graph_json";
+  const artifactPreviewPathLower = String(artifactPreviewPath ?? "").toLowerCase();
+  const isImageArtifact = /\.(png|jpe?g|webp|gif|bmp)$/.test(artifactPreviewPathLower);
+  const isPdfArtifact = artifactPreviewPathLower.endsWith(".pdf");
+  const isJsonArtifact = artifactKind === "json" || artifactPreviewPathLower.endsWith(".json");
+  const artifactJsonPreview = useMemo(() => {
+    if (!isJsonArtifact) return "";
+    const raw = String(artifactView?.content ?? "");
+    if (!raw) return "";
+    if (raw.length > 300_000) {
+      return "JSON preview is large. Use Open artifact for full view.";
+    }
+    try {
+      const parsed = JSON.parse(raw);
+      return JSON.stringify(parsed, null, 2);
+    } catch {
+      return raw;
+    }
+  }, [isJsonArtifact, artifactView?.content]);
   const graphNodes = Array.isArray(graphParsed?.nodes) ? graphParsed.nodes : [];
   const graphEdges = Array.isArray(graphParsed?.edges) ? graphParsed.edges : [];
   const graphTypes = useMemo(() => {
@@ -3672,6 +3733,16 @@ export default function App() {
               <div style={{ fontSize: 11, opacity: 0.8, marginBottom: 6 }}>
                 artifact_path=<code>{artifactView.path}</code> parse_status=<code>{artifactView.parse_status}</code>
               </div>
+              {artifactPreviewPath ? (
+                <div style={{ fontSize: 11, opacity: 0.8, marginBottom: 6 }}>
+                  preview_path=<code>{artifactPreviewPath}</code>
+                </div>
+              ) : null}
+              {artifactPreviewError ? (
+                <div style={{ color: "#a33", fontSize: 12, marginBottom: 6 }}>
+                  {artifactPreviewError}
+                </div>
+              ) : null}
               {selectedArtifact === "tree_md" && artifactView.exists ? (
                 <div
                   style={{
@@ -3882,6 +3953,37 @@ export default function App() {
                     />
                   )}
                 </div>
+              ) : isImageArtifact && artifactView.exists && artifactPreviewPath ? (
+                <div style={{ border: "1px solid #eee", borderRadius: 6, padding: 8, background: "#fff" }}>
+                  <img
+                    src={convertFileSrc(artifactPreviewPath)}
+                    alt={artifactView.artifact ?? "artifact-image"}
+                    style={{ width: "100%", maxHeight: 520, objectFit: "contain" }}
+                  />
+                </div>
+              ) : isPdfArtifact && artifactView.exists && artifactPreviewPath ? (
+                <div style={{ border: "1px solid #eee", borderRadius: 6, overflow: "hidden", background: "#fff" }}>
+                  <iframe
+                    title="artifact-pdf-viewer"
+                    src={convertFileSrc(artifactPreviewPath)}
+                    style={{ width: "100%", height: 520, border: "none" }}
+                  />
+                </div>
+              ) : isJsonArtifact && artifactView.exists ? (
+                <textarea
+                  readOnly
+                  value={artifactJsonPreview}
+                  wrap={artifactWrap ? "soft" : "off"}
+                  style={{
+                    width: "100%",
+                    height: 320,
+                    padding: 10,
+                    borderRadius: 8,
+                    border: "1px solid #ccc",
+                    fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+                    fontSize: 12,
+                  }}
+                />
               ) : (
                 <div>
                   <div style={{ display: "flex", gap: 8, marginBottom: 6 }}>
