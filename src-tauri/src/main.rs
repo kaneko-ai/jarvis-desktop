@@ -8675,6 +8675,85 @@ fn run_papers_tree(paper_id: String, depth: u8, max_per_level: u32) -> RunResult
     run_task_template("TEMPLATE_TREE".to_string(), paper_id, params)
 }
 
+fn resolve_safe_open_target(raw: &str, runtime: &RuntimeConfig) -> Result<PathBuf, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("RULE_OPEN_PATH_EMPTY: path is empty".to_string());
+    }
+    if has_disallowed_windows_prefix(trimmed) {
+        return Err("RULE_OPEN_PATH_PREFIX: UNC/device-prefixed path is not allowed".to_string());
+    }
+
+    let requested = PathBuf::from(trimmed);
+    let requested_abs = if requested.is_absolute() {
+        requested
+    } else {
+        absolutize(&requested, &runtime.pipeline_root)
+    };
+    if !requested_abs.exists() {
+        return Err(format!("RULE_OPEN_PATH_NOT_FOUND: path does not exist: {}", requested_abs.display()));
+    }
+    let requested_canonical = requested_abs.canonicalize().map_err(|e| {
+        format!(
+            "RULE_OPEN_PATH_CANONICALIZE_FAILED: failed to canonicalize {}: {e}",
+            requested_abs.display()
+        )
+    })?;
+
+    let mut allowed_roots = vec![
+        canonicalize_existing_dir(&runtime.pipeline_root, "RULE_OPEN_ALLOWED_PIPELINE_INVALID")?,
+        canonicalize_existing_dir(&runtime.out_base_dir, "RULE_OPEN_ALLOWED_OUTDIR_INVALID")?,
+    ];
+    allowed_roots.sort();
+    allowed_roots.dedup();
+
+    let allowed = allowed_roots
+        .iter()
+        .any(|allowed_root| requested_canonical.starts_with(allowed_root));
+    if !allowed {
+        let allowed_text = allowed_roots
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "RULE_OPEN_PATH_OUTSIDE_ALLOWED: {} is outside allowed roots: {}",
+            requested_canonical.display(),
+            allowed_text
+        ));
+    }
+    Ok(requested_canonical)
+}
+
+#[tauri::command]
+fn open_path(path: String) -> Result<String, String> {
+    let root = repo_root();
+    let runtime = resolve_runtime_config(&root)?;
+    let canonical = resolve_safe_open_target(&path, &runtime)?;
+    Command::new("explorer")
+        .arg(&canonical)
+        .spawn()
+        .map_err(|e| format!("failed to open path in explorer: {e}"))?;
+    Ok(canonical.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn reveal_path(path: String) -> Result<String, String> {
+    let root = repo_root();
+    let runtime = resolve_runtime_config(&root)?;
+    let canonical = resolve_safe_open_target(&path, &runtime)?;
+
+    let mut cmd = Command::new("explorer");
+    if canonical.is_file() {
+        cmd.arg("/select,").arg(&canonical);
+    } else {
+        cmd.arg(&canonical);
+    }
+    cmd.spawn()
+        .map_err(|e| format!("failed to reveal path in explorer: {e}"))?;
+    Ok(canonical.to_string_lossy().to_string())
+}
+
 #[tauri::command]
 fn open_run_folder(run_dir: String) -> Result<(), String> {
     let root = repo_root();
@@ -9067,6 +9146,8 @@ fn main() {
             library_get,
             library_set_tags,
             library_stats,
+            open_path,
+            reveal_path,
             open_run_folder,
             list_task_templates,
             validate_template_inputs,
@@ -9224,6 +9305,30 @@ mod tests {
             .expect("resolve local path");
         assert!(resolved.starts_with(base.canonicalize().expect("canonical base")));
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn resolve_safe_open_target_allows_runtime_roots_and_rejects_outside() {
+        let base = std::env::temp_dir().join(format!("jarvis_open_path_{}", now_epoch_ms()));
+        let runtime = build_test_runtime(&base);
+
+        let allowed_file = runtime.out_base_dir.join("result.json");
+        fs::write(&allowed_file, "{}").expect("write allowed file");
+        let allowed = resolve_safe_open_target(&allowed_file.to_string_lossy(), &runtime)
+            .expect("resolve allowed path");
+        assert!(allowed.starts_with(runtime.out_base_dir.canonicalize().expect("canonical out_dir")));
+
+        let outside_base = std::env::temp_dir().join(format!("jarvis_open_outside_{}", now_epoch_ms()));
+        fs::create_dir_all(&outside_base).expect("create outside base");
+        let outside_file = outside_base.join("outside.txt");
+        fs::write(&outside_file, "ng").expect("write outside file");
+        let err = resolve_safe_open_target(&outside_file.to_string_lossy(), &runtime)
+            .err()
+            .unwrap_or_default();
+        assert!(err.contains("RULE_OPEN_PATH_OUTSIDE_ALLOWED"));
+
+        let _ = fs::remove_dir_all(&base);
+        let _ = fs::remove_dir_all(&outside_base);
     }
 
     #[test]
