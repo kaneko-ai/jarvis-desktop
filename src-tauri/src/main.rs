@@ -7261,7 +7261,7 @@ fn validate_template_inputs_internal(
         }
     };
 
-    let required_fields = template.required_fields.clone().unwrap_or_default();
+    let required_fields = resolve_template_required_fields_for_validation(template);
     if required_fields.is_empty() && template.params_schema.is_none() {
         result
             .warnings
@@ -7312,8 +7312,17 @@ fn validate_template_inputs_internal(
                         .as_str()
                         .and_then(|s| s.trim().parse::<f64>().ok())
                         .is_some(),
-                "boolean" => value.as_bool().is_some(),
+                "boolean" => value.as_bool().is_some()
+                    || value
+                        .as_str()
+                        .map(|s| {
+                            let lowered = s.trim().to_ascii_lowercase();
+                            lowered == "true" || lowered == "false"
+                        })
+                        .unwrap_or(false),
                 "string" => value.as_str().is_some(),
+                "array" => value.as_array().is_some(),
+                "object" => value.as_object().is_some(),
                 _ => true,
             };
             if !valid_type {
@@ -7379,6 +7388,40 @@ fn validate_template_inputs_internal(
 
     result.ok = result.missing.is_empty() && result.invalid.is_empty();
     result
+}
+
+fn resolve_template_required_fields_for_validation(template: &TaskTemplateDef) -> Vec<String> {
+    if let Some(explicit) = template.required_fields.as_ref() {
+        let out = explicit
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    if let Some(schema) = template.params_schema.as_ref() {
+        let from_schema = schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|item| item.as_str().map(|s| s.to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !from_schema.is_empty() {
+            return from_schema;
+        }
+    }
+    template
+        .params
+        .iter()
+        .filter(|p| p.default_value.is_null())
+        .map(|p| p.key.clone())
+        .collect::<Vec<_>>()
 }
 
 #[tauri::command]
@@ -9348,6 +9391,61 @@ mod tests {
         let invalid = validate_template_inputs_internal(&template, &serde_json::json!({"depth": "x"}));
         assert!(!invalid.ok);
         assert!(invalid.invalid.iter().any(|v| v.contains("depth")));
+    }
+
+    #[test]
+    fn validate_template_inputs_detects_missing_from_required_inference() {
+        let template = TaskTemplateDef {
+            id: "TEST_TEMPLATE_INFER_REQUIRED".to_string(),
+            title: "Test".to_string(),
+            description: "test".to_string(),
+            wired: true,
+            disabled_reason: "".to_string(),
+            params: vec![TemplateParamDef {
+                key: "prompt".to_string(),
+                label: "Prompt".to_string(),
+                param_type: "string".to_string(),
+                default_value: serde_json::Value::Null,
+                min: None,
+                max: None,
+            }],
+            required_fields: None,
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "prompt": { "type": "string" }
+                },
+                "additionalProperties": false
+            })),
+        };
+
+        let missing = validate_template_inputs_internal(&template, &serde_json::json!({}));
+        assert!(!missing.ok);
+        assert_eq!(missing.missing, vec!["prompt".to_string()]);
+    }
+
+    #[test]
+    fn validate_template_inputs_detects_enum_invalid_values() {
+        let template = TaskTemplateDef {
+            id: "TEST_TEMPLATE_ENUM".to_string(),
+            title: "Test".to_string(),
+            description: "test".to_string(),
+            wired: true,
+            disabled_reason: "".to_string(),
+            params: vec![],
+            required_fields: None,
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "mode": { "type": "string", "enum": ["safe", "fast"] }
+                },
+                "additionalProperties": false
+            })),
+        };
+
+        let invalid = validate_template_inputs_internal(&template, &serde_json::json!({"mode": "turbo"}));
+        assert!(!invalid.ok);
+        assert!(invalid.invalid.iter().any(|v| v.contains("mode")));
     }
 
     #[test]
