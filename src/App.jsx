@@ -2139,11 +2139,21 @@ export default function App() {
   const templateRequiredFields = Array.isArray(selectedTemplate?.required_fields)
     ? selectedTemplate.required_fields
     : [];
+  const templateRequiredFieldSet = new Set(templateRequiredFields);
+  const templateFieldLabelByKey = templateDynamicFields.reduce((acc, field) => {
+    acc[field.key] = field.label;
+    return acc;
+  }, {});
   const missingTemplateRequiredFields = templateRequiredFields.filter((key) => {
     const value = templateParams?.[key];
     if (value === null || value === undefined) return true;
     if (typeof value === "string" && value.trim() === "") return true;
     return false;
+  });
+  const missingTemplateRequiredFieldSet = new Set(missingTemplateRequiredFields);
+  const missingTemplateRequiredDetails = missingTemplateRequiredFields.map((key) => {
+    const label = templateFieldLabelByKey[key];
+    return label ? `${label} (${key})` : key;
   });
   const runtimePipelineRootResolved = runtimeCfg?.ok === true
     && String(runtimeCfg?.pipeline_root ?? "").trim() !== ""
@@ -2159,7 +2169,7 @@ export default function App() {
   }
   if (missingTemplateRequiredFields.length > 0) {
     pipelineStartMissingRequirements.push(
-      `Missing template required fields: ${missingTemplateRequiredFields.join(", ")}`
+      `missing required params: ${missingTemplateRequiredDetails.join(", ")}`
     );
   }
   if (!canRunByNormalization) {
@@ -2755,7 +2765,10 @@ export default function App() {
         <div style={{ display: "grid", gap: 8, gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))" }}>
           {templateDynamicFields.map((field) => (
             <label key={field.key} style={{ display: "grid", gap: 4 }}>
-              <span style={{ fontSize: 12 }}>{field.label}</span>
+              <span style={{ fontSize: 12 }}>
+                {field.label}
+                {templateRequiredFieldSet.has(field.key) ? " *" : ""}
+              </span>
               {field.fieldType === "enum" ? (
                 <select
                   value={String(templateParams[field.key] ?? "")}
@@ -2804,6 +2817,9 @@ export default function App() {
                   style={{ padding: 8, borderRadius: 6, border: "1px solid #ccc" }}
                 />
               )}
+              {templateRequiredFieldSet.has(field.key) && missingTemplateRequiredFieldSet.has(field.key) ? (
+                <span style={{ fontSize: 11, color: "#a33" }}>required</span>
+              ) : null}
             </label>
           ))}
         </div>
