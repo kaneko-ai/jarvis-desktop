@@ -230,6 +230,9 @@ export default function App() {
   const [artifactView, setArtifactView] = useState(null);
   const [artifactWarnings, setArtifactWarnings] = useState([]);
   const [artifactWrap, setArtifactWrap] = useState(true);
+  const [artifactResolvedPath, setArtifactResolvedPath] = useState("");
+  const [artifactPathLoading, setArtifactPathLoading] = useState(false);
+  const [artifactPathError, setArtifactPathError] = useState("");
   const [graphParsed, setGraphParsed] = useState(null);
   const [graphParseLoading, setGraphParseLoading] = useState(false);
   const [graphParseError, setGraphParseError] = useState("");
@@ -1351,6 +1354,15 @@ export default function App() {
     return "";
   }
 
+  function mapLegacyKeyToArtifactName(artifactKey) {
+    if (artifactKey === "tree_md") return "tree.md";
+    if (artifactKey === "result_json") return "result.json";
+    if (artifactKey === "input_json") return "input.json";
+    if (artifactKey === "stdout_log") return "stdout.log";
+    if (artifactKey === "stderr_log") return "stderr.log";
+    return "";
+  }
+
   async function fetchArtifactCatalogForRun(runId, force = false) {
     if (!runId) return;
     let shouldFetch = false;
@@ -1654,6 +1666,60 @@ export default function App() {
     }
   }
 
+  async function resolveArtifactPath(runId, artifactName) {
+    if (!runId || !artifactName) {
+      setArtifactResolvedPath("");
+      setArtifactPathError("");
+      return;
+    }
+    setArtifactPathLoading(true);
+    setArtifactPathError("");
+    try {
+      const path = await invoke("get_run_artifact_path", {
+        runId,
+        name: artifactName,
+      });
+      setArtifactResolvedPath(String(path ?? ""));
+    } catch (e) {
+      setArtifactResolvedPath("");
+      setArtifactPathError(String(e));
+    } finally {
+      setArtifactPathLoading(false);
+    }
+  }
+
+  async function onOpenSelectedArtifactPath() {
+    if (!artifactResolvedPath) return;
+    setArtifactPathError("");
+    try {
+      await invoke("open_path", { path: artifactResolvedPath });
+    } catch (e) {
+      setArtifactPathError(String(e));
+      await onOpenSelectedRunFolder();
+    }
+  }
+
+  async function onRevealSelectedArtifactPath() {
+    if (!artifactResolvedPath) return;
+    setArtifactPathError("");
+    try {
+      await invoke("reveal_path", { path: artifactResolvedPath });
+    } catch (e) {
+      setArtifactPathError(String(e));
+      await onOpenSelectedRunFolder();
+    }
+  }
+
+  async function onCopySelectedArtifactPath() {
+    if (!artifactResolvedPath) return;
+    setArtifactPathError("");
+    try {
+      await navigator.clipboard?.writeText(artifactResolvedPath);
+    } catch (e) {
+      setArtifactPathError(String(e));
+    }
+  }
+
   useEffect(() => {
     loadRuntimeConfig(false);
     loadPreflight();
@@ -1811,6 +1877,15 @@ export default function App() {
   useEffect(() => {
     loadSelectedRunArtifactCatalog(selectedRunId);
   }, [selectedRunId]);
+
+  useEffect(() => {
+    const direct = String(artifactView?.artifact ?? "").trim();
+    const mappedCurrent = mapLegacyKeyToArtifactName(selectedArtifact);
+    const artifactName = direct && !mapLegacyKeyToArtifactName(direct)
+      ? direct
+      : (mappedCurrent || (direct ? (mapLegacyKeyToArtifactName(direct) || direct) : ""));
+    resolveArtifactPath(selectedRunId, artifactName);
+  }, [selectedRunId, selectedArtifact, artifactView?.artifact]);
 
   useEffect(() => {
     liveRunTextRequestSeqRef.current += 1;
@@ -3672,6 +3747,37 @@ export default function App() {
               <div style={{ fontSize: 11, opacity: 0.8, marginBottom: 6 }}>
                 artifact_path=<code>{artifactView.path}</code> parse_status=<code>{artifactView.parse_status}</code>
               </div>
+              <div style={{ display: "flex", gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
+                <button
+                  onClick={onOpenSelectedArtifactPath}
+                  disabled={!artifactResolvedPath || artifactPathLoading}
+                  style={{ padding: "6px 10px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+                >
+                  {artifactPathLoading ? "Resolving..." : "Open artifact"}
+                </button>
+                <button
+                  onClick={onRevealSelectedArtifactPath}
+                  disabled={!artifactResolvedPath || artifactPathLoading}
+                  style={{ padding: "6px 10px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+                >
+                  Reveal in Explorer
+                </button>
+                <button
+                  onClick={onCopySelectedArtifactPath}
+                  disabled={!artifactResolvedPath || artifactPathLoading}
+                  style={{ padding: "6px 10px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+                >
+                  Copy path
+                </button>
+              </div>
+              <div style={{ fontSize: 11, opacity: 0.8, marginBottom: 6 }}>
+                resolved_path=<code>{artifactResolvedPath || "-"}</code>
+              </div>
+              {artifactPathError ? (
+                <div style={{ color: "#a33", fontSize: 12, marginBottom: 6 }}>
+                  {artifactPathError}
+                </div>
+              ) : null}
               {selectedArtifact === "tree_md" && artifactView.exists ? (
                 <div
                   style={{
