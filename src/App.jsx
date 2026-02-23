@@ -170,6 +170,7 @@ const PIPELINE_RUN_ARTIFACT_OPTIONS = [
   { kind: "tree", label: "paper_graph/tree/tree.md" },
   { kind: "report", label: "report.md" },
   { kind: "warnings", label: "warnings.jsonl" },
+  { kind: "audit", label: "audit.jsonl" },
   { kind: "evidence", label: "evidence.jsonl" },
   { kind: "claims", label: "claims.jsonl" },
   { kind: "eval_summary", label: "eval_summary.json" },
@@ -207,6 +208,7 @@ export default function App() {
   const [message, setMessage] = useState("");
   const [retryAfterSec, setRetryAfterSec] = useState(null);
   const [lastRunRequest, setLastRunRequest] = useState(null);
+  const [pendingRunSelection, setPendingRunSelection] = useState(false);
 
   const [runtimeCfg, setRuntimeCfg] = useState(null);
   const [cfgLoading, setCfgLoading] = useState(false);
@@ -1170,6 +1172,45 @@ export default function App() {
     return "";
   }
 
+  async function pickPreferredRunTextKind(runId, fallbackKind = "input") {
+    if (!runId) return fallbackKind;
+    try {
+      const items = await invoke("list_run_artifacts", { runId });
+      const list = Array.isArray(items) ? items : [];
+      const names = new Set(list.map((item) => String(item?.name ?? "")));
+      if (names.has("audit.jsonl")) {
+        return "audit";
+      }
+      if (names.has("warnings.jsonl")) {
+        return "warnings";
+      }
+      return fallbackKind;
+    } catch {
+      return fallbackKind;
+    }
+  }
+
+  async function openRunsAndFocusLatest(options = {}) {
+    const attempts = options?.attempts ?? 6;
+    const delayMs = options?.delayMs ?? 700;
+    const fallbackKind = String(options?.fallbackKind ?? pipelineRunTab ?? "input");
+    setActiveScreen("runs");
+    setLiveRunFollow(true);
+    setLiveRunStickToBottom(true);
+    const latestRunId = await focusLatestPipelineRun({ attempts, delayMs });
+    if (!latestRunId) {
+      setPendingRunSelection(true);
+      setMessage("Still starting... open Runs and select latest run.");
+      return "";
+    }
+    setPendingRunSelection(false);
+    const preferredKind = await pickPreferredRunTextKind(latestRunId, fallbackKind);
+    if (preferredKind !== pipelineRunTab) {
+      setPipelineRunTab(preferredKind);
+    }
+    return latestRunId;
+  }
+
   async function onRunAnalyzePipeline() {
     const idForRun = normalized?.canonical?.trim() ? normalized.canonical : paperId;
     setPipelineValidationMissing([]);
@@ -1216,8 +1257,7 @@ export default function App() {
       await loadPipelines();
       await loadJobs();
       setSelectedPipelineId(pipelineId);
-      setActiveScreen("runs");
-      await focusLatestPipelineRun({ attempts: 6, delayMs: 700 });
+      await openRunsAndFocusLatest({ attempts: 6, delayMs: 700, fallbackKind: "input" });
     } catch (e) {
       alert(String(e));
     }
@@ -1783,6 +1823,7 @@ export default function App() {
       setLiveRunStickToBottom(true);
       return;
     }
+    setPendingRunSelection(false);
     setLiveRunStickToBottom(true);
   }, [selectedPipelineRunId]);
 
@@ -1888,8 +1929,7 @@ export default function App() {
       setLastRunRequest(params);
       await loadJobs();
       setSelectedJobId(jobId);
-      setActiveScreen("runs");
-      await focusLatestPipelineRun({ attempts: 8, delayMs: 500 });
+      await openRunsAndFocusLatest({ attempts: 8, delayMs: 500, fallbackKind: "warnings" });
     } catch (e) {
       setStderr(String(e));
       setStatus("error");
@@ -3023,6 +3063,19 @@ export default function App() {
       {message ? (
         <div style={{ marginTop: 8, color: status === "ok" ? "#245" : "#a33", fontSize: 13 }}>
           {message}
+        </div>
+      ) : null}
+      {pendingRunSelection ? (
+        <div style={{ marginTop: 8, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <button
+            onClick={() => {
+              setActiveScreen("runs");
+            }}
+            style={{ padding: "6px 10px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+          >
+            Show runs
+          </button>
+          <span style={{ fontSize: 12, color: "#8a4200" }}>Still starting...</span>
         </div>
       ) : null}
 

@@ -4786,6 +4786,7 @@ fn run_text_rel_path(kind: &str) -> Result<PathBuf, String> {
         "tree" => Ok(PathBuf::from("paper_graph").join("tree").join("tree.md")),
         "report" => Ok(PathBuf::from("report.md")),
         "warnings" => Ok(PathBuf::from("warnings.jsonl")),
+        "audit" => Ok(PathBuf::from("audit.jsonl")),
         "evidence" => Ok(PathBuf::from("evidence.jsonl")),
         "claims" => Ok(PathBuf::from("claims.jsonl")),
         "eval_summary" => Ok(PathBuf::from("eval_summary.json")),
