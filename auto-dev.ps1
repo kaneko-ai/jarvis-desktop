@@ -2,12 +2,17 @@
 # - 1 cycle = 1 worktree (no dirty start contamination)
 # - Writes plan/meta/evidence/result into .codex-logs (UTF-8 no BOM)
 # - Script performs push + optional PR creation (gh) to avoid "local-only completion"
+# - STEP E: auto-merge (squash) after PR creation
 # - Stops on dirty repo unless explicitly overridden
 #
 # IMPORTANT (Windows PowerShell 5.1):
 # - git/cargo/npm often print progress to stderr even on success.
 # - PowerShell 5.1 can treat that as an ErrorRecord; with $ErrorActionPreference="Stop" it kills the script.
 # - Therefore we run native tools through cmd.exe and check exit codes.
+#
+# IMPORTANT (codex-cli 0.104.0+):
+# - Long prompts passed as CLI arguments break on Windows due to quoting/escaping.
+# - We write prompts to a temp file and pipe via stdin: Get-Content file | codex exec --full-auto -
 
 [CmdletBinding()]
 param(
@@ -131,6 +136,53 @@ function Truncate([string]$Text, [int]$MaxChars) {
   if (-not $Text) { return "" }
   if ($Text.Length -le $MaxChars) { return $Text }
   return $Text.Substring($Text.Length - $MaxChars)
+}
+
+# -------------------------
+# Codex exec wrapper (stdin pipe method)
+# -------------------------
+function Invoke-Codex {
+  param(
+    [Parameter(Mandatory=$true)][string]$Prompt,
+    [Parameter(Mandatory=$true)][string]$LogFile,
+    [string]$PromptLabel = "prompt"
+  )
+
+  $promptFile = Join-Path $LogDir "$PromptLabel-$CycleId.txt"
+  Write-Utf8File $promptFile $Prompt
+
+  $oldEap = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  try {
+    Get-Content $promptFile -Raw | codex exec --full-auto - 2>&1 | Tee-Object -FilePath $LogFile | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      throw "codex exec failed (exit=$LASTEXITCODE). Prompt: $promptFile  Log: $LogFile"
+    }
+  } finally {
+    $ErrorActionPreference = $oldEap
+  }
+}
+
+# Report-phase codex wrapper (uses $Timestamp instead of $CycleId)
+function Invoke-CodexReport {
+  param(
+    [Parameter(Mandatory=$true)][string]$Prompt,
+    [Parameter(Mandatory=$true)][string]$LogFile
+  )
+
+  $promptFile = Join-Path $LogDir "prompt-report-$Timestamp.txt"
+  Write-Utf8File $promptFile $Prompt
+
+  $oldEap = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  try {
+    Get-Content $promptFile -Raw | codex exec --full-auto - 2>&1 | Tee-Object -FilePath $LogFile | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      throw "codex report failed (exit=$LASTEXITCODE). Prompt: $promptFile  Log: $LogFile"
+    }
+  } finally {
+    $ErrorActionPreference = $oldEap
+  }
 }
 
 # -------------------------
@@ -287,9 +339,6 @@ for ($i = 1; $i -le $MaxPRs; $i++) {
   $WtPath = Join-Path $WtRoot "wt-$CycleId"
   if (Test-Path $WtPath) { Remove-Item -Recurse -Force $WtPath }
 
-  # IMPORTANT:
-  # main is already checked out in the primary worktree, so we cannot check out 'main' again.
-  # Use detached HEAD worktree, then Codex will create a feature branch inside it.
   Run-CmdChecked "git-worktree-prune" "git worktree prune" | Out-Null
 
   $wtAddCmd = "git worktree add " + (Quote-CmdArg $WtPath) + " --detach main"
@@ -301,7 +350,9 @@ for ($i = 1; $i -le $MaxPRs; $i++) {
   try {
     Push-Location -LiteralPath $WtPath
 
+    # =====================
     # STEP A: Plan
+    # =====================
     Write-Host "[A] Planning next PR..." -ForegroundColor Green
 
     $PlanContent = Get-Content $PlanPath -Raw -Encoding utf8
@@ -354,16 +405,7 @@ IMPORTANT:
 "@
 
     $StepALog = Join-Path $LogDir "step-a-$CycleId.log"
-    $oldEap = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    try {
-      codex exec --full-auto $PlanPrompt 2>&1 | Tee-Object -FilePath $StepALog | Out-Null
-      if ($LASTEXITCODE -ne 0) {
-        throw "codex step A failed (exit=$LASTEXITCODE). See: $StepALog"
-      }
-    } finally {
-      $ErrorActionPreference = $oldEap
-    }
+    Invoke-Codex -Prompt $PlanPrompt -LogFile $StepALog -PromptLabel "prompt-a"
 
     if (-not (Test-Path $PlanNextFile)) { throw "Plan instruction file not generated: $PlanNextFile (see $StepALog)" }
     if (-not (Test-Path $MetaFile))     { throw "Meta JSON not generated: $MetaFile (see $StepALog)" }
@@ -376,7 +418,9 @@ IMPORTANT:
       throw "Meta JSON missing required keys. File: $MetaFile"
     }
 
-    # STEP B: Implement (Codex edits code, creates branch, commits; NO push/PR here)
+    # =====================
+    # STEP B: Implement
+    # =====================
     Write-Host "[B] Implementing on branch $($meta.branch_name) ..." -ForegroundColor Green
 
     $PlanNext = Get-Content $PlanNextFile -Raw -Encoding utf8
@@ -409,16 +453,7 @@ At the end, print:
 "@
 
     $StepBLog = Join-Path $LogDir "step-b-$CycleId.log"
-    $oldEap = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    try {
-      codex exec --full-auto $ImplPrompt 2>&1 | Tee-Object -FilePath $StepBLog | Out-Null
-      if ($LASTEXITCODE -ne 0) {
-        throw "codex step B failed (exit=$LASTEXITCODE). See: $StepBLog"
-      }
-    } finally {
-      $ErrorActionPreference = $oldEap
-    }
+    Invoke-Codex -Prompt $ImplPrompt -LogFile $StepBLog -PromptLabel "prompt-b"
 
     # Evidence collection (script-side; deterministic)
     Write-Host "[B] Collecting evidence..." -ForegroundColor DarkGreen
@@ -458,7 +493,9 @@ At the end, print:
 
     Write-Utf8File $EvidenceFile ($e -join "`n")
 
+    # =====================
     # STEP C: Summarize
+    # =====================
     Write-Host "[C] Summarizing..." -ForegroundColor Green
 
     $SummaryPrompt = @"
@@ -486,22 +523,15 @@ Output only the file; no extra chatter.
 "@
 
     $StepCLog = Join-Path $LogDir "step-c-$CycleId.log"
-    $oldEap = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    try {
-      codex exec --full-auto $SummaryPrompt 2>&1 | Tee-Object -FilePath $StepCLog | Out-Null
-      if ($LASTEXITCODE -ne 0) {
-        throw "codex step C failed (exit=$LASTEXITCODE). See: $StepCLog"
-      }
-    } finally {
-      $ErrorActionPreference = $oldEap
-    }
+    Invoke-Codex -Prompt $SummaryPrompt -LogFile $StepCLog -PromptLabel "prompt-c"
 
     if (-not (Test-Path $ResultFile)) {
       Write-Utf8File $ResultFile "Result file not generated. See logs: $StepCLog"
     }
 
-    # STEP D: Auto push + PR (script-controlled)
+    # =====================
+    # STEP D: Auto push + PR
+    # =====================
     $prUrl = ""
     if ($AutoPush -or $AutoCreatePR) {
       Write-Host "[D] Pushing branch / creating PR (script-side)..." -ForegroundColor Green
@@ -519,7 +549,7 @@ Output only the file; no extra chatter.
         $draftFlag = ""
         if ($DraftPR) { $draftFlag = "--draft" }
 
-        # Check if PR already exists (do not hard-fail if not)
+        # Check if PR already exists
         $existing = ""
         $viewR = Invoke-Cmd ("gh pr view {0} --json url -q .url" -f $meta.branch_name)
         if ($viewR.ExitCode -eq 0) { $existing = $viewR.Output.Trim() }
@@ -562,11 +592,12 @@ Notes:
       }
     }
 
-    # STEP E: Auto-merge the PR into main
+    # =====================
+    # STEP E: Auto-merge
+    # =====================
     if ($prUrl -and $AutoCreatePR -and $ghOk) {
       Write-Host "[E] Auto-merging PR into main..." -ForegroundColor Green
 
-      # Extract PR number from URL
       $prNumMatch = [regex]::Match($prUrl, '/pull/(\d+)')
       if ($prNumMatch.Success) {
         $prNum = $prNumMatch.Groups[1].Value
@@ -597,7 +628,6 @@ Notes:
         Write-Host "[E][warn] Could not extract PR number from: $prUrl" -ForegroundColor Yellow
       }
     }
-
 
     # Show result
     Write-Host "Result ($CycleId):" -ForegroundColor Cyan
@@ -701,16 +731,7 @@ Must include:
 "@
 
 $StepReportLog = Join-Path $LogDir "step-report-$Timestamp.log"
-$oldEap = $ErrorActionPreference
-$ErrorActionPreference = "Continue"
-try {
-  codex exec --full-auto $ReportPrompt 2>&1 | Tee-Object -FilePath $StepReportLog | Out-Null
-  if ($LASTEXITCODE -ne 0) {
-    throw "codex report step failed (exit=$LASTEXITCODE). See: $StepReportLog"
-  }
-} finally {
-  $ErrorActionPreference = $oldEap
-}
+Invoke-CodexReport -Prompt $ReportPrompt -LogFile $StepReportLog
 
 if (Test-Path $ReportFile) {
   Write-Host ""
