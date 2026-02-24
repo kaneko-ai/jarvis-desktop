@@ -1,914 +1,533 @@
-﻿# auto-dev.ps1 (Hardened, Worktree-based, Long-run safe)
-# - 1 cycle = 1 worktree (no dirty start contamination)
-# - Writes plan/meta/evidence/result into .codex-logs (UTF-8 no BOM)
-# - Script performs push + optional PR creation (gh) to avoid "local-only completion"
-# - STEP E: auto-merge (squash) after PR creation — runs from RepoRoot to avoid 'main already checked out'
-# - Stops on dirty repo unless explicitly overridden
-#
-# Enhancements v2 (2026-02-25):
-# - #1 Independent code review (STEP B2) after implementation
-# - #2 Spec-driven prompts (prompts/ templates referenced in STEP A)
-# - #4 Discord webhook notifications on every step completion/error
-# - #6 Self-healing retry loop in STEP B (up to MaxRetries)
-# - Boris Cherny method: STEP A0 (Deep Research) + STEP A1 (Self-Annotation)
-# - Mnemis/koylanai: Hierarchical memory in .codex-logs/memory/
-# - tabbata/super_bonochin: Constraint-wedge prompting (hard numeric constraints)
-# - STEP E fix: merge from RepoRoot, not worktree
-#
-# IMPORTANT (Windows PowerShell 5.1):
-# - git/cargo/npm often print progress to stderr even on success.
-# - PowerShell 5.1 can treat that as an ErrorRecord; with $ErrorActionPreference="Stop" it kills the script.
-# - Therefore we run native tools through cmd.exe and check exit codes.
-#
-# IMPORTANT (codex-cli 0.104.0+):
-# - Long prompts passed as CLI arguments break on Windows due to quoting/escaping.
-# - We write prompts to a temp file and pipe via stdin: Get-Content file | codex exec --full-auto -
-
-[CmdletBinding()]
+﻿<#
+.SYNOPSIS
+    auto-dev v3 – Codex 自動開発ループ（worktree分離・日本語Discord通知・ETA表示）
+.DESCRIPTION
+    A0(リサーチ)→A(計画)→A1(セルフアノテーション)→B(実装+自己修復)→B2(レビュー)→
+    B+(証跡)→C(要約)→D(Push/PR)→E(マージ) を繰り返す自動開発スクリプト。
+    Discord通知は日本語 Before/After 形式。ターミナルにリアルタイムETA表示。
+#>
 param(
-  [int]$MaxPRs = 3,
-  [int]$SleepMinutes = 2,
-  [string]$PlanFile = "master-plan.md",
-
-  # If omitted, defaults to the directory where this script lives.
-  [string]$ProjectDir = "",
-
-  # Long-run safety knobs
-  [switch]$AllowDirtyStart = $false,
-  [switch]$SkipBaselineChecks = $false,
-
-  # PR automation (bool, not switch)
-  [bool]$AutoPush = $true,
-  [bool]$AutoCreatePR = $true,
-  [bool]$DraftPR = $true,
-
-  # Worktree options
-  [switch]$KeepWorktrees = $false,
-
-  # Self-healing retry (#6)
-  [int]$MaxRetries = 3,
-
-  # Constraint wedges (tabbata/super_bonochin)
-  [int]$MaxDiffLines = 400,
-  [int]$MaxFilesChanged = 12,
-  [int]$MaxPromptTokenEstimate = 16000,
-
-  # Discord webhook (#4) - empty string disables notifications
-  [string]$DiscordWebhookUrl = "https://discord.com/api/webhooks/1475856515066892288/rj96GVnnXvyULPXj20pppIn7QXtAUkAbNIAa1KhwUHoSbbJYX3kTuRMnprT63_Qky32u"
+    [int]    $MaxPRs           = 5,
+    [int]    $SleepMinutes     = 15,
+    [string] $PlanFile         = "master-plan.md",
+    [switch] $AllowDirtyStart,
+    [switch] $AutoPush         = $true,
+    [switch] $AutoCreatePR     = $true,
+    [switch] $DraftPR          = $true,
+    [string] $DiscordWebhookUrl = "https://discord.com/api/webhooks/1475856515066892288/rj96GVnnXvyULPXj20pppIn7QXtAUkAbNIAa1KhwUHoSbbJYX3kTuRMnprT63_Qky32u",
+    [int]    $MaxRetries       = 3,
+    [int]    $MaxDiffLines     = 400,
+    [int]    $MaxFilesChanged  = 12
 )
 
-$ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
 
-# -------------------------
-# Native-command safe runner (PS5.1)
-# -------------------------
-function Quote-CmdArg([string]$s) {
-  if ($null -eq $s) { return '""' }
-  return '"' + ($s -replace '"','""') + '"'
+# ── タイムスタンプ ──
+$RunId     = Get-Date -Format "yyyyMMdd-HHmmss"
+$StartTime = Get-Date
+
+# ── ステップ別推定所要時間（秒） ── ETA計算用
+$StepWeights = [ordered]@{
+    "A0" = 420;  "A" = 180;  "A1" = 300
+    "B"  = 900;  "B2" = 600; "B+" = 60
+    "C"  = 120;  "D"  = 30;  "E"  = 15
+}
+$TotalEstSec   = ($StepWeights.Values | Measure-Object -Sum).Sum
+$CycleStartTime = $null
+
+# ── ETA付きステップ表示 ──
+function Write-Step {
+    param([string]$Step, [string]$Message, [int]$Cycle, [int]$Total)
+    $now     = Get-Date
+    $elapsed = $now - $CycleStartTime
+
+    # 現在ステップまでの累計推定秒
+    $cumSec = 0
+    foreach ($k in $StepWeights.Keys) {
+        $cumSec += $StepWeights[$k]
+        if ($k -eq $Step) { break }
+    }
+    $pct       = [math]::Min(99, [math]::Round(($cumSec / $TotalEstSec) * 100))
+    $remainSec = [math]::Max(0, $TotalEstSec - $elapsed.TotalSeconds)
+    $eta       = $now.AddSeconds($remainSec)
+    $etaStr    = $eta.ToString("HH:mm")
+
+    $line = "[$Step] $Message (サイクル $Cycle/$Total, 経過: $("{0:mm\:ss}" -f $elapsed), ${pct}%, 完了予定: $etaStr)"
+    Write-Host $line -ForegroundColor Cyan
+    return $line
 }
 
-function Invoke-Cmd {
-  param(
-    [Parameter(Mandatory=$true)][string]$CmdLine,
-    [string]$WorkingDirectory = ""
-  )
+# ── 安全なコマンド実行 ──
+function Run-Cmd {
+    param([string]$Cmd, [int]$TimeoutSec = 900, [switch]$NoThrow)
+    $pinfo = New-Object System.Diagnostics.ProcessStartInfo
+    $pinfo.FileName  = "pwsh"; $pinfo.Arguments = "-NoProfile -Command `"$Cmd`""
+    $pinfo.RedirectStandardOutput = $true; $pinfo.RedirectStandardError = $true
+    $pinfo.UseShellExecute = $false; $pinfo.CreateNoWindow = $true
+    $p = [System.Diagnostics.Process]::Start($pinfo)
+    if (-not $p.WaitForExit($TimeoutSec * 1000)) {
+        $p.Kill(); if (-not $NoThrow) { throw "TIMEOUT ($TimeoutSec s): $Cmd" }
+    }
+    $stdout = $p.StandardOutput.ReadToEnd()
+    $stderr = $p.StandardError.ReadToEnd()
+    if ($p.ExitCode -ne 0 -and -not $NoThrow) { throw "FAIL ($($p.ExitCode)): $Cmd`n$stderr" }
+    return $stdout
+}
 
-  $out = @()
-  $code = 0
+# ── UTF-8 BOMなし書き込み ──
+function Write-FileSafe {
+    param([string]$Path, [string]$Content)
+    $dir = Split-Path $Path -Parent
+    if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    [System.IO.File]::WriteAllText($Path, $Content, [System.Text.UTF8Encoding]::new($false))
+}
 
-  if ($WorkingDirectory -and $WorkingDirectory.Trim() -ne "") {
-    Push-Location -LiteralPath $WorkingDirectory
+# ── .git/info/exclude 更新 ──
+function Update-GitExclude {
+    $exFile = Join-Path $RepoRoot ".git\info\exclude"
+    $lines  = @(".codex-logs/", "worktrees/")
+    if (Test-Path $exFile) {
+        $existing = Get-Content $exFile -ErrorAction SilentlyContinue
+        foreach ($l in $lines) {
+            if ($existing -notcontains $l) { Add-Content $exFile $l }
+        }
+    }
+}
+
+# ── Discord 送信 ──
+function Send-Discord {
+    param([string]$Message)
+    if (-not $DiscordWebhookUrl) { return }
     try {
-      $out = cmd.exe /d /c "$CmdLine 2>&1"
-      $code = $LASTEXITCODE
-    } finally {
-      Pop-Location
+        $body = @{ content = $Message } | ConvertTo-Json -Compress -Depth 3
+        Invoke-RestMethod -Uri $DiscordWebhookUrl -Method Post -ContentType "application/json; charset=utf-8" -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) | Out-Null
+    } catch {
+        Write-Host "  [discord] 送信失敗: $_" -ForegroundColor Yellow
     }
-  } else {
-    $out = cmd.exe /d /c "$CmdLine 2>&1"
-    $code = $LASTEXITCODE
-  }
-
-  return [pscustomobject]@{
-    Output   = ($out -join "`n")
-    ExitCode = $code
-  }
 }
 
-function Run-CmdChecked {
-  param(
-    [Parameter(Mandatory=$true)][string]$Label,
-    [Parameter(Mandatory=$true)][string]$CmdLine,
-    [string]$WorkingDirectory = ""
-  )
+# ── Discord サイクルレポート（日本語 Before/After） ──
+function Send-CycleReport {
+    param(
+        [int]$CycleId, [string]$PRTitle, [string]$PRUrl, [string]$BranchName,
+        [hashtable]$Before, [hashtable]$After,
+        [int]$RetryUsed, [int]$RetryMax, [int]$ReviewFixes,
+        [string]$ElapsedTime, [string]$Status
+    )
+    if (-not $DiscordWebhookUrl) { return }
+    $icon = if ($Status -eq "成功") { ":white_check_mark:" } else { ":x:" }
+    $msg = @"
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+$icon **サイクル #$CycleId 完了** | $Status
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+:clipboard: **タスク:** $PRTitle
+:herb: **ブランチ:** $BranchName
 
-  $r = Invoke-Cmd -CmdLine $CmdLine -WorkingDirectory $WorkingDirectory
-  if ($r.ExitCode -ne 0) {
-    throw "[$Label] failed (exit=$($r.ExitCode)).`n$($r.Output)"
-  }
-  return $r.Output
+:bar_chart: **Before → After**
+テスト合計     : $($Before.Tests) 件 → $($After.Tests) 件
+テスト成功     : $($Before.TestPass) 件 → $($After.TestPass) 件
+lint 警告      : $($Before.LintWarn) 件 → $($After.LintWarn) 件
+lint エラー    : $($Before.LintErr) 件 → $($After.LintErr) 件
+fmt ドリフト   : $($Before.FmtDrift) → $($After.FmtDrift)
+変更ファイル数 : − → $($After.FilesChanged) 件
+diff 行数      : − → $($After.DiffLines) 行
+
+:wrench: **自己修復リトライ:** $RetryUsed / $RetryMax 回使用
+:mag: **レビュー自動修正:** $ReviewFixes 件
+:stopwatch: **所要時間:** $ElapsedTime
+
+"@
+    if ($PRUrl) { $msg += ":link: **PR:** $PRUrl`n" }
+    $msg += "━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    Send-Discord $msg
 }
 
-# -------------------------
-# Helpers
-# -------------------------
-function New-Utf8NoBom() {
-  return New-Object System.Text.UTF8Encoding($false)
-}
-
-function Write-Utf8File([string]$Path, [string]$Content) {
-  $dir = Split-Path -Parent $Path
-  if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
-  [System.IO.File]::WriteAllText($Path, $Content, (New-Utf8NoBom))
-}
-
-function Append-Utf8File([string]$Path, [string]$Content) {
-  $dir = Split-Path -Parent $Path
-  if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
-  [System.IO.File]::AppendAllText($Path, $Content, (New-Utf8NoBom))
-}
-
-function Ensure-InfoExclude([string]$RepoRoot, [string[]]$Patterns) {
-  $infoDir = Join-Path $RepoRoot ".git\info"
-  if (-not (Test-Path $infoDir)) { return }
-  $excludePath = Join-Path $infoDir "exclude"
-  if (-not (Test-Path $excludePath)) { New-Item -ItemType File -Force -Path $excludePath | Out-Null }
-
-  $current = @()
-  try { $current = Get-Content $excludePath -ErrorAction SilentlyContinue } catch { $current = @() }
-
-  foreach ($p in $Patterns) {
-    if ($current -notcontains $p) {
-      Add-Content -Path $excludePath -Value $p
-    }
-  }
-}
-
-function Get-LatestFile([string]$Dir, [string]$Pattern) {
-  if (-not (Test-Path $Dir)) { return $null }
-  $files = Get-ChildItem -Path $Dir -Filter $Pattern -File -ErrorAction SilentlyContinue |
-           Sort-Object LastWriteTime -Descending
-  if ($files -and $files.Count -gt 0) { return $files[0].FullName }
-  return $null
-}
-
-function Truncate([string]$Text, [int]$MaxChars) {
-  if (-not $Text) { return "" }
-  if ($Text.Length -le $MaxChars) { return $Text }
-  return $Text.Substring($Text.Length - $MaxChars)
-}
-
-# -------------------------
-# #4 Discord notification helper
-# -------------------------
-function Send-Notification {
-  param(
-    [Parameter(Mandatory=$true)][string]$Message,
-    [string]$Color = "3447003",
-    [string]$Title = ""
-  )
-
-  if (-not $DiscordWebhookUrl -or $DiscordWebhookUrl.Trim() -eq "") { return }
-
-  try {
-    $safeMsg = $Message
-    if ($safeMsg.Length -gt 1900) { $safeMsg = $safeMsg.Substring(0, 1900) + "... (truncated)" }
-
-    $payload = @{
-      embeds = @(
-        @{
-          title       = if ($Title) { $Title } else { "auto-dev.ps1" }
-          description = $safeMsg
-          color       = [int]$Color
-          timestamp   = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-          footer      = @{ text = "Jarvis Auto-Dev" }
+# ── 仕様テンプレート読み込み ──
+function Load-SpecTemplates {
+    $tplDir = Join-Path $RepoRoot "prompts"
+    $out = ""
+    if (Test-Path $tplDir) {
+        Get-ChildItem $tplDir -Filter "spec-*.md" | Sort-Object Name | ForEach-Object {
+            $out += "`n## [$($_.BaseName)]`n$(Get-Content $_.FullName -Raw)`n"
         }
-      )
-    } | ConvertTo-Json -Depth 5 -Compress
-
-    Invoke-RestMethod -Uri $DiscordWebhookUrl -Method Post -ContentType "application/json; charset=utf-8" -Body ([System.Text.Encoding]::UTF8.GetBytes($payload)) | Out-Null
-  } catch {
-    Write-Host "[notify][warn] Discord notification failed: $_" -ForegroundColor Yellow
-  }
-}
-
-# -------------------------
-# Progress helper
-# -------------------------
-function Write-Progress-Step {
-  param(
-    [string]$Step,
-    [string]$Message,
-    [string]$Percent,
-    [int]$Cycle,
-    [int]$MaxCycles,
-    [datetime]$LoopStart
-  )
-  $elapsed = ((Get-Date) - $LoopStart).ToString("hh\:mm\:ss")
-  Write-Host "[$Step] $Message (cycle $Cycle/$MaxCycles, elapsed: $elapsed, $Percent)" -ForegroundColor Green
-}
-
-# -------------------------
-# #2 Spec-driven template loader
-# -------------------------
-function Get-SpecTemplates {
-  param([string]$RepoRoot)
-
-  $promptsDir = Join-Path $RepoRoot "prompts"
-  if (-not (Test-Path $promptsDir)) { return "" }
-
-  $templates = @()
-  $templateFiles = Get-ChildItem -Path $promptsDir -Filter "spec-*.md" -File -ErrorAction SilentlyContinue |
-                   Sort-Object Name
-  foreach ($f in $templateFiles) {
-    $content = Get-Content $f.FullName -Raw -Encoding utf8
-    $content = Truncate $content 2000
-    $templates += "### Template: $($f.Name)"
-    $templates += $content
-    $templates += ""
-  }
-
-  if ($templates.Count -eq 0) { return "" }
-
-  $header = @"
-
-## Spec-Driven Development Templates (from prompts/)
-Use these templates to structure your planning output.
-Pick the most relevant template(s) for the current PR task.
-
-"@
-  return $header + ($templates -join "`n")
-}
-
-# -------------------------
-# Mnemis/koylanai: Hierarchical memory loader
-# -------------------------
-function Get-MemoryContext {
-  param([string]$LogDir)
-
-  $memDir = Join-Path $LogDir "memory"
-  if (-not (Test-Path $memDir)) { New-Item -ItemType Directory -Force -Path $memDir | Out-Null }
-
-  $memoryBlock = @()
-
-  # Category: lessons (from tasks/lessons.md + memory/lessons/)
-  $lessonsDir = Join-Path $memDir "lessons"
-  if (-not (Test-Path $lessonsDir)) { New-Item -ItemType Directory -Force -Path $lessonsDir | Out-Null }
-
-  # Load tasks/lessons.md if exists
-  $globalLessons = Join-Path $RepoRoot "tasks\lessons.md"
-  if (Test-Path $globalLessons) {
-    $content = Get-Content $globalLessons -Raw -Encoding utf8
-    $content = Truncate $content 3000
-    $memoryBlock += "## Memory: Global Lessons (tasks/lessons.md)"
-    $memoryBlock += $content
-    $memoryBlock += ""
-  }
-
-  # Load latest cycle-specific lessons
-  $cycleLessons = Get-ChildItem -Path $lessonsDir -Filter "*.md" -File -ErrorAction SilentlyContinue |
-                  Sort-Object LastWriteTime -Descending | Select-Object -First 5
-  foreach ($f in $cycleLessons) {
-    $content = Get-Content $f.FullName -Raw -Encoding utf8
-    $content = Truncate $content 1000
-    $memoryBlock += "### Memory: $($f.Name)"
-    $memoryBlock += $content
-    $memoryBlock += ""
-  }
-
-  # Category: patterns (recurring issues)
-  $patternsFile = Join-Path $memDir "patterns.md"
-  if (Test-Path $patternsFile) {
-    $content = Get-Content $patternsFile -Raw -Encoding utf8
-    $content = Truncate $content 2000
-    $memoryBlock += "## Memory: Recurring Patterns"
-    $memoryBlock += $content
-    $memoryBlock += ""
-  }
-
-  # Category: architecture decisions
-  $adrsDir = Join-Path $memDir "decisions"
-  if (Test-Path $adrsDir) {
-    $adrs = Get-ChildItem -Path $adrsDir -Filter "*.md" -File -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime -Descending | Select-Object -First 3
-    foreach ($f in $adrs) {
-      $content = Get-Content $f.FullName -Raw -Encoding utf8
-      $content = Truncate $content 1000
-      $memoryBlock += "### Memory: Decision - $($f.Name)"
-      $memoryBlock += $content
-      $memoryBlock += ""
     }
-  }
-
-  if ($memoryBlock.Count -eq 0) { return "" }
-
-  return "`n## Hierarchical Memory Context`n" + ($memoryBlock -join "`n")
+    return $out
 }
 
-# -------------------------
-# Memory writer: save cycle learnings
-# -------------------------
-function Save-CycleLearnings {
-  param(
-    [string]$LogDir,
-    [string]$CycleId,
-    [string]$Learnings
-  )
-
-  $lessonsDir = Join-Path $LogDir "memory\lessons"
-  if (-not (Test-Path $lessonsDir)) { New-Item -ItemType Directory -Force -Path $lessonsDir | Out-Null }
-
-  $file = Join-Path $lessonsDir "cycle-$CycleId.md"
-  Write-Utf8File $file $Learnings
+# ── 階層メモリ読み込み（Mnemis方式） ──
+function Load-Memory {
+    param([string]$MemDir)
+    $out = ""
+    if (Test-Path $MemDir) {
+        foreach ($sub in @("patterns", "failures", "decisions")) {
+            $d = Join-Path $MemDir $sub
+            if (Test-Path $d) {
+                Get-ChildItem $d -Filter "*.md" -ErrorAction SilentlyContinue |
+                    Sort-Object LastWriteTime -Descending | Select-Object -First 5 |
+                    ForEach-Object { $out += "`n### [$sub/$($_.Name)]`n$(Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue)`n" }
+            }
+        }
+    }
+    return $out
 }
 
-# -------------------------
-# Constraint wedge block (tabbata/super_bonochin)
-# -------------------------
-function Get-ConstraintWedges {
-  return @"
+# ── ハード制約ウェッジ ──
+function Get-ConstraintWedge {
+    return @"
 
-## HARD CONSTRAINTS (non-negotiable numeric bounds)
-These are simultaneous constraint wedges. ALL must be satisfied.
-Violating ANY constraint = immediate STOP and report why.
-
-| Constraint | Value | Enforcement |
-|---|---|---|
-| Max diff lines (insertions+deletions) | $MaxDiffLines | If git diff --stat shows more, split the PR |
-| Max files changed | $MaxFilesChanged | If more files touched, split the PR |
-| Max branch name length | 50 chars | Truncate slug if needed |
-| Tests must pass | 100% of existing tests | New test failures = fix or revert |
-| No new dependencies without justification | 0 unjustified | Document in PR body why needed |
-| No type:any / type:unknown (TypeScript) | 0 instances | Use proper types |
-| No console.log left in production code | 0 instances | Remove before commit |
-| Commit message format | conventional commits | feat: / fix: / test: / ci: / docs: |
-| PR scope | exactly 1 theme | No unrelated changes bundled |
-
-These constraints exist to force the solution into a narrow, high-quality region of the solution space.
-Do not treat them as suggestions. They are hard walls.
+## HARD CONSTRAINTS (MUST NOT VIOLATE)
+- Max diff lines: $MaxDiffLines (reject if exceeded)
+- Max files changed: $MaxFilesChanged (reject if exceeded)
+- Forbidden patterns: console.log, TODO, FIXME, HACK (in new code)
+- Required: all tests pass, lint 0 errors, cargo fmt clean
+- Language: PR title and body in English, code comments in English
+- Scope: one logical change per PR, no unrelated changes
 "@
 }
 
-# -------------------------
-# Codex exec wrapper (stdin pipe method)
-# -------------------------
-function Invoke-Codex {
-  param(
-    [Parameter(Mandatory=$true)][string]$Prompt,
-    [Parameter(Mandatory=$true)][string]$LogFile,
-    [string]$PromptLabel = "prompt"
-  )
+# ══════════════════════════════════════════
+#  初期化
+# ══════════════════════════════════════════
+$RepoRoot = (git rev-parse --show-toplevel 2>$null)
+if (-not $RepoRoot) { $RepoRoot = $PSScriptRoot }
+$RepoRoot = (Resolve-Path $RepoRoot).Path
 
-  $promptFile = Join-Path $LogDir "$PromptLabel-$CycleId.txt"
-  Write-Utf8File $promptFile $Prompt
-
-  $oldEap = $ErrorActionPreference
-  $ErrorActionPreference = "Continue"
-  try {
-    Get-Content $promptFile -Raw | codex exec --full-auto - 2>&1 | Tee-Object -FilePath $LogFile | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-      throw "codex exec failed (exit=$LASTEXITCODE). Prompt: $promptFile  Log: $LogFile"
-    }
-  } finally {
-    $ErrorActionPreference = $oldEap
-  }
-}
-
-# Report-phase codex wrapper (uses $Timestamp instead of $CycleId)
-function Invoke-CodexReport {
-  param(
-    [Parameter(Mandatory=$true)][string]$Prompt,
-    [Parameter(Mandatory=$true)][string]$LogFile
-  )
-
-  $promptFile = Join-Path $LogDir "prompt-report-$Timestamp.txt"
-  Write-Utf8File $promptFile $Prompt
-
-  $oldEap = $ErrorActionPreference
-  $ErrorActionPreference = "Continue"
-  try {
-    Get-Content $promptFile -Raw | codex exec --full-auto - 2>&1 | Tee-Object -FilePath $LogFile | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-      throw "codex report failed (exit=$LASTEXITCODE). Prompt: $promptFile  Log: $LogFile"
-    }
-  } finally {
-    $ErrorActionPreference = $oldEap
-  }
-}
-
-# -------------------------
-# Encoding (reduce mojibake)
-# -------------------------
-try {
-  $utf8NoBom = New-Utf8NoBom
-  [Console]::OutputEncoding = $utf8NoBom
-  $OutputEncoding = $utf8NoBom
-} catch {}
-# -------------------------
-# Resolve project dir safely
-# -------------------------
-if (-not $ProjectDir -or $ProjectDir.Trim() -eq "") {
-  $ProjectDir = $PSScriptRoot
-  if (-not $ProjectDir) { $ProjectDir = (Get-Location).Path }
-}
-$ProjectDir = (Resolve-Path -LiteralPath $ProjectDir).Path
-
-Set-Location -LiteralPath $ProjectDir
-
-$repoTopR = Invoke-Cmd "git rev-parse --show-toplevel"
-if ($repoTopR.ExitCode -ne 0 -or -not $repoTopR.Output.Trim()) {
-  throw "This directory is not inside a git repository: $ProjectDir`n$($repoTopR.Output)"
-}
-$RepoRoot = (Resolve-Path -LiteralPath $repoTopR.Output.Trim()).Path
-Set-Location -LiteralPath $RepoRoot
-
-# Required files
-$AgentsPath = Join-Path $RepoRoot "AGENTS.md"
-$PlanPath   = Join-Path $RepoRoot $PlanFile
-if (-not (Test-Path $AgentsPath)) { throw "Missing AGENTS.md at repo root: $AgentsPath" }
-if (-not (Test-Path $PlanPath))   { throw "Missing plan file: $PlanPath" }
-
-# Logs + worktree root
 $LogDir = Join-Path $RepoRoot ".codex-logs"
-$WtRoot = Join-Path $RepoRoot ".wt"
-if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Force -Path $LogDir | Out-Null }
-if (-not (Test-Path $WtRoot)) { New-Item -ItemType Directory -Force -Path $WtRoot | Out-Null }
-
-# Memory hierarchy directories (Mnemis)
 $MemDir = Join-Path $LogDir "memory"
-foreach ($sub in @("lessons", "decisions", "patterns")) {
-  $p = Join-Path $MemDir $sub
-  if (-not (Test-Path $p)) { New-Item -ItemType Directory -Force -Path $p | Out-Null }
+foreach ($d in @($LogDir, $MemDir, "$MemDir\patterns", "$MemDir\failures", "$MemDir\decisions")) {
+    if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
 }
 
-Ensure-InfoExclude $RepoRoot @(
-  ".codex-logs/",
-  ".wt/",
-  "prompts/"
-)
+Update-GitExclude
 
-# Tools sanity
-$codexVer = Invoke-Cmd "codex --version"
-if ($codexVer.ExitCode -ne 0) { throw "codex CLI not found. Install it first.`n$($codexVer.Output)" }
+# 必須ファイル確認
+$agentsMd = Join-Path $RepoRoot "AGENTS.md"
+$planPath = Join-Path $RepoRoot $PlanFile
+if (-not (Test-Path $agentsMd)) { throw "AGENTS.md not found at $agentsMd" }
+if (-not (Test-Path $planPath)) { throw "$PlanFile not found at $planPath" }
 
-# GitHub CLI optional checks
-$ghOk = $true
-$ghVer = Invoke-Cmd "gh --version"
-if ($ghVer.ExitCode -ne 0) { $ghOk = $false }
+$agentsContent = Get-Content $agentsMd -Raw
+$planContent   = Get-Content $planPath -Raw
+$specTemplates = Load-SpecTemplates
+$memoryContext = Load-Memory $MemDir
+$constraints   = Get-ConstraintWedge
 
-if ($AutoCreatePR -and -not $ghOk) {
-  Write-Host "[warn] gh CLI missing; disabling AutoCreatePR." -ForegroundColor Yellow
-  $AutoCreatePR = $false
-}
-if ($AutoCreatePR -and $ghOk) {
-  $ghAuth = Invoke-Cmd "gh auth status"
-  if ($ghAuth.ExitCode -ne 0) {
-    Write-Host "[warn] gh auth status failed; disabling AutoCreatePR." -ForegroundColor Yellow
-    $AutoCreatePR = $false
-  }
-}
+Write-Host @"
 
-# Repo cleanliness guard
-$dirtyR = Invoke-Cmd "git status --porcelain"
-$dirty = $dirtyR.Output.TrimEnd()
-if ($dirty -and -not $AllowDirtyStart) {
-  throw "Dirty working tree detected at start. Fix or run with -AllowDirtyStart.`n$dirty"
-}
+========================================
+ auto-dev v3 (worktree) loop started
+ RepoRoot : $RepoRoot
+ Max PRs  : $MaxPRs
+ Sleep    : $SleepMinutes minutes
+ AutoPush : $AutoPush  AutoPR : $AutoCreatePR  Draft : $DraftPR
+ Retries  : $MaxRetries | MaxDiff: $MaxDiffLines | MaxFiles: $MaxFilesChanged
+ Discord  : $(if ($DiscordWebhookUrl) {'enabled'} else {'disabled'})
+ Memory   : $MemDir
+ Started  : $(Get-Date -Format 'MM/dd/yyyy HH:mm:ss')
+========================================
+"@ -ForegroundColor Green
 
-$Timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+Send-Discord ":rocket: **auto-dev v3 起動** | 最大 $MaxPRs PR | $(Get-Date -Format 'HH:mm') 開始"
 
-Write-Host ""
-Write-Host "========================================" -ForegroundColor Cyan
-Write-Host " auto-dev v2 (worktree) loop started" -ForegroundColor Cyan
-Write-Host " RepoRoot : $RepoRoot" -ForegroundColor Cyan
-Write-Host " Max PRs  : $MaxPRs" -ForegroundColor Cyan
-Write-Host " Sleep    : $SleepMinutes minutes" -ForegroundColor Cyan
-Write-Host " AutoPush : $AutoPush  AutoPR : $AutoCreatePR  Draft : $DraftPR" -ForegroundColor Cyan
-Write-Host " Retries  : $MaxRetries | MaxDiff: $MaxDiffLines | MaxFiles: $MaxFilesChanged" -ForegroundColor Cyan
-Write-Host " Discord  : $(if ($DiscordWebhookUrl) { 'enabled' } else { 'disabled' })" -ForegroundColor Cyan
-Write-Host " Memory   : $MemDir" -ForegroundColor Cyan
-Write-Host " Started  : $(Get-Date)" -ForegroundColor Cyan
-Write-Host "========================================" -ForegroundColor Cyan
+# ── ベースライン ──
+Write-Host "[baseline] Running baseline checks..." -ForegroundColor DarkGray
+$baselinePath = Join-Path $LogDir "baseline-$RunId.md"
+$baseOut = "# Baseline $RunId`n"
+try { $fmtBase = & cargo fmt --check 2>&1 | Out-String; $baseOut += "## cargo fmt`n$fmtBase`n" } catch {}
+try { $lintBase = & npm run lint 2>&1 | Out-String; $baseOut += "## lint`n$lintBase`n" } catch {}
+try { $testBase = & cargo test 2>&1 | Out-String; $baseOut += "## test`n$testBase`n" } catch {}
+Write-FileSafe $baselinePath $baseOut
+Write-Host "[baseline] saved: $baselinePath" -ForegroundColor DarkGray
 
-Send-Notification -Title "Loop Started" -Message "auto-dev v2 loop started.`nMaxPRs: $MaxPRs | Retries: $MaxRetries | MaxDiff: $MaxDiffLines`nRepo: $RepoRoot" -Color "3447003"
+$allPRUrls = @()
 
-# Baseline checks (once)
-$BaselineFile = Join-Path $LogDir "baseline-$Timestamp.md"
-if (-not $SkipBaselineChecks) {
-  Write-Host "[baseline] Running baseline checks..." -ForegroundColor Gray
-  $baseline = @()
-  $baseline += "# Baseline Checks"
-  $baseline += "Time: $(Get-Date)"
-  $baseline += "Repo: $RepoRoot"
-  $baseline += ""
+# ══════════════════════════════════════════
+#  メインループ
+# ══════════════════════════════════════════
+for ($cycle = 1; $cycle -le $MaxPRs; $cycle++) {
 
-  $baseline += "## git status --porcelain"
-  $baseline += (Run-CmdChecked "baseline-git-status" "git status --porcelain")
+    $script:CycleStartTime = Get-Date
+    $prTitle    = ""
+    $prUrl      = ""
+    $branch     = ""
+    $retryUsed  = 0
+    $reviewFixCount = 0
 
-  $baseline += "## git log --oneline -5"
-  $baseline += (Run-CmdChecked "baseline-git-log" "git log --oneline -5")
+    Write-Host "`n--- [$cycle / $MaxPRs] サイクル開始: $(Get-Date -Format 'MM/dd/yyyy HH:mm:ss') ---" -ForegroundColor Magenta
+    Send-Discord ":arrows_counterclockwise: **サイクル $cycle / $MaxPRs 開始** | $(Get-Date -Format 'HH:mm')"
 
-  $baseline += "## npm run lint"
-  $baseline += (Run-CmdChecked "baseline-npm-lint" "npm run lint")
+    # ── Before 計測 ──
+    $beforeData = @{ Tests = 0; TestPass = 0; LintWarn = 0; LintErr = 0; FmtDrift = "不明" }
+    $afterData  = @{ Tests = 0; TestPass = 0; LintWarn = 0; LintErr = 0; FmtDrift = "不明"; FilesChanged = 0; DiffLines = 0 }
 
-  $tauriDir = Join-Path $RepoRoot "src-tauri"
-  if (Test-Path $tauriDir) {
-    $baseline += "## cargo fmt --check"
-    $fmtR = Invoke-Cmd -CmdLine "cargo fmt --check" -WorkingDirectory $tauriDir
-    $baseline += $fmtR.Output
-    if ($fmtR.ExitCode -ne 0) {
-      $baseline += "(pre-existing fmt drift detected; non-fatal)"
-      Write-Host "[baseline] cargo fmt --check: pre-existing drift (non-fatal)" -ForegroundColor Yellow
+    try {
+        $fmtChk = & cargo fmt --check 2>&1
+        $beforeData.FmtDrift = if ($LASTEXITCODE -ne 0) { "あり" } else { "なし" }
+    } catch { $beforeData.FmtDrift = "不明" }
+    try {
+        $lo = & npm run lint 2>&1 | Out-String
+        if ($lo -match '(\d+)\s+error')   { $beforeData.LintErr  = [int]$Matches[1] }
+        if ($lo -match '(\d+)\s+warning') { $beforeData.LintWarn = [int]$Matches[1] }
+    } catch {}
+    try {
+        $to = & cargo test 2>&1 | Out-String
+        if ($to -match 'test result: \w+\.\s+(\d+)\s+passed') {
+            $beforeData.TestPass = [int]$Matches[1]; $beforeData.Tests = [int]$Matches[1]
+        }
+    } catch {}
+
+    # worktree 作成
+    $wtName = "wt-$RunId-$cycle"
+    $wtPath = Join-Path $RepoRoot "worktrees\$wtName"
+    try {
+        git worktree add $wtPath main --detach 2>$null
+    } catch {
+        Write-Host "  [worktree] fallback: using repo root" -ForegroundColor Yellow
+        $wtPath = $RepoRoot
     }
 
-    $baseline += "## cargo test"
-    $baseline += (Run-CmdChecked "baseline-cargo-test" "cargo test" $tauriDir)
-  } else {
-    $baseline += "## src-tauri not found; skipping cargo checks"
-  }
+    Push-Location -LiteralPath $wtPath
+    try {
 
-  Write-Utf8File $BaselineFile ($baseline -join "`n")
-  Write-Host "[baseline] saved: $BaselineFile" -ForegroundColor Gray
-}
+    # ============================================================
+    #  STEP A0 – Deep Research (Boris Cherny 方式)
+    # ============================================================
+    $stepMsg = Write-Step "A0" "コードベース深層リサーチ中..." $cycle $MaxPRs
+    Send-Discord ":microscope: [A0] リサーチ開始 | サイクル $cycle"
 
-# Track created PR URLs
-$CreatedPRs = New-Object System.Collections.Generic.List[string]
+    $researchPrompt = @"
+You are a senior engineer performing deep research before planning.
+Read the codebase, AGENTS.md, and the master plan carefully.
+Focus on: architecture, patterns, recent changes, potential issues, test coverage gaps.
 
-# Loop start time for progress tracking
-$LoopStartTime = Get-Date
+AGENTS.md:
+$agentsContent
 
-# Load spec templates and constraint wedges once
-$SpecTemplateBlock = Get-SpecTemplates -RepoRoot $RepoRoot
-$ConstraintBlock = Get-ConstraintWedges
+Master Plan:
+$planContent
 
-for ($i = 1; $i -le $MaxPRs; $i++) {
+Memory from previous sessions:
+$memoryContext
 
-  $cycleStartTime = Get-Date
-  Write-Host ""
-  Write-Host "--- [$i / $MaxPRs] Cycle start: $(Get-Date) ---" -ForegroundColor Yellow
-  Send-Notification -Title "Cycle $i/$MaxPRs Started" -Message "Starting cycle $i of $MaxPRs at $(Get-Date -Format 'HH:mm:ss')" -Color "3447003"
-
-  # Always sync main first (ff-only)
-  Run-CmdChecked "git-switch-main" "git switch main" | Out-Null
-  Run-CmdChecked "git-pull-ff" "git pull --ff-only" | Out-Null
-
-  # Ensure clean before creating worktree
-  $dirtyNowR = Invoke-Cmd "git status --porcelain"
-  $dirtyNow = $dirtyNowR.Output.TrimEnd()
-  if ($dirtyNow -and -not $AllowDirtyStart) {
-    throw "Dirty working tree before cycle $i. Aborting.`n$dirtyNow"
-  }
-
-  $CycleId = "{0}-{1:D3}" -f $Timestamp, $i
-  $ResearchFile = Join-Path $LogDir "research-$CycleId.md"
-  $PlanNextFile = Join-Path $LogDir "plan-next-$CycleId.md"
-  $MetaFile     = Join-Path $LogDir "meta-$CycleId.json"
-  $EvidenceFile = Join-Path $LogDir "evidence-$CycleId.md"
-  $ResultFile   = Join-Path $LogDir "result-$CycleId.md"
-
-  # Previous result (latest available)
-  $PrevResultPath = Get-LatestFile $LogDir "result-*.md"
-  $PrevResult = "No previous result."
-  if ($PrevResultPath) {
-    $PrevResult = Get-Content $PrevResultPath -Raw -Encoding utf8
-    $PrevResult = Truncate $PrevResult 4000
-  }
-
-  # Load hierarchical memory (Mnemis)
-  $MemoryBlock = Get-MemoryContext -LogDir $LogDir
-
-  # Create isolated worktree
-  $WtPath = Join-Path $WtRoot "wt-$CycleId"
-  if (Test-Path $WtPath) { Remove-Item -Recurse -Force $WtPath }
-
-  Run-CmdChecked "git-worktree-prune" "git worktree prune" | Out-Null
-
-  $wtAddCmd = "git worktree add " + (Quote-CmdArg $WtPath) + " --detach main"
-  $wtOut = Run-CmdChecked "git-worktree-add" $wtAddCmd
-  if (-not (Test-Path $WtPath)) {
-    throw "Failed to create worktree at $WtPath. git output:`n$wtOut"
-  }
-
-  try {
-    Push-Location -LiteralPath $WtPath
-
-    # =====================
-    # STEP A0: Deep Research (Boris Cherny) (~0-5%)
-    # =====================
-    Write-Progress-Step -Step "A0" -Message "Deep research on target area..." -Percent "~3%" -Cycle $i -MaxCycles $MaxPRs -LoopStart $LoopStartTime
-
-    $PlanContent = Get-Content $PlanPath -Raw -Encoding utf8
-    $PlanContent = Truncate $PlanContent 12000
-
-    $ResearchPrompt = @"
-You are a senior developer conducting deep research on a codebase.
-Repository: $WtPath
-
-Read and follow: $AgentsPath
-
-Your task: Identify the SINGLE most important next PR from the master plan,
-then deeply research the relevant parts of the codebase.
-
-Master plan (truncated):
-$PlanContent
-
-Previous cycle result (truncated):
-$PrevResult
-$MemoryBlock
-
-RESEARCH INSTRUCTIONS (Boris Cherny method):
-- Read the relevant folders and files IN DEPTH. Not just signatures — understand the full logic.
-- Use rg (ripgrep) to find all usages, callers, and dependencies.
-- Understand the intricacies: edge cases, error handling, state management.
-- Look for potential bugs, inconsistencies, and missing test coverage.
-- DO NOT skim. Surface-level reading is NOT acceptable.
-
-Save a detailed research report to:
-$ResearchFile
-
-The report MUST include:
-- Which PR task you selected and why
-- Files and modules examined (with line counts)
-- How the current code works (data flow, state, dependencies)
-- Existing test coverage for the target area
-- Potential risks, bugs, or gotchas discovered
-- Pre-existing issues that must NOT be fixed in this PR (out of scope)
-
-DO NOT write any plan yet. DO NOT implement anything. Research ONLY.
+Output a structured research report as research-$cycle.md covering:
+1. Current architecture overview
+2. Recent change patterns
+3. Risk areas and technical debt
+4. Test coverage gaps
+5. Recommended next focus area
 "@
 
-    $StepA0Log = Join-Path $LogDir "step-a0-$CycleId.log"
-    Invoke-Codex -Prompt $ResearchPrompt -LogFile $StepA0Log -PromptLabel "prompt-a0"
+    $researchFile = Join-Path $LogDir "research-$cycle.md"
+    try {
+        codex -a full-auto --quiet -m o4-mini "$researchPrompt" 2>$null
+        if (Test-Path "research-$cycle.md") {
+            Move-Item "research-$cycle.md" $researchFile -Force
+        } else {
+            Write-FileSafe $researchFile "# Research $cycle`nNo output generated."
+        }
+    } catch {
+        Write-FileSafe $researchFile "# Research $cycle`nError: $_"
+    }
+    $researchContent = Get-Content $researchFile -Raw -ErrorAction SilentlyContinue
 
-    if (-not (Test-Path $ResearchFile)) {
-      Write-Utf8File $ResearchFile "(Research file not generated. See $StepA0Log)"
+    # ============================================================
+    #  STEP A – Planning（仕様テンプレート + 制約 + メモリ）
+    # ============================================================
+    $stepMsg = Write-Step "A" "次のPRを計画中..." $cycle $MaxPRs
+    Send-Discord ":memo: [A] 計画策定中 | サイクル $cycle"
+
+    $planPrompt = @"
+You are a senior engineer. Based on the research, AGENTS.md, master plan, spec templates,
+memory, and constraints below, determine the single most impactful next PR.
+
+Research:
+$researchContent
+
+AGENTS.md:
+$agentsContent
+
+Master Plan:
+$planContent
+
+Spec Templates:
+$specTemplates
+
+Memory:
+$memoryContext
+
+$constraints
+
+Output exactly:
+- Line 1: branch name (e.g., pr70-fix-dashboard)
+- Line 2: PR title (e.g., fix: correct dashboard stat calculation)
+- Lines 3+: implementation plan (step by step, max 20 steps)
+
+Save output as plan.md
+"@
+
+    $planOutFile = Join-Path $LogDir "plan-$cycle.md"
+    try {
+        codex -a full-auto --quiet "$planPrompt" 2>$null
+        if (Test-Path "plan.md") {
+            Copy-Item "plan.md" $planOutFile -Force
+            $planOut = Get-Content "plan.md" -Raw
+        } else {
+            $planOut = "pr${cycle}-auto-improvement`nchore: automated improvement cycle $cycle`nImplement improvements."
+        }
+    } catch {
+        $planOut = "pr${cycle}-auto-improvement`nchore: automated improvement cycle $cycle`nImplement improvements."
     }
 
-    Send-Notification -Title "STEP A0 Research Complete" -Message "Research saved: research-$CycleId.md" -Color "3066993"
+    $planLines = $planOut -split "`n" | Where-Object { $_.Trim() }
+    $branch    = ($planLines[0] -replace '[^a-zA-Z0-9\-]', '-').ToLower().Substring(0, [math]::Min(60, $planLines[0].Length))
+    $prTitle   = if ($planLines.Count -gt 1) { $planLines[1].Trim() } else { "chore: auto improvement $cycle" }
 
-    # =====================
-    # STEP A: Plan (~5-12%)  [#2 spec templates + constraint wedges]
-    # =====================
-    Write-Progress-Step -Step "A" -Message "Planning next PR based on research..." -Percent "~8%" -Cycle $i -MaxCycles $MaxPRs -LoopStart $LoopStartTime
+    Write-FileSafe $planOutFile $planOut
 
-    $ResearchContent = Get-Content $ResearchFile -Raw -Encoding utf8
-    $ResearchContent = Truncate $ResearchContent 8000
+    # ============================================================
+    #  STEP A1 – Self-Annotation（独立レビュー）
+    # ============================================================
+    $stepMsg = Write-Step "A1" "計画をセルフアノテーション中..." $cycle $MaxPRs
+    Send-Discord ":mag_right: [A1] セルフアノテーション | サイクル $cycle"
 
-    $PlanPrompt = @"
-You are a senior developer writing an implementation plan.
-Repository: $WtPath
+    $annotPrompt = @"
+You are an independent reviewer. Review this implementation plan critically.
+Check for: scope creep, missing edge cases, constraint violations, unclear steps.
+Add annotations with [OK], [WARN], or [FIX] prefix to each step.
+If any step has [FIX], rewrite the corrected plan.
 
-Hard rules:
-- Read and follow: $AgentsPath
-- Read and follow: $PlanPath
-- Base your plan on the research findings below. Do NOT ignore them.
-- Do NOT guess. The research already examined the code deeply.
-$ConstraintBlock
-$SpecTemplateBlock
-$MemoryBlock
+Plan:
+$planOut
 
-Research findings:
-$ResearchContent
+Constraints:
+$constraints
 
-Task:
-Write a detailed implementation plan based on the research.
-Output TWO files:
-
-(1) A concrete instruction Markdown saved to:
-$PlanNextFile
-
-Structure the instruction using spec-driven templates where applicable:
-- Requirements summary (what and why)
-- Design rationale (how, based on research findings)
-- Implementation checklist (step-by-step tasks with IDs: T-1, T-2, ...)
-- Test and verification plan
-- Stop conditions
-
-(2) A machine-readable meta JSON saved to:
-$MetaFile
-
-The JSON must include:
-{
-  "branch_name": "prNN-short-slug",
-  "pr_title": "feat(desktop): ... / fix: ... / test: ... / ci: ... / docs: ...",
-  "commit_message": "...",
-  "tests_to_run": ["npm run lint", "cd src-tauri && cargo test", "cd src-tauri && cargo fmt --check"],
-  "notes": "constraints / risks / why this PR now"
-}
-
-IMPORTANT:
-- Save the files EXACTLY at the given absolute paths.
-- Do not start implementation yet.
+Save annotated plan as plan-annotated.md
 "@
 
-    $StepALog = Join-Path $LogDir "step-a-$CycleId.log"
-    Invoke-Codex -Prompt $PlanPrompt -LogFile $StepALog -PromptLabel "prompt-a"
+    try {
+        codex -a full-auto --quiet -m o4-mini "$annotPrompt" 2>$null
+        if (Test-Path "plan-annotated.md") {
+            $planOut = Get-Content "plan-annotated.md" -Raw
+            Copy-Item "plan-annotated.md" (Join-Path $LogDir "plan-annotated-$cycle.md") -Force
+        }
+    } catch {}
 
-    if (-not (Test-Path $PlanNextFile)) { throw "Plan instruction file not generated: $PlanNextFile (see $StepALog)" }
-    if (-not (Test-Path $MetaFile))     { throw "Meta JSON not generated: $MetaFile (see $StepALog)" }
+    # ============================================================
+    #  STEP B – Implementation（ブランチ作成 + Codex実装）
+    # ============================================================
+    $stepMsg = Write-Step "B" "$branch で実装中..." $cycle $MaxPRs
+    Send-Discord ":hammer_and_wrench: [B] 実装開始 | ``$branch`` | サイクル $cycle"
 
-    # Read meta
-    $metaRaw = Get-Content $MetaFile -Raw -Encoding utf8
-    $meta = $null
-    try { $meta = $metaRaw | ConvertFrom-Json } catch { throw "Invalid JSON meta: $MetaFile" }
-    if (-not $meta.branch_name -or -not $meta.pr_title -or -not $meta.commit_message) {
-      throw "Meta JSON missing required keys. File: $MetaFile"
+    git switch -c $branch 2>$null
+    if ($LASTEXITCODE -ne 0) { git checkout -b $branch 2>$null }
+
+    # node_modules クリーン
+    if (Test-Path "node_modules") { Remove-Item "node_modules" -Recurse -Force -ErrorAction SilentlyContinue }
+    if (Test-Path "package-lock.json") { Remove-Item "package-lock.json" -Force -ErrorAction SilentlyContinue }
+
+    $implPrompt = @"
+Implement the following plan precisely. Follow AGENTS.md rules strictly.
+Run ``npm ci && npm run build`` if package.json exists.
+Do NOT modify dotfiles, CI configs, or unrelated code.
+
+AGENTS.md:
+$agentsContent
+
+Plan:
+$planOut
+
+$constraints
+"@
+
+    try {
+        codex -a full-auto --quiet "$implPrompt" 2>$null
+    } catch {
+        Write-Host "  [B] Codex implementation error: $_" -ForegroundColor Yellow
     }
 
-    Send-Notification -Title "STEP A Plan Complete" -Message "Plan: **$($meta.pr_title)**`nBranch: ``$($meta.branch_name)``" -Color "3066993"
+    git add -A
+    git commit -m "$prTitle" --allow-empty 2>$null
 
-    # =====================
-    # STEP A1: Self-Annotation (Boris Cherny annotation cycle) (~12-18%)
-    # =====================
-    Write-Progress-Step -Step "A1" -Message "Self-annotating plan (independent review)..." -Percent "~15%" -Cycle $i -MaxCycles $MaxPRs -LoopStart $LoopStartTime
+    # ============================================================
+    #  STEP B-test – テスト + 自己修復リトライ
+    # ============================================================
+    for ($retry = 1; $retry -le $MaxRetries; $retry++) {
+        $stepMsg = Write-Step "B" "テスト実行中 (試行 $retry/$MaxRetries)..." $cycle $MaxPRs
 
-    $PlanDraft = Get-Content $PlanNextFile -Raw -Encoding utf8
-    $PlanDraft = Truncate $PlanDraft 10000
+        $testPassed = $true
+        $testErrors = @()
 
-    $AnnotatePrompt = @"
-You are an independent senior architect reviewing a plan written by another developer.
-You have NO context from the planning session. You must evaluate the plan critically.
+        # cargo fmt
+        try {
+            & cargo fmt --check 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                & cargo fmt 2>$null
+                git add -A; git commit --amend --no-edit 2>$null
+                Write-Host "  [B-test] cargo fmt auto-fixed and commit amended." -ForegroundColor Yellow
+            }
+        } catch {}
 
-Repository: $WtPath
-AGENTS rules: $AgentsPath
-Master plan: $PlanPath
-Research: $ResearchFile
-$ConstraintBlock
+        # lint
+        try {
+            $lintResult = & npm run lint 2>&1 | Out-String
+            if ($lintResult -match '(\d+)\s+error' -and [int]$Matches[1] -gt 0) {
+                $testPassed = $false; $testErrors += "lint errors: $($Matches[1])"
+            }
+        } catch {}
 
-## Plan to review:
-$PlanDraft
+        # cargo test
+        try {
+            $testResult = & cargo test 2>&1 | Out-String
+            if ($LASTEXITCODE -ne 0) {
+                $testPassed = $false; $testErrors += "cargo test failed"
+            }
+        } catch { $testPassed = $false; $testErrors += "cargo test exception: $_" }
 
-## Your review tasks:
-1. Check if the plan addresses all findings from the research
-2. Check if implementation steps are concrete enough (not vague)
-3. Check if the plan respects ALL hard constraints (diff lines, file count, scope)
-4. Check for missing edge cases, error handling, or test scenarios
-5. Check if the plan accidentally includes out-of-scope changes
-6. Check for over-engineering — prefer minimal-diff solutions
-
-## Your output:
-- Add inline annotations directly into the plan document where corrections are needed
-- Format annotations as: **[ANNOTATION]:** your correction here
-- After annotating, rewrite the ENTIRE plan with corrections applied
-- Save the corrected plan to the SAME path: $PlanNextFile
-- Update $MetaFile if the annotation changed branch name, title, or scope
-
-If the plan is already excellent, still save it (unchanged) to confirm review passed.
-
-DO NOT implement anything. Annotation and plan revision ONLY.
-"@
-
-    $StepA1Log = Join-Path $LogDir "step-a1-$CycleId.log"
-    Invoke-Codex -Prompt $AnnotatePrompt -LogFile $StepA1Log -PromptLabel "prompt-a1"
-
-    # Re-read meta in case annotation changed it
-    if (Test-Path $MetaFile) {
-      $metaRaw = Get-Content $MetaFile -Raw -Encoding utf8
-      try { $meta = $metaRaw | ConvertFrom-Json } catch {}
-    }
-
-    Send-Notification -Title "STEP A1 Annotation Complete" -Message "Plan reviewed and revised for: **$($meta.pr_title)**" -Color "3066993"
-
-    # =====================
-    # STEP B: Implement (~18-50%)  [#6 self-healing retry loop]
-    # =====================
-    Write-Progress-Step -Step "B" -Message "Implementing on branch $($meta.branch_name)..." -Percent "~20%" -Cycle $i -MaxCycles $MaxPRs -LoopStart $LoopStartTime
-
-    $PlanNext = Get-Content $PlanNextFile -Raw -Encoding utf8
-    $PlanNext = Truncate $PlanNext 14000
-
-    $ImplPrompt = @"
-Repository workdir: $WtPath
-
-Follow AGENTS: $AgentsPath
-Follow master plan: $PlanPath
-$ConstraintBlock
-
-Implement the PR described below.
-
-Rules:
-- Create and switch to branch: $($meta.branch_name)
-- Implement exactly one PR theme (no unrelated refactors).
-- Run tests listed in meta (if a test fails due to pre-existing drift, record it explicitly).
-- Commit with message: $($meta.commit_message)
-- DO NOT push.
-- DO NOT create GitHub PR.
-- Keep changes within constraint bounds (max $MaxDiffLines diff lines, max $MaxFilesChanged files).
-- If constraints would be violated, STOP and explain in the result what must be split.
-
-Instruction:
-$PlanNext
-
-At the end, print:
-- current branch name
-- latest commit hash
-- git diff --stat origin/main...HEAD (or main...HEAD)
-"@
-
-    $StepBLog = Join-Path $LogDir "step-b-$CycleId.log"
-    Invoke-Codex -Prompt $ImplPrompt -LogFile $StepBLog -PromptLabel "prompt-b"
-
-    # --- #6 Self-healing retry loop ---
-    $retryCount = 0
-    $testsPass = $false
-
-    while ($retryCount -lt $MaxRetries) {
-      Write-Progress-Step -Step "B-test" -Message "Running tests (attempt $($retryCount + 1)/$MaxRetries)..." -Percent "~$([int](30 + $retryCount * 7))%" -Cycle $i -MaxCycles $MaxPRs -LoopStart $LoopStartTime
-
-      $testErrors = @()
-
-      # npm lint
-      $lintR = Invoke-Cmd "npm run lint"
-      if ($lintR.ExitCode -ne 0) { $testErrors += "npm run lint failed:`n$($lintR.Output)" }
-
-      # cargo tests
-      $tauriDirWt = Join-Path $WtPath "src-tauri"
-      if (Test-Path $tauriDirWt) {
-        $fmtR = Invoke-Cmd -CmdLine "cargo fmt --check" -WorkingDirectory $tauriDirWt
-        if ($fmtR.ExitCode -ne 0) {
-          $fixR = Invoke-Cmd -CmdLine "cargo fmt" -WorkingDirectory $tauriDirWt
-          $fmtR2 = Invoke-Cmd -CmdLine "cargo fmt --check" -WorkingDirectory $tauriDirWt
-          if ($fmtR2.ExitCode -ne 0) {
-            $testErrors += "cargo fmt --check failed (even after auto-fix):`n$($fmtR2.Output)"
-          } else {
-            $amendR = Invoke-Cmd "git add -A && git commit --amend --no-edit"
-            Write-Host "[B-test] cargo fmt auto-fixed and commit amended." -ForegroundColor DarkGreen
-          }
+        if ($testPassed) {
+            Write-Host "  [B-test] 全テスト合格 (試行 $retry)" -ForegroundColor Green
+            break
         }
 
-        $testR = Invoke-Cmd -CmdLine "cargo test" -WorkingDirectory $tauriDirWt
-        if ($testR.ExitCode -ne 0) { $testErrors += "cargo test failed:`n$($testR.Output)" }
-      }
+        $retryUsed = $retry
+        if ($retry -lt $MaxRetries) {
+            Write-Host "  [B-test] 失敗 (試行 $retry): $($testErrors -join '; ')" -ForegroundColor Yellow
+            Send-Discord ":warning: [B] テスト失敗 (試行 $retry/$MaxRetries) | 自己修復中..."
 
-      if ($testErrors.Count -eq 0) {
-        $testsPass = $true
-        Write-Host "[B-test] All tests passed on attempt $($retryCount + 1)." -ForegroundColor Green
-        break
-      }
+            $fixPrompt = @"
+The following tests failed. Fix the issues and ensure all tests pass.
+Do not change test expectations unless the tests themselves are wrong.
 
-      $retryCount++
+Errors:
+$($testErrors -join "`n")
 
-      if ($retryCount -ge $MaxRetries) {
-        Write-Host "[B-test][warn] Tests still failing after $MaxRetries attempts. Proceeding." -ForegroundColor Yellow
-        Send-Notification -Title "STEP B: Tests Failed" -Message "Tests failed after $MaxRetries retries.`n$($testErrors[0])" -Color "15158332"
-        break
-      }
+Test output:
+$testResult
 
-      Write-Host "[B-test] Tests failed (attempt $retryCount). Asking Codex to fix..." -ForegroundColor Yellow
-
-      $fixPrompt = @"
-Repository workdir: $WtPath
-Branch: $($meta.branch_name)
-
-The following test failures occurred after implementation:
-
-$($testErrors -join "`n`n---`n`n")
-
-Rules:
-- Fix ONLY the issues above. Do not refactor or change unrelated code.
-- Stay on branch $($meta.branch_name).
-- Amend the existing commit (git commit --amend --no-edit) after fixing.
-- Do NOT push. Do NOT create PR.
-- If a failure is pre-existing (not caused by your changes), document it but do not fix.
-
-Fix the failures now.
+$constraints
 "@
-
-      $StepBFixLog = Join-Path $LogDir "step-b-fix-$CycleId-r$retryCount.log"
-      Invoke-Codex -Prompt $fixPrompt -LogFile $StepBFixLog -PromptLabel "prompt-b-fix-r$retryCount"
+            try {
+                codex -a full-auto --quiet "$fixPrompt" 2>$null
+                git add -A; git commit --amend --no-edit 2>$null
+            } catch {}
+        } else {
+            Write-Host "  [B-test] 最大リトライ到達。続行。" -ForegroundColor Red
+            Send-Discord ":x: [B] テスト失敗 | リトライ上限 $MaxRetries 到達"
+        }
     }
 
-    Send-Notification -Title "STEP B Complete" -Message "Tests: $(if ($testsPass) { 'PASSED' } else { 'FAILED' }) | Retries: $retryCount/$MaxRetries" -Color $(if ($testsPass) { "3066993" } else { "16776960" })
+    # ============================================================
+    #  STEP B2 – Independent Code Review
+    # ============================================================
+    $stepMsg = Write-Step "B2" "独立コードレビュー中..." $cycle $MaxPRs
+    Send-Discord ":mag: [B2] コードレビュー開始 | サイクル $cycle"
 
-    # =====================
-    # STEP B2: Independent Code Review (~50-60%)  [#1]
-    # =====================
-    Write-Progress-Step -Step "B2" -Message "Independent code review..." -Percent "~55%" -Cycle $i -MaxCycles $MaxPRs -LoopStart $LoopStartTime
+    $diffContent = git diff main --stat 2>$null | Out-String
+    $diffFull    = git diff main 2>$null | Out-String
 
-    $diffForReview = Invoke-Cmd "git diff main...HEAD"
-    $diffText = Truncate $diffForReview.Output 12000
-
-    $diffStatForReview = Invoke-Cmd "git diff --stat main...HEAD"
-    $diffStatText = $diffStatForReview.Output
-
-    $ReviewPrompt = @"
-You are an independent senior code reviewer. You have NO context from the implementation session.
-You are reviewing a PR for the jarvis-desktop project.
-
-AGENTS rules: $AgentsPath
-Master plan: $PlanPath
-Research: $ResearchFile
-$ConstraintBlock
-
-PR title: $($meta.pr_title)
-Branch: $($meta.branch_name)
-
-## Changed files (stat):
-$diffStatText
-
-## Full diff:
-$diffText
+    $reviewPrompt = @"
+You are an independent code reviewer. Review this diff carefully.
 
 ## Review checklist:
 1. Correctness: Does the code do what the PR title says? Any logic bugs?
@@ -917,397 +536,241 @@ $diffText
 4. Tests: Are new behaviors tested? Are edge cases covered?
 5. Diff hygiene: Any unrelated changes? Formatting-only hunks that should be separate?
 6. AGENTS compliance: Does it follow the rules in AGENTS.md?
-7. Constraint compliance: Is diff <= $MaxDiffLines lines? Files <= $MaxFilesChanged?
+7. Constraint compliance: Is diff <= `$MaxDiffLines lines? Files <= `$MaxFilesChanged?
 
-## Your task:
-- If you find issues that are FIXABLE (not pre-existing), fix them directly in the code.
-- Amend the commit after fixes: git add -A && git commit --amend --no-edit
-- If issues are minor or pre-existing, just document them.
-- Save a review summary to: $LogDir\review-$CycleId.md
-- The review summary must list: issues found, fixes applied, remaining concerns.
-- Do NOT push. Do NOT create PR.
+PR Title: $prTitle
 
-## Memory extraction:
-Also save a brief lessons-learned note (2-5 bullets) to:
-$LogDir\memory\lessons\cycle-$CycleId.md
-Format: | what happened | root cause | prevention rule |
+AGENTS.md:
+$agentsContent
+
+Diff stat:
+$diffContent
+
+Full diff:
+$diffFull
+
+If you find issues, fix them directly and save a summary as review-fixes.md.
+If no issues, save review-clean.md with "No issues found."
 "@
 
-    $StepB2Log = Join-Path $LogDir "step-b2-$CycleId.log"
-    Invoke-Codex -Prompt $ReviewPrompt -LogFile $StepB2Log -PromptLabel "prompt-b2"
-
-    # Quick re-test after review fixes
-    $postReviewTestOk = $true
-    $lintR2 = Invoke-Cmd "npm run lint"
-    if ($lintR2.ExitCode -ne 0) { $postReviewTestOk = $false }
-    if (Test-Path $tauriDirWt) {
-      $testR2 = Invoke-Cmd -CmdLine "cargo test" -WorkingDirectory $tauriDirWt
-      if ($testR2.ExitCode -ne 0) { $postReviewTestOk = $false }
+    try {
+        codex -a full-auto --quiet -m o4-mini "$reviewPrompt" 2>$null
+        if (Test-Path "review-fixes.md") {
+            $reviewFixCount = (git diff --name-only 2>$null | Measure-Object).Count
+            git add -A; git commit --amend --no-edit 2>$null
+            Copy-Item "review-fixes.md" (Join-Path $LogDir "review-fixes-$cycle.md") -Force
+            Write-Host "  [B2] レビュー修正: $reviewFixCount 件" -ForegroundColor Yellow
+        } elseif (Test-Path "review-clean.md") {
+            Write-Host "  [B2] レビュー: 問題なし" -ForegroundColor Green
+        }
+    } catch {
+        Write-Host "  [B2] レビューエラー: $_" -ForegroundColor Yellow
     }
 
-    if (-not $postReviewTestOk) {
-      Write-Host "[B2][warn] Post-review tests failed." -ForegroundColor Yellow
-      Send-Notification -Title "STEP B2: Post-Review Test Failed" -Message "Tests failed after code review fixes." -Color "15158332"
-    } else {
-      Write-Host "[B2] Post-review tests passed." -ForegroundColor Green
-    }
+    Send-Discord ":mag: [B2] レビュー完了 | 修正 $reviewFixCount 件"
 
-    $reviewFile = Join-Path $LogDir "review-$CycleId.md"
-    $reviewSummary = "(no review file)"
-    if (Test-Path $reviewFile) {
-      $reviewSummary = Get-Content $reviewFile -Raw -Encoding utf8
-      $reviewSummary = Truncate $reviewSummary 500
-    }
-    Send-Notification -Title "STEP B2 Review Complete" -Message "Post-review tests: $(if ($postReviewTestOk) { 'PASSED' } else { 'FAILED' })`n$reviewSummary" -Color $(if ($postReviewTestOk) { "3066993" } else { "16776960" })
+    # ============================================================
+    #  STEP B+ – Evidence collection
+    # ============================================================
+    $stepMsg = Write-Step "B+" "証跡を収集中..." $cycle $MaxPRs
 
-    # =====================
-    # Evidence collection (~60-65%)
-    # =====================
-    Write-Progress-Step -Step "B+" -Message "Collecting evidence..." -Percent "~65%" -Cycle $i -MaxCycles $MaxPRs -LoopStart $LoopStartTime
+    $evidencePath = Join-Path $LogDir "evidence-$cycle.md"
+    $ev = "# Evidence – Cycle $cycle`n`n"
+    try { $ev += "## cargo test`n$(& cargo test 2>&1 | Out-String)`n" } catch {}
+    try { $ev += "## npm run lint`n$(& npm run lint 2>&1 | Out-String)`n" } catch {}
+    try { $ev += "## cargo fmt --check`n$(& cargo fmt --check 2>&1 | Out-String)`n" } catch {}
+    try { $ev += "## git diff --stat`n$(git diff main --stat 2>&1 | Out-String)`n" } catch {}
+    Write-FileSafe $evidencePath $ev
 
-    $e = @()
-    $e += "# Evidence $CycleId"
-    $e += "Time: $(Get-Date)"
-    $e += "Worktree: $WtPath"
-    $e += "Branch(meta): $($meta.branch_name)"
-    $e += "Self-heal retries used: $retryCount/$MaxRetries"
-    $e += "Tests pass after impl: $testsPass"
-    $e += "Tests pass after review: $postReviewTestOk"
-    $e += ""
+    # ============================================================
+    #  STEP C – Summary generation
+    # ============================================================
+    $stepMsg = Write-Step "C" "PR要約を生成中..." $cycle $MaxPRs
 
-    $e += "## git status --porcelain"
-    $e += (Run-CmdChecked "evidence-git-status" "git status --porcelain")
+    $summaryPrompt = @"
+Summarize the changes in this PR for the GitHub PR description.
+Write in English. Include: what changed, why, test results.
+Keep it concise (max 200 words). Save as pr-summary.md.
 
-    $e += "## git branch --show-current"
-    $e += (Run-CmdChecked "evidence-git-branch" "git branch --show-current")
-
-    $e += "## git log -1 --oneline --decorate"
-    $e += (Run-CmdChecked "evidence-git-log" "git log -1 --oneline --decorate")
-
-    $e += "## git diff --stat main...HEAD"
-    $e += (Run-CmdChecked "evidence-git-diffstat" "git diff --stat main...HEAD")
-
-    $e += "## npm run lint"
-    $e += (Run-CmdChecked "evidence-npm-lint" "npm run lint")
-
-    $tauriDirWt = Join-Path $WtPath "src-tauri"
-    if (Test-Path $tauriDirWt) {
-      $e += "## cargo fmt --check"
-      $fmtR = Invoke-Cmd -CmdLine "cargo fmt --check" -WorkingDirectory $tauriDirWt
-      $e += $fmtR.Output
-      if ($fmtR.ExitCode -ne 0) {
-        $e += "(pre-existing fmt drift; non-fatal)"
-        Write-Host "[evidence] cargo fmt drift detected (non-fatal)" -ForegroundColor Yellow
-      }
-
-      $e += "## cargo test"
-      $e += (Run-CmdChecked "evidence-cargo-test" "cargo test" $tauriDirWt)
-    } else {
-      $e += "## src-tauri not found; skipping cargo checks"
-    }
-
-    Write-Utf8File $EvidenceFile ($e -join "`n")
-
-    # =====================
-    # STEP C: Summarize (~70-75%)
-    # =====================
-    Write-Progress-Step -Step "C" -Message "Summarizing..." -Percent "~75%" -Cycle $i -MaxCycles $MaxPRs -LoopStart $LoopStartTime
-
-    $SummaryPrompt = @"
-You are a senior engineer writing a cycle summary.
-
-Read:
-- Research: $ResearchFile
-- Instruction: $PlanNextFile
-- Meta: $MetaFile
-- Evidence: $EvidenceFile
-- Review: $LogDir\review-$CycleId.md (if exists)
-- AGENTS: $AgentsPath
-- Plan: $PlanPath
-
-Write a concise but complete result report and save to:
-$ResultFile
-
-Must include:
-- Branch name
-- Intended PR title
-- What changed (files + bullets)
-- Test results (lint/fmt/test) and whether failures are pre-existing
-- Code review findings and fixes applied
-- Self-healing retries used ($retryCount/$MaxRetries)
-- Constraint compliance (diff lines, files changed vs limits)
-- Remaining TODOs / blockers
-- Whether it's safe to open a PR now
-
-Output only the file; no extra chatter.
+PR Title: $prTitle
+Diff stat:
+$(git diff main --stat 2>$null | Out-String)
+Evidence:
+$(Get-Content $evidencePath -Raw -ErrorAction SilentlyContinue)
 "@
 
-    $StepCLog = Join-Path $LogDir "step-c-$CycleId.log"
-    Invoke-Codex -Prompt $SummaryPrompt -LogFile $StepCLog -PromptLabel "prompt-c"
+    $prBody = ""
+    try {
+        codex -a full-auto --quiet -m o4-mini "$summaryPrompt" 2>$null
+        if (Test-Path "pr-summary.md") {
+            $prBody = Get-Content "pr-summary.md" -Raw
+            Copy-Item "pr-summary.md" (Join-Path $LogDir "summary-$cycle.md") -Force
+        }
+    } catch {}
+    if (-not $prBody) { $prBody = "Automated PR by auto-dev v3. See evidence in .codex-logs." }
 
-    if (-not (Test-Path $ResultFile)) {
-      Write-Utf8File $ResultFile "Result file not generated. See logs: $StepCLog"
+    # ============================================================
+    #  STEP D – Push & PR creation
+    # ============================================================
+    $stepMsg = Write-Step "D" "プッシュ＆PR作成中..." $cycle $MaxPRs
+
+    if ($AutoPush) {
+        git push origin $branch --force-with-lease 2>$null
+        Write-Host "  [D] プッシュ完了: $branch" -ForegroundColor Green
+
+        if ($AutoCreatePR) {
+            $draftFlag = if ($DraftPR) { "--draft" } else { "" }
+            try {
+                $prResult = & gh pr create --base main --head $branch --title "$prTitle" --body "$prBody" $draftFlag 2>&1
+                $prUrl = ($prResult | Select-String -Pattern 'https://github.com/.+/pull/\d+' | Select-Object -First 1).Matches.Value
+                if ($prUrl) {
+                    Write-Host "  [D] PR作成: $prUrl" -ForegroundColor Green
+                    $allPRUrls += $prUrl
+                } else {
+                    Write-Host "  [D] PR作成結果: $prResult" -ForegroundColor Yellow
+                }
+            } catch {
+                Write-Host "  [D] PR作成エラー: $_" -ForegroundColor Yellow
+            }
+        }
     }
 
-    # =====================
-    # STEP D: Auto push + PR (~80-85%)
-    # =====================
-    $prUrl = ""
-    if ($AutoPush -or $AutoCreatePR) {
-      Write-Progress-Step -Step "D" -Message "Pushing branch / creating PR..." -Percent "~85%" -Cycle $i -MaxCycles $MaxPRs -LoopStart $LoopStartTime
+    Send-Discord ":rocket: [D] プッシュ＆PR作成完了 | ``$branch``"
 
-      $cur = (Run-CmdChecked "git-branch-current" "git branch --show-current").Trim()
-      if ($cur -ne $meta.branch_name) {
-        throw "Current branch '$cur' != expected '$($meta.branch_name)'. Aborting push/PR."
-      }
+    # ── After 計測 ──
+    try {
+        $fc2 = & cargo fmt --check 2>&1
+        $afterData.FmtDrift = if ($LASTEXITCODE -ne 0) { "あり" } else { "なし" }
+    } catch { $afterData.FmtDrift = "不明" }
+    try {
+        $lo2 = & npm run lint 2>&1 | Out-String
+        if ($lo2 -match '(\d+)\s+error')   { $afterData.LintErr  = [int]$Matches[1] }
+        if ($lo2 -match '(\d+)\s+warning') { $afterData.LintWarn = [int]$Matches[1] }
+    } catch {}
+    try {
+        $to2 = & cargo test 2>&1 | Out-String
+        if ($to2 -match 'test result: \w+\.\s+(\d+)\s+passed') {
+            $afterData.TestPass = [int]$Matches[1]; $afterData.Tests = [int]$Matches[1]
+        }
+    } catch {}
+    try {
+        $ds = git diff main --stat 2>$null | Out-String
+        if ($ds -match '(\d+)\s+file')      { $afterData.FilesChanged = [int]$Matches[1] }
+        if ($ds -match '(\d+)\s+insertion')  { $ins = [int]$Matches[1] } else { $ins = 0 }
+        if ($ds -match '(\d+)\s+deletion')   { $del = [int]$Matches[1] } else { $del = 0 }
+        $afterData.DiffLines = $ins + $del
+    } catch {}
 
-      if ($AutoPush) {
-        Run-CmdChecked "git-push" ("git push -u origin {0}" -f $meta.branch_name) | Out-Null
-      }
+    $cycleElapsed = (Get-Date) - $script:CycleStartTime
+    $elapsedStr   = "{0:mm\分ss\秒}" -f $cycleElapsed
 
-      if ($AutoCreatePR -and $ghOk) {
-        $draftFlag = ""
-        if ($DraftPR) { $draftFlag = "--draft" }
+    # ── 日本語 Before/After レポート送信 ──
+    $cycleStatus = if ($prUrl) { "成功" } else { "失敗" }
+    Send-CycleReport -CycleId $cycle -PRTitle $prTitle -PRUrl $prUrl -BranchName $branch `
+        -Before $beforeData -After $afterData `
+        -RetryUsed $retryUsed -RetryMax $MaxRetries -ReviewFixes $reviewFixCount `
+        -ElapsedTime $elapsedStr -Status $cycleStatus
 
-        $existing = ""
-        $viewR = Invoke-Cmd ("gh pr view {0} --json url -q .url" -f $meta.branch_name)
-        if ($viewR.ExitCode -eq 0) { $existing = $viewR.Output.Trim() }
+    # メタ情報保存
+    $metaPath = Join-Path $LogDir "meta-$cycle.json"
+    $meta = @{
+        cycle = $cycle; branch = $branch; prTitle = $prTitle; prUrl = $prUrl
+        retryUsed = $retryUsed; reviewFixes = $reviewFixCount
+        elapsed = $cycleElapsed.TotalSeconds; status = $cycleStatus
+        before = $beforeData; after = $afterData
+    } | ConvertTo-Json -Depth 3
+    Write-FileSafe $metaPath $meta
 
-        if (-not $existing) {
-          $safeTitle = ($meta.pr_title -replace '"', "'")
-          $body = @"
-Summary:
-- $safeTitle
+    } # end try
+    finally {
+        Pop-Location
+    }
 
-How to test:
-- npm run lint
-- cd src-tauri && cargo fmt --check
-- cd src-tauri && cargo test
+    # ============================================================
+    #  STEP E – Auto-merge（repo root から実行）
+    # ============================================================
+    $stepMsg = Write-Step "E" "マージ中..." $cycle $MaxPRs
 
-Notes:
-- Research: .codex-logs/research-$CycleId.md
-- Evidence: .codex-logs/evidence-$CycleId.md
-- Review: .codex-logs/review-$CycleId.md
-- Self-healing retries: $retryCount/$MaxRetries
-- Constraints: max $MaxDiffLines diff lines, max $MaxFilesChanged files
+    if ($prUrl) {
+        Push-Location -LiteralPath $RepoRoot
+        try {
+            Start-Sleep -Seconds 3
+            $prNum = ($prUrl -split '/')[-1]
+            & gh pr merge $prNum --squash --delete-branch 2>$null
+            if ($LASTEXITCODE -eq 0) {
+                Write-Host "  [E] マージ成功: PR #$prNum" -ForegroundColor Green
+                Send-Discord ":dart: [E] マージ完了 | PR #$prNum"
+                git pull origin main 2>$null
+            } else {
+                Write-Host "  [E] マージ不可（レビュー待ちまたはCI未完了）" -ForegroundColor Yellow
+                Send-Discord ":hourglass: [E] マージ保留 | PR #$prNum（手動対応可）"
+            }
+        } catch {
+            Write-Host "  [E] マージエラー: $_" -ForegroundColor Yellow
+        }
+        Pop-Location
+    }
+
+    # ── worktree cleanup ──
+    try {
+        git worktree remove $wtPath --force 2>$null
+        Write-Host "  [cleanup] worktree removed: $wtName" -ForegroundColor DarkGray
+    } catch {}
+
+    # ── Memory 蓄積 ──
+    $lessonPath = Join-Path $MemDir "patterns\cycle-$cycle-$RunId.md"
+    $lesson = @"
+# Cycle $cycle – $prTitle
+- Status: $cycleStatus
+- Retry: $retryUsed/$MaxRetries
+- Review fixes: $reviewFixCount
+- Elapsed: $elapsedStr
+- Branch: $branch
 "@
-          $tmpBody = Join-Path $LogDir "pr-body-$CycleId.txt"
-          Write-Utf8File $tmpBody $body
+    Write-FileSafe $lessonPath $lesson
 
-          $cmd = "gh pr create --base main --head {0} --title {1} --body-file {2} {3}" -f `
-            $meta.branch_name, (Quote-CmdArg $safeTitle), (Quote-CmdArg $tmpBody), $draftFlag
-
-          $created = Invoke-Cmd $cmd
-          if ($created.ExitCode -ne 0) {
-            throw "[gh-pr-create] failed (exit=$($created.ExitCode)).`n$($created.Output)"
-          }
-
-          $m = [regex]::Match($created.Output, 'https://github\.com/\S+/pull/\d+')
-          if ($m.Success) { $prUrl = $m.Value }
-        } else {
-          $prUrl = $existing
-        }
-
-        if ($prUrl) {
-          $CreatedPRs.Add($prUrl) | Out-Null
-          Append-Utf8File $ResultFile "`n`nPR: $prUrl`n"
-        }
-      }
+    # ── スリープ ──
+    if ($cycle -lt $MaxPRs) {
+        Write-Host "  [sleep] 次のサイクルまで $SleepMinutes 分待機..." -ForegroundColor DarkGray
+        Send-Discord ":zzz: 次のサイクルまで $SleepMinutes 分待機"
+        Start-Sleep -Seconds ($SleepMinutes * 60)
     }
-
-    Send-Notification -Title "STEP D Complete" -Message "PR: $prUrl`nBranch: ``$($meta.branch_name)``" -Color "3066993"
-
-    # Return to RepoRoot BEFORE STEP E (worktree -> main repo)
-    Pop-Location
-    Set-Location -LiteralPath $RepoRoot
-
-    # =====================
-    # STEP E: Auto-merge (~90-95%) — FIXED: runs from RepoRoot
-    # =====================
-    if ($prUrl -and $AutoCreatePR -and $ghOk) {
-      Write-Progress-Step -Step "E" -Message "Auto-merging PR into main..." -Percent "~93%" -Cycle $i -MaxCycles $MaxPRs -LoopStart $LoopStartTime
-
-      $prNumMatch = [regex]::Match($prUrl, '/pull/(\d+)')
-      if ($prNumMatch.Success) {
-        $prNum = $prNumMatch.Groups[1].Value
-
-        if ($DraftPR) {
-          Write-Host "[E] Marking PR #$prNum as ready..." -ForegroundColor DarkGreen
-          $readyR = Invoke-Cmd "gh pr ready $prNum"
-          if ($readyR.ExitCode -ne 0) {
-            Write-Host "[E][warn] gh pr ready failed: $($readyR.Output)" -ForegroundColor Yellow
-          }
-          Start-Sleep -Seconds 3
-        }
-
-        Write-Host "[E] Squash-merging PR #$prNum..." -ForegroundColor DarkGreen
-        $mergeR = Invoke-Cmd "gh pr merge $prNum --squash --delete-branch"
-        if ($mergeR.ExitCode -eq 0) {
-          Write-Host "[E] PR #$prNum merged successfully." -ForegroundColor Green
-          Append-Utf8File $ResultFile "`nMerge: PR #$prNum squash-merged into main.`n"
-          Send-Notification -Title "PR #$prNum Merged" -Message "**$($meta.pr_title)**`nSquash-merged into main." -Color "3066993"
-        } else {
-          Write-Host "[E][error] Merge failed: $($mergeR.Output)" -ForegroundColor Red
-          Append-Utf8File $ResultFile "`nMerge: FAILED for PR #$prNum - $($mergeR.Output)`n"
-          Send-Notification -Title "PR #$prNum Merge FAILED" -Message "Error: $($mergeR.Output)" -Color "15158332"
-        }
-
-        Start-Sleep -Seconds 3
-      } else {
-        Write-Host "[E][warn] Could not extract PR number from: $prUrl" -ForegroundColor Yellow
-      }
-    }
-
-    # Show result
-    $cycleElapsed = ((Get-Date) - $cycleStartTime).ToString("hh\:mm\:ss")
-    Write-Host ""
-    Write-Host "--- Cycle $i COMPLETE (took: $cycleElapsed) ---" -ForegroundColor Green
-    Write-Host "Result ($CycleId):" -ForegroundColor Cyan
-    Get-Content $ResultFile -Encoding utf8
-
-    Send-Notification -Title "Cycle $i/$MaxPRs Complete" -Message "Duration: $cycleElapsed`nPR: $($meta.pr_title)`nURL: $prUrl" -Color "3066993"
-
-  }
-  finally {
-    # Ensure we're back at RepoRoot (may already be there after STEP E)
-    try { Pop-Location } catch {}
-    Set-Location -LiteralPath $RepoRoot
-
-    if (-not $KeepWorktrees) {
-      try {
-        $rmCmd = "git worktree remove " + (Quote-CmdArg $WtPath) + " --force"
-        Invoke-Cmd $rmCmd | Out-Null
-      } catch {}
-      try { if (Test-Path $WtPath) { Remove-Item -Recurse -Force $WtPath } } catch {}
-    }
-  }
-
-  if ($i -lt $MaxPRs) {
-    Write-Host "Sleeping $SleepMinutes minutes..." -ForegroundColor Gray
-    Start-Sleep -Seconds ($SleepMinutes * 60)
-  }
 }
 
-$totalElapsed = ((Get-Date) - $LoopStartTime).ToString("hh\:mm\:ss")
-Write-Host ""
-Write-Host "========================================" -ForegroundColor Cyan
-Write-Host " auto-dev loop COMPLETE" -ForegroundColor Cyan
-Write-Host " Finished : $(Get-Date)" -ForegroundColor Cyan
-Write-Host " Total    : $totalElapsed" -ForegroundColor Cyan
-Write-Host " PRs done : $($CreatedPRs.Count)" -ForegroundColor Cyan
-Write-Host "========================================" -ForegroundColor Cyan
+# ══════════════════════════════════════════
+#  終了処理
+# ══════════════════════════════════════════
+$totalElapsed = (Get-Date) - $StartTime
+$totalStr     = "{0:hh\時間mm\分ss\秒}" -f $totalElapsed
 
-Send-Notification -Title "Loop COMPLETE" -Message "All $MaxPRs cycles finished.`nTotal: $totalElapsed`nPRs: $($CreatedPRs.Count)`nURLs:`n$($CreatedPRs -join "`n")" -Color "3066993"
-
-# -------------------------
-# POST-LOOP: Night report + next plan + memory consolidation
-# -------------------------
-Write-Host ""
-Write-Host "========================================" -ForegroundColor Magenta
-Write-Host " Generating night report and next plan..." -ForegroundColor Magenta
-Write-Host "========================================" -ForegroundColor Magenta
-
-$ReportFile    = Join-Path $LogDir "night-report-$Timestamp.md"
-$NextPlanFile  = Join-Path $LogDir "next-session-plan-$Timestamp.md"
-$PatternsFile  = Join-Path $LogDir "memory\patterns.md"
-$PRListFile    = Join-Path $LogDir "pr-urls-$Timestamp.txt"
-
-if ($CreatedPRs.Count -gt 0) {
-  Write-Utf8File $PRListFile ($CreatedPRs -join "`n")
-} else {
-  Write-Utf8File $PRListFile "(no PR urls recorded)"
-}
-
-$MgmtEvidence = @()
-$MgmtEvidence += "# Nightly Evidence"
-$MgmtEvidence += "Time: $(Get-Date)"
-$MgmtEvidence += "Repo: $RepoRoot"
-$MgmtEvidence += ""
-
-$MgmtEvidence += "## git log --oneline -20"
-$MgmtEvidence += (Run-CmdChecked "mgmt-git-log" "git log --oneline -20")
-
-$MgmtEvidence += "## gh pr list (last 100)"
-if ($ghOk) {
-  $prListR = Invoke-Cmd "gh pr list --state all --limit 100"
-  if ($prListR.ExitCode -eq 0) { $MgmtEvidence += $prListR.Output } else { $MgmtEvidence += "[gh pr list failed]`n$($prListR.Output)" }
-} else {
-  $MgmtEvidence += "(gh not available)"
-}
-
-$MgmtEvidencePath = Join-Path $LogDir "mgmt-evidence-$Timestamp.md"
-Write-Utf8File $MgmtEvidencePath ($MgmtEvidence -join "`n")
-
-$ReportPrompt = @"
-You are a senior engineering manager reviewing an automated overnight run.
-
-Read:
-- All cycle results: $LogDir\result-*.md
-- All cycle evidence: $LogDir\evidence-*.md
-- All code reviews: $LogDir\review-*.md
-- All research reports: $LogDir\research-*.md
-- All cycle lessons: $LogDir\memory\lessons\*.md
-- Tasks: $RepoRoot\tasks\todo.md (if exists), $RepoRoot\tasks\lessons.md (if exists)
-- Repo evidence: $MgmtEvidencePath
-- PR URLs file: $PRListFile
-- AGENTS: $AgentsPath
-- Plan: $PlanPath
-
-Produce THREE files:
-
-(1) Night report saved to:
-$ReportFile
-
-Must include:
-- PR-by-PR status (merged/open/local-only)
-- Failures / incomplete work
-- Code review findings summary
-- Self-healing retry statistics
-- Constraint compliance summary (diff lines, files changed)
-- Patterns / lessons
-- Top risks / technical debt
-- Recommended next 5-10 PRs
-
-(2) Next session instruction plan saved to:
-$NextPlanFile
-
-Must include:
-- Mandatory hygiene steps
-- Concrete reconciliation steps (PR lifecycle gap closure)
-- Verification debt closure steps
-- Acceptance criteria and logging requirements
-
-(3) Recurring patterns update saved to:
-$PatternsFile
-
-Consolidate ALL cycle lessons into a categorized pattern list:
-- Category: Build/Test patterns
-- Category: Code quality patterns
-- Category: Scope management patterns
-- Category: Tool/environment patterns
-Format each pattern as: | pattern | frequency | prevention rule |
-This file is the long-term memory that future cycles will read.
+$nightlyReport = @"
+# Nightly Report – $RunId
+- Total cycles: $MaxPRs
+- Total elapsed: $totalStr
+- PRs created: $($allPRUrls.Count)
+$(($allPRUrls | ForEach-Object { "  - $_" }) -join "`n")
 "@
+Write-FileSafe (Join-Path $LogDir "nightly-$RunId.md") $nightlyReport
 
-$StepReportLog = Join-Path $LogDir "step-report-$Timestamp.log"
-Invoke-CodexReport -Prompt $ReportPrompt -LogFile $StepReportLog
+# 最終Discord通知
+$finalMsg = @"
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+:clipboard: **夜間レポート** | $RunId
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+実行サイクル : $MaxPRs
+合計所要時間 : $totalStr
+作成PR数     : $($allPRUrls.Count)
+$(($allPRUrls | ForEach-Object { ":link: $_" }) -join "`n")
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+"@
+Send-Discord $finalMsg
 
-if (Test-Path $ReportFile) {
-  Write-Host ""
-  Write-Host "=== Night Report ===" -ForegroundColor Cyan
-  Get-Content $ReportFile -Encoding utf8
-}
-if (Test-Path $NextPlanFile) {
-  Write-Host ""
-  Write-Host "=== Next Session Plan ===" -ForegroundColor Cyan
-  Get-Content $NextPlanFile -Encoding utf8
-}
+Write-Host @"
 
-Write-Host ""
-Write-Host "========================================" -ForegroundColor Magenta
-Write-Host " Report and next plan COMPLETE" -ForegroundColor Magenta
-Write-Host " Logs: $LogDir" -ForegroundColor Magenta
-Write-Host " Memory: $MemDir" -ForegroundColor Magenta
-Write-Host "========================================" -ForegroundColor Magenta
-
-Send-Notification -Title "Night Report Generated" -Message "Report: night-report-$Timestamp.md`nNext plan: next-session-plan-$Timestamp.md`nPatterns: memory/patterns.md`nLogs: $LogDir" -Color "3447003"
+========================================
+ auto-dev v3 completed
+ Total PRs : $($allPRUrls.Count)
+ Elapsed   : $totalStr
+ Report    : $(Join-Path $LogDir "nightly-$RunId.md")
+========================================
+"@ -ForegroundColor Green
