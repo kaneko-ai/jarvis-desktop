@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     auto-dev v3 – Codex 自動開発ループ（worktree分離・日本語Discord通知・ETA表示）
 .DESCRIPTION
@@ -778,3 +778,4 @@ Write-Host @"
  Report    : $(Join-Path $LogDir "nightly-$RunId.md")
 ========================================
 "@ -ForegroundColor Green
+
