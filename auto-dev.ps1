@@ -320,7 +320,7 @@ Output a structured research report as research-$cycle.md covering:
 
     $researchFile = Join-Path $LogDir "research-$cycle.md"
     try {
-        codex -a full-auto -m o4-mini "$researchPrompt" 2>$null
+        codex --full-auto -m o4-mini "$researchPrompt" 2>$null
         if (Test-Path "research-$cycle.md") {
             Move-Item "research-$cycle.md" $researchFile -Force
         } else {
@@ -368,7 +368,7 @@ Save output as plan.md
 
     $planOutFile = Join-Path $LogDir "plan-$cycle.md"
     try {
-        codex -a full-auto "$planPrompt" 2>$null
+        codex --full-auto "$planPrompt" 2>$null
         if (Test-Path "plan.md") {
             Copy-Item "plan.md" $planOutFile -Force
             $planOut = Get-Content "plan.md" -Raw
@@ -407,7 +407,7 @@ Save annotated plan as plan-annotated.md
 "@
 
     try {
-        codex -a full-auto -m o4-mini "$annotPrompt" 2>$null
+        codex --full-auto -m o4-mini "$annotPrompt" 2>$null
         if (Test-Path "plan-annotated.md") {
             $planOut = Get-Content "plan-annotated.md" -Raw
             Copy-Item "plan-annotated.md" (Join-Path $LogDir "plan-annotated-$cycle.md") -Force
@@ -445,7 +445,7 @@ $constraints
 "@
 
     try {
-        codex -a full-auto "$implPrompt" 2>$null
+        codex --full-auto "$implPrompt" 2>$null
     } catch {
         Write-Host "  [B] Codex implementation error: $_" -ForegroundColor Yellow
     }
@@ -512,7 +512,7 @@ $testResult
 $constraints
 "@
             try {
-                codex -a full-auto "$fixPrompt" 2>$null
+                codex --full-auto "$fixPrompt" 2>$null
                 git add -A; git commit --amend --no-edit 2>$null
             } catch {}
         } else {
@@ -558,7 +558,7 @@ If no issues, save review-clean.md with "No issues found."
 "@
 
     try {
-        codex -a full-auto -m o4-mini "$reviewPrompt" 2>$null
+        Write-FileSafe "review-prompt.txt" $reviewPrompt; codex --full-auto -m o4-mini (Get-Content "review-prompt.txt" -Raw) 2>$null
         if (Test-Path "review-fixes.md") {
             $reviewFixCount = (git diff --name-only 2>$null | Measure-Object).Count
             git add -A; git commit --amend --no-edit 2>$null
@@ -605,7 +605,7 @@ $(Get-Content $evidencePath -Raw -ErrorAction SilentlyContinue)
 
     $prBody = ""
     try {
-        codex -a full-auto -m o4-mini "$summaryPrompt" 2>$null
+        codex --full-auto -m o4-mini "$summaryPrompt" 2>$null
         if (Test-Path "pr-summary.md") {
             $prBody = Get-Content "pr-summary.md" -Raw
             Copy-Item "pr-summary.md" (Join-Path $LogDir "summary-$cycle.md") -Force
@@ -619,7 +619,7 @@ $(Get-Content $evidencePath -Raw -ErrorAction SilentlyContinue)
     $stepMsg = Write-Step "D" "プッシュ＆PR作成中..." $cycle $MaxPRs
 
     if ($AutoPush) {
-        git push origin $branch --force-with-lease 2>$null
+        $ErrorActionPreference = "Continue"; git push origin $branch --force-with-lease 2>&1 | Out-Null; $ErrorActionPreference = "Stop"
         Write-Host "  [D] プッシュ完了: $branch" -ForegroundColor Green
 
         if ($AutoCreatePR) {
@@ -700,11 +700,11 @@ $(Get-Content $evidencePath -Raw -ErrorAction SilentlyContinue)
         try {
             Start-Sleep -Seconds 3
             $prNum = ($prUrl -split '/')[-1]
-            & gh pr merge $prNum --squash --delete-branch 2>$null
+            $ErrorActionPreference = "Continue"; & gh pr merge $prNum --squash --delete-branch 2>&1 | Out-Null; $ErrorActionPreference = "Stop"
             if ($LASTEXITCODE -eq 0) {
                 Write-Host "  [E] マージ成功: PR #$prNum" -ForegroundColor Green
                 Send-Discord ":dart: [E] マージ完了 | PR #$prNum"
-                git pull origin main 2>$null
+                $ErrorActionPreference = "Continue"; git pull origin main 2>&1 | Out-Null; $ErrorActionPreference = "Stop"
             } else {
                 Write-Host "  [E] マージ不可（レビュー待ちまたはCI未完了）" -ForegroundColor Yellow
                 Send-Discord ":hourglass: [E] マージ保留 | PR #$prNum（手動対応可）"
@@ -778,4 +778,6 @@ Write-Host @"
  Report    : $(Join-Path $LogDir "nightly-$RunId.md")
 ========================================
 "@ -ForegroundColor Green
+
+
 
