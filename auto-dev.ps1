@@ -420,8 +420,11 @@ Save annotated plan as plan-annotated.md
     $stepMsg = Write-Step "B" "$branch で実装中..." $cycle $MaxPRs
     Send-Discord ":hammer_and_wrench: [B] 実装開始 | ``$branch`` | サイクル $cycle"
 
-    git switch -c $branch 2>$null
-    if ($LASTEXITCODE -ne 0) { git checkout -b $branch 2>$null }
+    $ErrorActionPreference = "Continue"
+    git switch -c $branch 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { git checkout -b $branch 2>&1 | Out-Null }
+    $ErrorActionPreference = "Stop"
+
 
     # node_modules クリーン
     if (Test-Path "node_modules") { Remove-Item "node_modules" -Recurse -Force -ErrorAction SilentlyContinue }
