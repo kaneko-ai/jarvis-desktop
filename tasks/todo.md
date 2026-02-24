@@ -3,16 +3,17 @@
 
 ## Current Cycle
 - [x] PR65: run pre-work hygiene checks and branch setup
-- [x] PR65: review existing Runs log viewer behavior and define deterministic filter/search rules
-- [x] PR65: add local log search/filter state and derived filtered-line summary in `src/App.jsx`
-- [x] PR65: wire Runs-screen search/filter controls and filtered `<pre>` rendering
-- [x] PR65: run validation checks (`npm run lint`, `cargo test`, `cargo fmt --check`) and record review
+- [x] PR65: inspect current Runs `Live run logs` implementation and align behavior to master-plan PR65 scope
+- [x] PR65: replace log filter state with `pipelineRunSearchQuery` and `pipelineRunFilterMatchesOnly` in `src/App.jsx`
+- [x] PR65: add memoized line match totals plus `visiblePipelineRunText` rendering and no-match helper text
+- [x] PR65: run validation checks (`npm run lint`, `cargo test`, `cargo fmt --check`) and record outcomes
 
 ## Review (Current Cycle)
-- Added live log filtering/search state in `src/App.jsx`: query text, filter mode (`all`/`error`/`warn`/`info`), and case-sensitive toggle.
-- Added deterministic derived line filtering over `pipelineRunText` with summary counts (`showing X / Y lines`) and default pass-through behavior when filters are unset.
-- Updated Runs-screen Live run logs controls with search input, filter dropdown, case toggle, and `Clear filters` action; `<pre>` now renders filtered content.
-- Validation results: `npm run lint` passed with existing warnings (9), `cargo test` passed (78 tests), `cargo fmt --check` failed due pre-existing broad formatting drift in `src-tauri/src/main.rs` (not introduced by this PR).
+- Updated `src/App.jsx` live-log state to exactly the PR65 controls: search query string and `Matches only` toggle.
+- Added memoized derived live-log data: split lines from `pipelineRunText`, case-insensitive match count, total line count, and `visiblePipelineRunText` pass-through/filter behavior.
+- Updated Runs screen `Live run logs` control row with `search logs`, `Matches only`, and `matches=X / lines=Y`; kept refresh/clear/follow behaviors intact.
+- Added filtered empty-state helper line when query exists, `Matches only` is enabled, and matches are zero.
+- Validation results: `npm run lint` passed with existing warnings (9), `cargo test` passed (78 tests), `cargo fmt --check` failed due pre-existing formatting drift in `src-tauri/src/main.rs` (outside this PR scope).
 
 ## Completed
 - [x] PR54: safe artifact open/reveal/copy path actions
