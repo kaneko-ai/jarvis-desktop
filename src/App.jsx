@@ -188,6 +188,34 @@ function pipelineRunStatusColor(status) {
   return "#666";
 }
 
+const LIVE_RUN_LOG_FILTER_MODES = [
+  { value: "all", label: "All" },
+  { value: "error", label: "Error" },
+  { value: "warn", label: "Warn" },
+  { value: "info", label: "Info" },
+];
+
+function classifyLiveRunLogLine(line) {
+  const lower = String(line ?? "").toLowerCase();
+  if (
+    lower.includes("[error]")
+    || lower.includes(" error ")
+    || lower.startsWith("error:")
+    || lower.includes("exception")
+    || lower.includes("traceback")
+    || lower.includes("stderr:")
+  ) {
+    return "error";
+  }
+  if (lower.includes("[warn]") || lower.includes(" warning") || lower.includes(" warn")) {
+    return "warn";
+  }
+  if (lower.includes("[info]") || lower.includes(" info ") || lower.startsWith("info:")) {
+    return "info";
+  }
+  return "all";
+}
+
 export default function App() {
   const [paperId, setPaperId] = useState("arxiv:1706.03762");
   const [templates, setTemplates] = useState([]);
@@ -332,6 +360,9 @@ export default function App() {
   const [pipelineRunTab, setPipelineRunTab] = useState("input");
   const [pipelineRunQuery, setPipelineRunQuery] = useState("");
   const [pipelineRunText, setPipelineRunText] = useState("");
+  const [liveRunSearchQuery, setLiveRunSearchQuery] = useState("");
+  const [liveRunFilterMode, setLiveRunFilterMode] = useState("all");
+  const [liveRunCaseSensitive, setLiveRunCaseSensitive] = useState(false);
   const [pipelineRunTextLoading, setPipelineRunTextLoading] = useState(false);
   const [pipelineRunTextError, setPipelineRunTextError] = useState("");
   const [liveRunFollow, setLiveRunFollow] = useState(false);
@@ -523,6 +554,12 @@ export default function App() {
 
   async function onRefreshLiveRunLogs() {
     await loadPipelineRunText(selectedPipelineRunId, pipelineRunTab);
+  }
+
+  function onClearLiveRunFilters() {
+    setLiveRunSearchQuery("");
+    setLiveRunFilterMode("all");
+    setLiveRunCaseSensitive(false);
   }
 
   function onClearLiveRunLogs() {
@@ -2270,6 +2307,42 @@ export default function App() {
       return hay.includes(pipelineRunQueryNormalized);
     })
     : pipelineRuns;
+  const liveRunFilterSummary = useMemo(() => {
+    const rawText = String(pipelineRunText ?? "");
+    if (!rawText) {
+      return { text: "", matchedLines: 0, totalLines: 0 };
+    }
+
+    const lines = rawText.split(/\r?\n/);
+    const totalLines = lines.length;
+    const queryRaw = String(liveRunSearchQuery ?? "");
+    const query = queryRaw.trim();
+    const hasQuery = query.length > 0;
+    const isCaseSensitive = liveRunCaseSensitive === true;
+    const queryNeedle = isCaseSensitive ? query : query.toLowerCase();
+    const mode = String(liveRunFilterMode ?? "all");
+    const isDefaultMode = mode === "all";
+
+    if (!hasQuery && isDefaultMode) {
+      return { text: rawText, matchedLines: totalLines, totalLines };
+    }
+
+    const matchedLines = lines.filter((line) => {
+      if (!isDefaultMode) {
+        const level = classifyLiveRunLogLine(line);
+        if (level !== mode) return false;
+      }
+      if (!hasQuery) return true;
+      const hay = isCaseSensitive ? String(line ?? "") : String(line ?? "").toLowerCase();
+      return hay.includes(queryNeedle);
+    });
+
+    return {
+      text: matchedLines.join("\n"),
+      matchedLines: matchedLines.length,
+      totalLines,
+    };
+  }, [pipelineRunText, liveRunSearchQuery, liveRunFilterMode, liveRunCaseSensitive]);
   const selectedRun = runs.find((r) => r.run_id === selectedRunId) ?? null;
   const selectedPipelineRun = pipelineRuns.find((r) => r.run_id === selectedPipelineRunId) ?? null;
   const artifactIsMissing = artifactView && artifactView.exists === false;
@@ -4051,6 +4124,35 @@ export default function App() {
                   <option key={opt.kind} value={opt.kind}>{opt.label}</option>
                 ))}
               </select>
+              <input
+                value={liveRunSearchQuery}
+                onChange={(e) => setLiveRunSearchQuery(e.target.value)}
+                placeholder="Search log lines"
+                style={{ minWidth: 220, padding: 8, borderRadius: 6, border: "1px solid #ccc", fontSize: 12 }}
+              />
+              <select
+                value={liveRunFilterMode}
+                onChange={(e) => setLiveRunFilterMode(e.target.value)}
+                style={{ padding: 8, borderRadius: 6, border: "1px solid #ccc", minWidth: 110, fontSize: 12 }}
+              >
+                {LIVE_RUN_LOG_FILTER_MODES.map((opt) => (
+                  <option key={opt.value} value={opt.value}>{opt.label}</option>
+                ))}
+              </select>
+              <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
+                <input
+                  type="checkbox"
+                  checked={liveRunCaseSensitive}
+                  onChange={(e) => setLiveRunCaseSensitive(e.target.checked)}
+                />
+                Case sensitive
+              </label>
+              <button
+                onClick={onClearLiveRunFilters}
+                style={{ padding: "6px 10px", borderRadius: 6, border: "1px solid #333", fontSize: 11 }}
+              >
+                Clear filters
+              </button>
               <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
                 <input
                   type="checkbox"
@@ -4100,6 +4202,9 @@ export default function App() {
               <span style={{ fontSize: 11, opacity: 0.8 }}>
                 source={liveRunTailUsed ? "tail" : "preview"}{liveRunTailTruncated ? " (truncated)" : ""}
               </span>
+              <span style={{ fontSize: 11, opacity: 0.8 }}>
+                showing {liveRunFilterSummary.matchedLines} / {liveRunFilterSummary.totalLines} lines
+              </span>
             </div>
 
             {pipelineRunTextLoading ? <div style={{ fontSize: 12, marginBottom: 8 }}>Loading logs...</div> : null}
@@ -4125,7 +4230,7 @@ export default function App() {
                 wordBreak: "break-word",
               }}
             >
-              {pipelineRunText}
+              {liveRunFilterSummary.text}
             </pre>
           </div>
         </div>
