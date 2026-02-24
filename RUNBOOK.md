@@ -160,6 +160,43 @@ Rejected:
 - UNC / device prefixes (`\\`, `\\?\`, `\\.\`)
 - paths outside allowed roots after canonicalization
 
+## Artifact Viewer Guide
+
+Use `Runs / Artifacts Viewer` to inspect run outputs quickly.
+
+### Search and badges
+- Use the `Search artifacts` box to filter by name, path, or kind.
+- Type badges:
+  - `md`, `json`, `graph`, `html`, `img`, `pdf`, `other`
+- Size is shown in human-readable units (`B`, `KB`, `MB`).
+
+### Open / Reveal / Copy path
+- `Open artifact`: opens the selected artifact in the OS default app.
+- `Reveal in Explorer`: opens Explorer and selects the artifact (or opens the directory).
+- `Copy path`: copies resolved artifact path.
+
+### Preview support
+- Inline preview is available for:
+  - Images (`.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`, `.bmp`)
+  - PDF (`.pdf`)
+  - JSON (`.json`)
+- Large JSON is not fully expanded inline; use `Open artifact` for full view.
+
+### Compare runs by artifacts
+- In `Compare runs (artifacts diff)`, choose run `A` and run `B`.
+- Buckets:
+  - `only in A`
+  - `only in B`
+  - `common`
+- Use quick `Open A` / `Open B` buttons to jump into artifact content.
+
+### Security notes for path open/reveal
+- `open_path` / `reveal_path` only allow canonical paths under:
+  - `runtime.pipeline_root`
+  - `runtime.out_base_dir`
+- Paths outside allowed roots are rejected.
+- UNC/device-prefixed paths are rejected (`\\`, `\\?\`, `\\.\`).
+
 ## Template Required Inference Rules
 
 `list_task_templates` returns `required_fields` using deterministic rules:
