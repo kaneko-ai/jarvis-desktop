@@ -562,6 +562,43 @@ Notes:
       }
     }
 
+    # STEP E: Auto-merge the PR into main
+    if ($prUrl -and $AutoCreatePR -and $ghOk) {
+      Write-Host "[E] Auto-merging PR into main..." -ForegroundColor Green
+
+      # Extract PR number from URL
+      $prNumMatch = [regex]::Match($prUrl, '/pull/(\d+)')
+      if ($prNumMatch.Success) {
+        $prNum = $prNumMatch.Groups[1].Value
+
+        # If draft, mark as ready first
+        if ($DraftPR) {
+          Write-Host "[E] Marking PR #$prNum as ready..." -ForegroundColor DarkGreen
+          $readyR = Invoke-Cmd "gh pr ready $prNum"
+          if ($readyR.ExitCode -ne 0) {
+            Write-Host "[E][warn] gh pr ready failed: $($readyR.Output)" -ForegroundColor Yellow
+          }
+          Start-Sleep -Seconds 3
+        }
+
+        # Squash merge and delete remote branch
+        Write-Host "[E] Squash-merging PR #$prNum..." -ForegroundColor DarkGreen
+        $mergeR = Invoke-Cmd "gh pr merge $prNum --squash --delete-branch"
+        if ($mergeR.ExitCode -eq 0) {
+          Write-Host "[E] PR #$prNum merged successfully." -ForegroundColor Green
+          Append-Utf8File $ResultFile "`nMerge: PR #$prNum squash-merged into main.`n"
+        } else {
+          Write-Host "[E][error] Merge failed: $($mergeR.Output)" -ForegroundColor Red
+          Append-Utf8File $ResultFile "`nMerge: FAILED for PR #$prNum - $($mergeR.Output)`n"
+        }
+
+        Start-Sleep -Seconds 3
+      } else {
+        Write-Host "[E][warn] Could not extract PR number from: $prUrl" -ForegroundColor Yellow
+      }
+    }
+
+
     # Show result
     Write-Host "Result ($CycleId):" -ForegroundColor Cyan
     Get-Content $ResultFile -Encoding utf8
