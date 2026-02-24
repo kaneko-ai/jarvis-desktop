@@ -332,6 +332,8 @@ export default function App() {
   const [pipelineRunTab, setPipelineRunTab] = useState("input");
   const [pipelineRunQuery, setPipelineRunQuery] = useState("");
   const [pipelineRunText, setPipelineRunText] = useState("");
+  const [pipelineRunSearchQuery, setPipelineRunSearchQuery] = useState("");
+  const [pipelineRunFilterMatchesOnly, setPipelineRunFilterMatchesOnly] = useState(false);
   const [pipelineRunTextLoading, setPipelineRunTextLoading] = useState(false);
   const [pipelineRunTextError, setPipelineRunTextError] = useState("");
   const [liveRunFollow, setLiveRunFollow] = useState(false);
@@ -524,6 +526,7 @@ export default function App() {
   async function onRefreshLiveRunLogs() {
     await loadPipelineRunText(selectedPipelineRunId, pipelineRunTab);
   }
+
 
   function onClearLiveRunLogs() {
     setPipelineRunText("");
@@ -2270,6 +2273,35 @@ export default function App() {
       return hay.includes(pipelineRunQueryNormalized);
     })
     : pipelineRuns;
+  const {
+    visiblePipelineRunText,
+    pipelineRunMatchCount,
+    pipelineRunTotalLineCount,
+  } = useMemo(() => {
+    const rawText = String(pipelineRunText ?? "");
+    const lines = rawText ? rawText.split(/\r?\n/) : [];
+    const totalLines = lines.length;
+    const query = String(pipelineRunSearchQuery ?? "").trim().toLowerCase();
+    const hasQuery = query.length > 0;
+    const matchedLines = hasQuery
+      ? lines.filter((line) => String(line ?? "").toLowerCase().includes(query))
+      : lines;
+    const matchCount = matchedLines.length;
+    const text = hasQuery && pipelineRunFilterMatchesOnly
+      ? matchedLines.join("\n")
+      : rawText;
+
+    return {
+      visiblePipelineRunText: text,
+      pipelineRunMatchCount: matchCount,
+      pipelineRunTotalLineCount: totalLines,
+    };
+  }, [pipelineRunText, pipelineRunSearchQuery, pipelineRunFilterMatchesOnly]);
+  const hasPipelineRunSearchQuery = String(pipelineRunSearchQuery ?? "").trim().length > 0;
+  const showNoPipelineRunMatches =
+    hasPipelineRunSearchQuery
+    && pipelineRunFilterMatchesOnly
+    && pipelineRunMatchCount === 0;
   const selectedRun = runs.find((r) => r.run_id === selectedRunId) ?? null;
   const selectedPipelineRun = pipelineRuns.find((r) => r.run_id === selectedPipelineRunId) ?? null;
   const artifactIsMissing = artifactView && artifactView.exists === false;
@@ -4051,6 +4083,20 @@ export default function App() {
                   <option key={opt.kind} value={opt.kind}>{opt.label}</option>
                 ))}
               </select>
+              <input
+                value={pipelineRunSearchQuery}
+                onChange={(e) => setPipelineRunSearchQuery(e.target.value)}
+                placeholder="search logs"
+                style={{ minWidth: 220, padding: 8, borderRadius: 6, border: "1px solid #ccc", fontSize: 12 }}
+              />
+              <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
+                <input
+                  type="checkbox"
+                  checked={pipelineRunFilterMatchesOnly}
+                  onChange={(e) => setPipelineRunFilterMatchesOnly(e.target.checked)}
+                />
+                Matches only
+              </label>
               <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12 }}>
                 <input
                   type="checkbox"
@@ -4100,11 +4146,17 @@ export default function App() {
               <span style={{ fontSize: 11, opacity: 0.8 }}>
                 source={liveRunTailUsed ? "tail" : "preview"}{liveRunTailTruncated ? " (truncated)" : ""}
               </span>
+              <span style={{ fontSize: 11, opacity: 0.8 }}>
+                matches={pipelineRunMatchCount} / lines={pipelineRunTotalLineCount}
+              </span>
             </div>
 
             {pipelineRunTextLoading ? <div style={{ fontSize: 12, marginBottom: 8 }}>Loading logs...</div> : null}
             {pipelineRunTextError ? (
               <div style={{ color: "#a33", fontSize: 12, marginBottom: 8 }}>{pipelineRunTextError}</div>
+            ) : null}
+            {showNoPipelineRunMatches ? (
+              <div style={{ fontSize: 12, marginBottom: 8 }}>No log lines matched the current search.</div>
             ) : null}
 
             <pre
@@ -4125,7 +4177,7 @@ export default function App() {
                 wordBreak: "break-word",
               }}
             >
-              {pipelineRunText}
+              {visiblePipelineRunText}
             </pre>
           </div>
         </div>
