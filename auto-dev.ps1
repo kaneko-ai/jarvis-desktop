@@ -2,14 +2,18 @@
 # - 1 cycle = 1 worktree (no dirty start contamination)
 # - Writes plan/meta/evidence/result into .codex-logs (UTF-8 no BOM)
 # - Script performs push + optional PR creation (gh) to avoid "local-only completion"
-# - STEP E: auto-merge (squash) after PR creation
+# - STEP E: auto-merge (squash) after PR creation — runs from RepoRoot to avoid 'main already checked out'
 # - Stops on dirty repo unless explicitly overridden
 #
-# Enhancements (2026-02-24):
+# Enhancements v2 (2026-02-25):
 # - #1 Independent code review (STEP B2) after implementation
 # - #2 Spec-driven prompts (prompts/ templates referenced in STEP A)
 # - #4 Discord webhook notifications on every step completion/error
 # - #6 Self-healing retry loop in STEP B (up to MaxRetries)
+# - Boris Cherny method: STEP A0 (Deep Research) + STEP A1 (Self-Annotation)
+# - Mnemis/koylanai: Hierarchical memory in .codex-logs/memory/
+# - tabbata/super_bonochin: Constraint-wedge prompting (hard numeric constraints)
+# - STEP E fix: merge from RepoRoot, not worktree
 #
 # IMPORTANT (Windows PowerShell 5.1):
 # - git/cargo/npm often print progress to stderr even on success.
@@ -43,6 +47,11 @@ param(
 
   # Self-healing retry (#6)
   [int]$MaxRetries = 3,
+
+  # Constraint wedges (tabbata/super_bonochin)
+  [int]$MaxDiffLines = 400,
+  [int]$MaxFilesChanged = 12,
+  [int]$MaxPromptTokenEstimate = 16000,
 
   # Discord webhook (#4) - empty string disables notifications
   [string]$DiscordWebhookUrl = "https://discord.com/api/webhooks/1475856515066892288/rj96GVnnXvyULPXj20pppIn7QXtAUkAbNIAa1KhwUHoSbbJYX3kTuRMnprT63_Qky32u"
@@ -156,7 +165,7 @@ function Truncate([string]$Text, [int]$MaxChars) {
 function Send-Notification {
   param(
     [Parameter(Mandatory=$true)][string]$Message,
-    [string]$Color = "3447003",  # blue=3447003, green=3066993, red=15158332, yellow=16776960
+    [string]$Color = "3447003",
     [string]$Title = ""
   )
 
@@ -233,6 +242,115 @@ Pick the most relevant template(s) for the current PR task.
 }
 
 # -------------------------
+# Mnemis/koylanai: Hierarchical memory loader
+# -------------------------
+function Get-MemoryContext {
+  param([string]$LogDir)
+
+  $memDir = Join-Path $LogDir "memory"
+  if (-not (Test-Path $memDir)) { New-Item -ItemType Directory -Force -Path $memDir | Out-Null }
+
+  $memoryBlock = @()
+
+  # Category: lessons (from tasks/lessons.md + memory/lessons/)
+  $lessonsDir = Join-Path $memDir "lessons"
+  if (-not (Test-Path $lessonsDir)) { New-Item -ItemType Directory -Force -Path $lessonsDir | Out-Null }
+
+  # Load tasks/lessons.md if exists
+  $globalLessons = Join-Path $RepoRoot "tasks\lessons.md"
+  if (Test-Path $globalLessons) {
+    $content = Get-Content $globalLessons -Raw -Encoding utf8
+    $content = Truncate $content 3000
+    $memoryBlock += "## Memory: Global Lessons (tasks/lessons.md)"
+    $memoryBlock += $content
+    $memoryBlock += ""
+  }
+
+  # Load latest cycle-specific lessons
+  $cycleLessons = Get-ChildItem -Path $lessonsDir -Filter "*.md" -File -ErrorAction SilentlyContinue |
+                  Sort-Object LastWriteTime -Descending | Select-Object -First 5
+  foreach ($f in $cycleLessons) {
+    $content = Get-Content $f.FullName -Raw -Encoding utf8
+    $content = Truncate $content 1000
+    $memoryBlock += "### Memory: $($f.Name)"
+    $memoryBlock += $content
+    $memoryBlock += ""
+  }
+
+  # Category: patterns (recurring issues)
+  $patternsFile = Join-Path $memDir "patterns.md"
+  if (Test-Path $patternsFile) {
+    $content = Get-Content $patternsFile -Raw -Encoding utf8
+    $content = Truncate $content 2000
+    $memoryBlock += "## Memory: Recurring Patterns"
+    $memoryBlock += $content
+    $memoryBlock += ""
+  }
+
+  # Category: architecture decisions
+  $adrsDir = Join-Path $memDir "decisions"
+  if (Test-Path $adrsDir) {
+    $adrs = Get-ChildItem -Path $adrsDir -Filter "*.md" -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 3
+    foreach ($f in $adrs) {
+      $content = Get-Content $f.FullName -Raw -Encoding utf8
+      $content = Truncate $content 1000
+      $memoryBlock += "### Memory: Decision - $($f.Name)"
+      $memoryBlock += $content
+      $memoryBlock += ""
+    }
+  }
+
+  if ($memoryBlock.Count -eq 0) { return "" }
+
+  return "`n## Hierarchical Memory Context`n" + ($memoryBlock -join "`n")
+}
+
+# -------------------------
+# Memory writer: save cycle learnings
+# -------------------------
+function Save-CycleLearnings {
+  param(
+    [string]$LogDir,
+    [string]$CycleId,
+    [string]$Learnings
+  )
+
+  $lessonsDir = Join-Path $LogDir "memory\lessons"
+  if (-not (Test-Path $lessonsDir)) { New-Item -ItemType Directory -Force -Path $lessonsDir | Out-Null }
+
+  $file = Join-Path $lessonsDir "cycle-$CycleId.md"
+  Write-Utf8File $file $Learnings
+}
+
+# -------------------------
+# Constraint wedge block (tabbata/super_bonochin)
+# -------------------------
+function Get-ConstraintWedges {
+  return @"
+
+## HARD CONSTRAINTS (non-negotiable numeric bounds)
+These are simultaneous constraint wedges. ALL must be satisfied.
+Violating ANY constraint = immediate STOP and report why.
+
+| Constraint | Value | Enforcement |
+|---|---|---|
+| Max diff lines (insertions+deletions) | $MaxDiffLines | If git diff --stat shows more, split the PR |
+| Max files changed | $MaxFilesChanged | If more files touched, split the PR |
+| Max branch name length | 50 chars | Truncate slug if needed |
+| Tests must pass | 100% of existing tests | New test failures = fix or revert |
+| No new dependencies without justification | 0 unjustified | Document in PR body why needed |
+| No type:any / type:unknown (TypeScript) | 0 instances | Use proper types |
+| No console.log left in production code | 0 instances | Remove before commit |
+| Commit message format | conventional commits | feat: / fix: / test: / ci: / docs: |
+| PR scope | exactly 1 theme | No unrelated changes bundled |
+
+These constraints exist to force the solution into a narrow, high-quality region of the solution space.
+Do not treat them as suggestions. They are hard walls.
+"@
+}
+
+# -------------------------
 # Codex exec wrapper (stdin pipe method)
 # -------------------------
 function Invoke-Codex {
@@ -287,7 +405,6 @@ try {
   [Console]::OutputEncoding = $utf8NoBom
   $OutputEncoding = $utf8NoBom
 } catch {}
-
 # -------------------------
 # Resolve project dir safely
 # -------------------------
@@ -312,11 +429,18 @@ $PlanPath   = Join-Path $RepoRoot $PlanFile
 if (-not (Test-Path $AgentsPath)) { throw "Missing AGENTS.md at repo root: $AgentsPath" }
 if (-not (Test-Path $PlanPath))   { throw "Missing plan file: $PlanPath" }
 
-# Logs + worktree root (kept under repo root but ignored via .git/info/exclude)
+# Logs + worktree root
 $LogDir = Join-Path $RepoRoot ".codex-logs"
 $WtRoot = Join-Path $RepoRoot ".wt"
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Force -Path $LogDir | Out-Null }
 if (-not (Test-Path $WtRoot)) { New-Item -ItemType Directory -Force -Path $WtRoot | Out-Null }
+
+# Memory hierarchy directories (Mnemis)
+$MemDir = Join-Path $LogDir "memory"
+foreach ($sub in @("lessons", "decisions", "patterns")) {
+  $p = Join-Path $MemDir $sub
+  if (-not (Test-Path $p)) { New-Item -ItemType Directory -Force -Path $p | Out-Null }
+}
 
 Ensure-InfoExclude $RepoRoot @(
   ".codex-logs/",
@@ -356,17 +480,18 @@ $Timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 
 Write-Host ""
 Write-Host "========================================" -ForegroundColor Cyan
-Write-Host " auto-dev (worktree) loop started" -ForegroundColor Cyan
+Write-Host " auto-dev v2 (worktree) loop started" -ForegroundColor Cyan
 Write-Host " RepoRoot : $RepoRoot" -ForegroundColor Cyan
 Write-Host " Max PRs  : $MaxPRs" -ForegroundColor Cyan
 Write-Host " Sleep    : $SleepMinutes minutes" -ForegroundColor Cyan
 Write-Host " AutoPush : $AutoPush  AutoPR : $AutoCreatePR  Draft : $DraftPR" -ForegroundColor Cyan
-Write-Host " Retries  : $MaxRetries" -ForegroundColor Cyan
+Write-Host " Retries  : $MaxRetries | MaxDiff: $MaxDiffLines | MaxFiles: $MaxFilesChanged" -ForegroundColor Cyan
 Write-Host " Discord  : $(if ($DiscordWebhookUrl) { 'enabled' } else { 'disabled' })" -ForegroundColor Cyan
+Write-Host " Memory   : $MemDir" -ForegroundColor Cyan
 Write-Host " Started  : $(Get-Date)" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 
-Send-Notification -Title "Loop Started" -Message "auto-dev loop started.`nMaxPRs: $MaxPRs | Retries: $MaxRetries | Sleep: ${SleepMinutes}min`nRepo: $RepoRoot" -Color "3447003"
+Send-Notification -Title "Loop Started" -Message "auto-dev v2 loop started.`nMaxPRs: $MaxPRs | Retries: $MaxRetries | MaxDiff: $MaxDiffLines`nRepo: $RepoRoot" -Color "3447003"
 
 # Baseline checks (once)
 $BaselineFile = Join-Path $LogDir "baseline-$Timestamp.md"
@@ -413,8 +538,9 @@ $CreatedPRs = New-Object System.Collections.Generic.List[string]
 # Loop start time for progress tracking
 $LoopStartTime = Get-Date
 
-# #2 Load spec templates once
+# Load spec templates and constraint wedges once
 $SpecTemplateBlock = Get-SpecTemplates -RepoRoot $RepoRoot
+$ConstraintBlock = Get-ConstraintWedges
 
 for ($i = 1; $i -le $MaxPRs; $i++) {
 
@@ -435,6 +561,7 @@ for ($i = 1; $i -le $MaxPRs; $i++) {
   }
 
   $CycleId = "{0}-{1:D3}" -f $Timestamp, $i
+  $ResearchFile = Join-Path $LogDir "research-$CycleId.md"
   $PlanNextFile = Join-Path $LogDir "plan-next-$CycleId.md"
   $MetaFile     = Join-Path $LogDir "meta-$CycleId.json"
   $EvidenceFile = Join-Path $LogDir "evidence-$CycleId.md"
@@ -447,6 +574,9 @@ for ($i = 1; $i -le $MaxPRs; $i++) {
     $PrevResult = Get-Content $PrevResultPath -Raw -Encoding utf8
     $PrevResult = Truncate $PrevResult 4000
   }
+
+  # Load hierarchical memory (Mnemis)
+  $MemoryBlock = Get-MemoryContext -LogDir $LogDir
 
   # Create isolated worktree
   $WtPath = Join-Path $WtRoot "wt-$CycleId"
@@ -464,40 +594,96 @@ for ($i = 1; $i -le $MaxPRs; $i++) {
     Push-Location -LiteralPath $WtPath
 
     # =====================
-    # STEP A: Plan (~0-10%)  [#2 enhanced with spec templates]
+    # STEP A0: Deep Research (Boris Cherny) (~0-5%)
     # =====================
-    Write-Progress-Step -Step "A" -Message "Planning next PR..." -Percent "~10%" -Cycle $i -MaxCycles $MaxPRs -LoopStart $LoopStartTime
+    Write-Progress-Step -Step "A0" -Message "Deep research on target area..." -Percent "~3%" -Cycle $i -MaxCycles $MaxPRs -LoopStart $LoopStartTime
 
     $PlanContent = Get-Content $PlanPath -Raw -Encoding utf8
     $PlanContent = Truncate $PlanContent 12000
 
+    $ResearchPrompt = @"
+You are a senior developer conducting deep research on a codebase.
+Repository: $WtPath
+
+Read and follow: $AgentsPath
+
+Your task: Identify the SINGLE most important next PR from the master plan,
+then deeply research the relevant parts of the codebase.
+
+Master plan (truncated):
+$PlanContent
+
+Previous cycle result (truncated):
+$PrevResult
+$MemoryBlock
+
+RESEARCH INSTRUCTIONS (Boris Cherny method):
+- Read the relevant folders and files IN DEPTH. Not just signatures — understand the full logic.
+- Use rg (ripgrep) to find all usages, callers, and dependencies.
+- Understand the intricacies: edge cases, error handling, state management.
+- Look for potential bugs, inconsistencies, and missing test coverage.
+- DO NOT skim. Surface-level reading is NOT acceptable.
+
+Save a detailed research report to:
+$ResearchFile
+
+The report MUST include:
+- Which PR task you selected and why
+- Files and modules examined (with line counts)
+- How the current code works (data flow, state, dependencies)
+- Existing test coverage for the target area
+- Potential risks, bugs, or gotchas discovered
+- Pre-existing issues that must NOT be fixed in this PR (out of scope)
+
+DO NOT write any plan yet. DO NOT implement anything. Research ONLY.
+"@
+
+    $StepA0Log = Join-Path $LogDir "step-a0-$CycleId.log"
+    Invoke-Codex -Prompt $ResearchPrompt -LogFile $StepA0Log -PromptLabel "prompt-a0"
+
+    if (-not (Test-Path $ResearchFile)) {
+      Write-Utf8File $ResearchFile "(Research file not generated. See $StepA0Log)"
+    }
+
+    Send-Notification -Title "STEP A0 Research Complete" -Message "Research saved: research-$CycleId.md" -Color "3066993"
+
+    # =====================
+    # STEP A: Plan (~5-12%)  [#2 spec templates + constraint wedges]
+    # =====================
+    Write-Progress-Step -Step "A" -Message "Planning next PR based on research..." -Percent "~8%" -Cycle $i -MaxCycles $MaxPRs -LoopStart $LoopStartTime
+
+    $ResearchContent = Get-Content $ResearchFile -Raw -Encoding utf8
+    $ResearchContent = Truncate $ResearchContent 8000
+
     $PlanPrompt = @"
-You are a senior developer working on the repository at: $WtPath
+You are a senior developer writing an implementation plan.
+Repository: $WtPath
 
 Hard rules:
 - Read and follow: $AgentsPath
 - Read and follow: $PlanPath
-- Do NOT guess. Use rg and existing code/tests as evidence.
-- Keep changes small and reviewable (aim <= 400 lines).
-- One PR = one theme.
+- Base your plan on the research findings below. Do NOT ignore them.
+- Do NOT guess. The research already examined the code deeply.
+$ConstraintBlock
 $SpecTemplateBlock
+$MemoryBlock
 
-Context:
-- Previous cycle result (truncated):
-$PrevResult
+Research findings:
+$ResearchContent
 
 Task:
-Decide the single most important next PR to implement.
+Write a detailed implementation plan based on the research.
 Output TWO files:
 
 (1) A concrete instruction Markdown saved to:
 $PlanNextFile
 
-Structure the instruction using the spec-driven templates above where applicable:
-- Include a requirements summary (spec-requirements style)
-- Include affected files and design rationale (spec-design style)
-- Include implementation steps as a checklist (spec-planning style)
-- Include test and verification plan (spec-review style)
+Structure the instruction using spec-driven templates where applicable:
+- Requirements summary (what and why)
+- Design rationale (how, based on research findings)
+- Implementation checklist (step-by-step tasks with IDs: T-1, T-2, ...)
+- Test and verification plan
+- Stop conditions
 
 (2) A machine-readable meta JSON saved to:
 $MetaFile
@@ -510,14 +696,6 @@ The JSON must include:
   "tests_to_run": ["npm run lint", "cd src-tauri && cargo test", "cd src-tauri && cargo fmt --check"],
   "notes": "constraints / risks / why this PR now"
 }
-
-The instruction Markdown must include:
-- Branch name
-- PR title
-- Detailed implementation steps
-- Exact files to edit (candidate list)
-- How to test
-- Stop conditions (when to stop and report)
 
 IMPORTANT:
 - Save the files EXACTLY at the given absolute paths.
@@ -538,12 +716,64 @@ IMPORTANT:
       throw "Meta JSON missing required keys. File: $MetaFile"
     }
 
-    Send-Notification -Title "STEP A Complete" -Message "Plan: **$($meta.pr_title)**`nBranch: ``$($meta.branch_name)``" -Color "3066993"
+    Send-Notification -Title "STEP A Plan Complete" -Message "Plan: **$($meta.pr_title)**`nBranch: ``$($meta.branch_name)``" -Color "3066993"
 
     # =====================
-    # STEP B: Implement (~10-55%)  [#6 self-healing retry loop]
+    # STEP A1: Self-Annotation (Boris Cherny annotation cycle) (~12-18%)
     # =====================
-    Write-Progress-Step -Step "B" -Message "Implementing on branch $($meta.branch_name)..." -Percent "~15%" -Cycle $i -MaxCycles $MaxPRs -LoopStart $LoopStartTime
+    Write-Progress-Step -Step "A1" -Message "Self-annotating plan (independent review)..." -Percent "~15%" -Cycle $i -MaxCycles $MaxPRs -LoopStart $LoopStartTime
+
+    $PlanDraft = Get-Content $PlanNextFile -Raw -Encoding utf8
+    $PlanDraft = Truncate $PlanDraft 10000
+
+    $AnnotatePrompt = @"
+You are an independent senior architect reviewing a plan written by another developer.
+You have NO context from the planning session. You must evaluate the plan critically.
+
+Repository: $WtPath
+AGENTS rules: $AgentsPath
+Master plan: $PlanPath
+Research: $ResearchFile
+$ConstraintBlock
+
+## Plan to review:
+$PlanDraft
+
+## Your review tasks:
+1. Check if the plan addresses all findings from the research
+2. Check if implementation steps are concrete enough (not vague)
+3. Check if the plan respects ALL hard constraints (diff lines, file count, scope)
+4. Check for missing edge cases, error handling, or test scenarios
+5. Check if the plan accidentally includes out-of-scope changes
+6. Check for over-engineering — prefer minimal-diff solutions
+
+## Your output:
+- Add inline annotations directly into the plan document where corrections are needed
+- Format annotations as: **[ANNOTATION]:** your correction here
+- After annotating, rewrite the ENTIRE plan with corrections applied
+- Save the corrected plan to the SAME path: $PlanNextFile
+- Update $MetaFile if the annotation changed branch name, title, or scope
+
+If the plan is already excellent, still save it (unchanged) to confirm review passed.
+
+DO NOT implement anything. Annotation and plan revision ONLY.
+"@
+
+    $StepA1Log = Join-Path $LogDir "step-a1-$CycleId.log"
+    Invoke-Codex -Prompt $AnnotatePrompt -LogFile $StepA1Log -PromptLabel "prompt-a1"
+
+    # Re-read meta in case annotation changed it
+    if (Test-Path $MetaFile) {
+      $metaRaw = Get-Content $MetaFile -Raw -Encoding utf8
+      try { $meta = $metaRaw | ConvertFrom-Json } catch {}
+    }
+
+    Send-Notification -Title "STEP A1 Annotation Complete" -Message "Plan reviewed and revised for: **$($meta.pr_title)**" -Color "3066993"
+
+    # =====================
+    # STEP B: Implement (~18-50%)  [#6 self-healing retry loop]
+    # =====================
+    Write-Progress-Step -Step "B" -Message "Implementing on branch $($meta.branch_name)..." -Percent "~20%" -Cycle $i -MaxCycles $MaxPRs -LoopStart $LoopStartTime
 
     $PlanNext = Get-Content $PlanNextFile -Raw -Encoding utf8
     $PlanNext = Truncate $PlanNext 14000
@@ -553,6 +783,7 @@ Repository workdir: $WtPath
 
 Follow AGENTS: $AgentsPath
 Follow master plan: $PlanPath
+$ConstraintBlock
 
 Implement the PR described below.
 
@@ -563,7 +794,8 @@ Rules:
 - Commit with message: $($meta.commit_message)
 - DO NOT push.
 - DO NOT create GitHub PR.
-- Keep changes small (<= 400 lines if possible). If larger, stop and explain.
+- Keep changes within constraint bounds (max $MaxDiffLines diff lines, max $MaxFilesChanged files).
+- If constraints would be violated, STOP and explain in the result what must be split.
 
 Instruction:
 $PlanNext
@@ -582,7 +814,7 @@ At the end, print:
     $testsPass = $false
 
     while ($retryCount -lt $MaxRetries) {
-      Write-Progress-Step -Step "B-test" -Message "Running tests (attempt $($retryCount + 1)/$MaxRetries)..." -Percent "~$([int](20 + $retryCount * 10))%" -Cycle $i -MaxCycles $MaxPRs -LoopStart $LoopStartTime
+      Write-Progress-Step -Step "B-test" -Message "Running tests (attempt $($retryCount + 1)/$MaxRetries)..." -Percent "~$([int](30 + $retryCount * 7))%" -Cycle $i -MaxCycles $MaxPRs -LoopStart $LoopStartTime
 
       $testErrors = @()
 
@@ -595,13 +827,11 @@ At the end, print:
       if (Test-Path $tauriDirWt) {
         $fmtR = Invoke-Cmd -CmdLine "cargo fmt --check" -WorkingDirectory $tauriDirWt
         if ($fmtR.ExitCode -ne 0) {
-          # Try auto-fix with cargo fmt
           $fixR = Invoke-Cmd -CmdLine "cargo fmt" -WorkingDirectory $tauriDirWt
           $fmtR2 = Invoke-Cmd -CmdLine "cargo fmt --check" -WorkingDirectory $tauriDirWt
           if ($fmtR2.ExitCode -ne 0) {
             $testErrors += "cargo fmt --check failed (even after auto-fix):`n$($fmtR2.Output)"
           } else {
-            # Auto-fixed: amend commit
             $amendR = Invoke-Cmd "git add -A && git commit --amend --no-edit"
             Write-Host "[B-test] cargo fmt auto-fixed and commit amended." -ForegroundColor DarkGreen
           }
@@ -620,12 +850,11 @@ At the end, print:
       $retryCount++
 
       if ($retryCount -ge $MaxRetries) {
-        Write-Host "[B-test][warn] Tests still failing after $MaxRetries attempts. Proceeding with review." -ForegroundColor Yellow
-        Send-Notification -Title "STEP B: Tests Failed" -Message "Tests failed after $MaxRetries retries.`nErrors:`n$($testErrors -join "`n---`n")" -Color "15158332"
+        Write-Host "[B-test][warn] Tests still failing after $MaxRetries attempts. Proceeding." -ForegroundColor Yellow
+        Send-Notification -Title "STEP B: Tests Failed" -Message "Tests failed after $MaxRetries retries.`n$($testErrors[0])" -Color "15158332"
         break
       }
 
-      # Ask Codex to fix the failures
       Write-Host "[B-test] Tests failed (attempt $retryCount). Asking Codex to fix..." -ForegroundColor Yellow
 
       $fixPrompt = @"
@@ -650,10 +879,10 @@ Fix the failures now.
       Invoke-Codex -Prompt $fixPrompt -LogFile $StepBFixLog -PromptLabel "prompt-b-fix-r$retryCount"
     }
 
-    Send-Notification -Title "STEP B Complete" -Message "Implementation done.`nTests: $(if ($testsPass) { 'PASSED' } else { 'FAILED (proceeding)' })`nRetries used: $retryCount/$MaxRetries" -Color $(if ($testsPass) { "3066993" } else { "16776960" })
+    Send-Notification -Title "STEP B Complete" -Message "Tests: $(if ($testsPass) { 'PASSED' } else { 'FAILED' }) | Retries: $retryCount/$MaxRetries" -Color $(if ($testsPass) { "3066993" } else { "16776960" })
 
     # =====================
-    # STEP B2: Independent Code Review (~55-65%)  [#1]
+    # STEP B2: Independent Code Review (~50-60%)  [#1]
     # =====================
     Write-Progress-Step -Step "B2" -Message "Independent code review..." -Percent "~55%" -Cycle $i -MaxCycles $MaxPRs -LoopStart $LoopStartTime
 
@@ -669,6 +898,8 @@ You are reviewing a PR for the jarvis-desktop project.
 
 AGENTS rules: $AgentsPath
 Master plan: $PlanPath
+Research: $ResearchFile
+$ConstraintBlock
 
 PR title: $($meta.pr_title)
 Branch: $($meta.branch_name)
@@ -686,6 +917,7 @@ $diffText
 4. Tests: Are new behaviors tested? Are edge cases covered?
 5. Diff hygiene: Any unrelated changes? Formatting-only hunks that should be separate?
 6. AGENTS compliance: Does it follow the rules in AGENTS.md?
+7. Constraint compliance: Is diff <= $MaxDiffLines lines? Files <= $MaxFilesChanged?
 
 ## Your task:
 - If you find issues that are FIXABLE (not pre-existing), fix them directly in the code.
@@ -694,6 +926,11 @@ $diffText
 - Save a review summary to: $LogDir\review-$CycleId.md
 - The review summary must list: issues found, fixes applied, remaining concerns.
 - Do NOT push. Do NOT create PR.
+
+## Memory extraction:
+Also save a brief lessons-learned note (2-5 bullets) to:
+$LogDir\memory\lessons\cycle-$CycleId.md
+Format: | what happened | root cause | prevention rule |
 "@
 
     $StepB2Log = Join-Path $LogDir "step-b2-$CycleId.log"
@@ -709,14 +946,14 @@ $diffText
     }
 
     if (-not $postReviewTestOk) {
-      Write-Host "[B2][warn] Post-review tests failed. Review may have introduced issues." -ForegroundColor Yellow
-      Send-Notification -Title "STEP B2: Post-Review Test Failed" -Message "Tests failed after code review fixes. Manual check may be needed." -Color "15158332"
+      Write-Host "[B2][warn] Post-review tests failed." -ForegroundColor Yellow
+      Send-Notification -Title "STEP B2: Post-Review Test Failed" -Message "Tests failed after code review fixes." -Color "15158332"
     } else {
       Write-Host "[B2] Post-review tests passed." -ForegroundColor Green
     }
 
     $reviewFile = Join-Path $LogDir "review-$CycleId.md"
-    $reviewSummary = "(no review file generated)"
+    $reviewSummary = "(no review file)"
     if (Test-Path $reviewFile) {
       $reviewSummary = Get-Content $reviewFile -Raw -Encoding utf8
       $reviewSummary = Truncate $reviewSummary 500
@@ -724,9 +961,9 @@ $diffText
     Send-Notification -Title "STEP B2 Review Complete" -Message "Post-review tests: $(if ($postReviewTestOk) { 'PASSED' } else { 'FAILED' })`n$reviewSummary" -Color $(if ($postReviewTestOk) { "3066993" } else { "16776960" })
 
     # =====================
-    # Evidence collection (script-side; deterministic) (~65-70%)
+    # Evidence collection (~60-65%)
     # =====================
-    Write-Progress-Step -Step "B+" -Message "Collecting evidence..." -Percent "~70%" -Cycle $i -MaxCycles $MaxPRs -LoopStart $LoopStartTime
+    Write-Progress-Step -Step "B+" -Message "Collecting evidence..." -Percent "~65%" -Cycle $i -MaxCycles $MaxPRs -LoopStart $LoopStartTime
 
     $e = @()
     $e += "# Evidence $CycleId"
@@ -772,14 +1009,15 @@ $diffText
     Write-Utf8File $EvidenceFile ($e -join "`n")
 
     # =====================
-    # STEP C: Summarize (~75-80%)
+    # STEP C: Summarize (~70-75%)
     # =====================
-    Write-Progress-Step -Step "C" -Message "Summarizing..." -Percent "~80%" -Cycle $i -MaxCycles $MaxPRs -LoopStart $LoopStartTime
+    Write-Progress-Step -Step "C" -Message "Summarizing..." -Percent "~75%" -Cycle $i -MaxCycles $MaxPRs -LoopStart $LoopStartTime
 
     $SummaryPrompt = @"
 You are a senior engineer writing a cycle summary.
 
 Read:
+- Research: $ResearchFile
 - Instruction: $PlanNextFile
 - Meta: $MetaFile
 - Evidence: $EvidenceFile
@@ -797,6 +1035,7 @@ Must include:
 - Test results (lint/fmt/test) and whether failures are pre-existing
 - Code review findings and fixes applied
 - Self-healing retries used ($retryCount/$MaxRetries)
+- Constraint compliance (diff lines, files changed vs limits)
 - Remaining TODOs / blockers
 - Whether it's safe to open a PR now
 
@@ -811,11 +1050,11 @@ Output only the file; no extra chatter.
     }
 
     # =====================
-    # STEP D: Auto push + PR (~85-90%)
+    # STEP D: Auto push + PR (~80-85%)
     # =====================
     $prUrl = ""
     if ($AutoPush -or $AutoCreatePR) {
-      Write-Progress-Step -Step "D" -Message "Pushing branch / creating PR..." -Percent "~90%" -Cycle $i -MaxCycles $MaxPRs -LoopStart $LoopStartTime
+      Write-Progress-Step -Step "D" -Message "Pushing branch / creating PR..." -Percent "~85%" -Cycle $i -MaxCycles $MaxPRs -LoopStart $LoopStartTime
 
       $cur = (Run-CmdChecked "git-branch-current" "git branch --show-current").Trim()
       if ($cur -ne $meta.branch_name) {
@@ -830,7 +1069,6 @@ Output only the file; no extra chatter.
         $draftFlag = ""
         if ($DraftPR) { $draftFlag = "--draft" }
 
-        # Check if PR already exists
         $existing = ""
         $viewR = Invoke-Cmd ("gh pr view {0} --json url -q .url" -f $meta.branch_name)
         if ($viewR.ExitCode -eq 0) { $existing = $viewR.Output.Trim() }
@@ -847,9 +1085,11 @@ How to test:
 - cd src-tauri && cargo test
 
 Notes:
-- See .codex-logs/evidence-$CycleId.md and result-$CycleId.md
-- Code review: .codex-logs/review-$CycleId.md
+- Research: .codex-logs/research-$CycleId.md
+- Evidence: .codex-logs/evidence-$CycleId.md
+- Review: .codex-logs/review-$CycleId.md
 - Self-healing retries: $retryCount/$MaxRetries
+- Constraints: max $MaxDiffLines diff lines, max $MaxFilesChanged files
 "@
           $tmpBody = Join-Path $LogDir "pr-body-$CycleId.txt"
           Write-Utf8File $tmpBody $body
@@ -877,17 +1117,20 @@ Notes:
 
     Send-Notification -Title "STEP D Complete" -Message "PR: $prUrl`nBranch: ``$($meta.branch_name)``" -Color "3066993"
 
+    # Return to RepoRoot BEFORE STEP E (worktree -> main repo)
+    Pop-Location
+    Set-Location -LiteralPath $RepoRoot
+
     # =====================
-    # STEP E: Auto-merge (~95%)
+    # STEP E: Auto-merge (~90-95%) — FIXED: runs from RepoRoot
     # =====================
     if ($prUrl -and $AutoCreatePR -and $ghOk) {
-      Write-Progress-Step -Step "E" -Message "Auto-merging PR into main..." -Percent "~95%" -Cycle $i -MaxCycles $MaxPRs -LoopStart $LoopStartTime
+      Write-Progress-Step -Step "E" -Message "Auto-merging PR into main..." -Percent "~93%" -Cycle $i -MaxCycles $MaxPRs -LoopStart $LoopStartTime
 
       $prNumMatch = [regex]::Match($prUrl, '/pull/(\d+)')
       if ($prNumMatch.Success) {
         $prNum = $prNumMatch.Groups[1].Value
 
-        # If draft, mark as ready first
         if ($DraftPR) {
           Write-Host "[E] Marking PR #$prNum as ready..." -ForegroundColor DarkGreen
           $readyR = Invoke-Cmd "gh pr ready $prNum"
@@ -897,7 +1140,6 @@ Notes:
           Start-Sleep -Seconds 3
         }
 
-        # Squash merge and delete remote branch
         Write-Host "[E] Squash-merging PR #$prNum..." -ForegroundColor DarkGreen
         $mergeR = Invoke-Cmd "gh pr merge $prNum --squash --delete-branch"
         if ($mergeR.ExitCode -eq 0) {
@@ -927,7 +1169,9 @@ Notes:
 
   }
   finally {
-    Pop-Location
+    # Ensure we're back at RepoRoot (may already be there after STEP E)
+    try { Pop-Location } catch {}
+    Set-Location -LiteralPath $RepoRoot
 
     if (-not $KeepWorktrees) {
       try {
@@ -956,7 +1200,7 @@ Write-Host "========================================" -ForegroundColor Cyan
 Send-Notification -Title "Loop COMPLETE" -Message "All $MaxPRs cycles finished.`nTotal: $totalElapsed`nPRs: $($CreatedPRs.Count)`nURLs:`n$($CreatedPRs -join "`n")" -Color "3066993"
 
 # -------------------------
-# POST-LOOP: Night report + next plan
+# POST-LOOP: Night report + next plan + memory consolidation
 # -------------------------
 Write-Host ""
 Write-Host "========================================" -ForegroundColor Magenta
@@ -965,6 +1209,7 @@ Write-Host "========================================" -ForegroundColor Magenta
 
 $ReportFile    = Join-Path $LogDir "night-report-$Timestamp.md"
 $NextPlanFile  = Join-Path $LogDir "next-session-plan-$Timestamp.md"
+$PatternsFile  = Join-Path $LogDir "memory\patterns.md"
 $PRListFile    = Join-Path $LogDir "pr-urls-$Timestamp.txt"
 
 if ($CreatedPRs.Count -gt 0) {
@@ -1000,13 +1245,15 @@ Read:
 - All cycle results: $LogDir\result-*.md
 - All cycle evidence: $LogDir\evidence-*.md
 - All code reviews: $LogDir\review-*.md
+- All research reports: $LogDir\research-*.md
+- All cycle lessons: $LogDir\memory\lessons\*.md
 - Tasks: $RepoRoot\tasks\todo.md (if exists), $RepoRoot\tasks\lessons.md (if exists)
 - Repo evidence: $MgmtEvidencePath
 - PR URLs file: $PRListFile
 - AGENTS: $AgentsPath
 - Plan: $PlanPath
 
-Produce TWO files:
+Produce THREE files:
 
 (1) Night report saved to:
 $ReportFile
@@ -1016,6 +1263,7 @@ Must include:
 - Failures / incomplete work
 - Code review findings summary
 - Self-healing retry statistics
+- Constraint compliance summary (diff lines, files changed)
 - Patterns / lessons
 - Top risks / technical debt
 - Recommended next 5-10 PRs
@@ -1028,6 +1276,17 @@ Must include:
 - Concrete reconciliation steps (PR lifecycle gap closure)
 - Verification debt closure steps
 - Acceptance criteria and logging requirements
+
+(3) Recurring patterns update saved to:
+$PatternsFile
+
+Consolidate ALL cycle lessons into a categorized pattern list:
+- Category: Build/Test patterns
+- Category: Code quality patterns
+- Category: Scope management patterns
+- Category: Tool/environment patterns
+Format each pattern as: | pattern | frequency | prevention rule |
+This file is the long-term memory that future cycles will read.
 "@
 
 $StepReportLog = Join-Path $LogDir "step-report-$Timestamp.log"
@@ -1048,6 +1307,7 @@ Write-Host ""
 Write-Host "========================================" -ForegroundColor Magenta
 Write-Host " Report and next plan COMPLETE" -ForegroundColor Magenta
 Write-Host " Logs: $LogDir" -ForegroundColor Magenta
+Write-Host " Memory: $MemDir" -ForegroundColor Magenta
 Write-Host "========================================" -ForegroundColor Magenta
 
-Send-Notification -Title "Night Report Generated" -Message "Report: night-report-$Timestamp.md`nNext plan: next-session-plan-$Timestamp.md`nLogs: $LogDir" -Color "3447003"
+Send-Notification -Title "Night Report Generated" -Message "Report: night-report-$Timestamp.md`nNext plan: next-session-plan-$Timestamp.md`nPatterns: memory/patterns.md`nLogs: $LogDir" -Color "3447003"
