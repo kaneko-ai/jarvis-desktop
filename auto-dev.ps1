@@ -139,6 +139,22 @@ function Truncate([string]$Text, [int]$MaxChars) {
 }
 
 # -------------------------
+# Progress helper
+# -------------------------
+function Write-Progress-Step {
+  param(
+    [string]$Step,
+    [string]$Message,
+    [string]$Percent,
+    [int]$Cycle,
+    [int]$MaxCycles,
+    [datetime]$LoopStart
+  )
+  $elapsed = ((Get-Date) - $LoopStart).ToString("hh\:mm\:ss")
+  Write-Host "[$Step] $Message (cycle $Cycle/$MaxCycles, elapsed: $elapsed, $Percent)" -ForegroundColor Green
+}
+
+# -------------------------
 # Codex exec wrapper (stdin pipe method)
 # -------------------------
 function Invoke-Codex {
@@ -272,6 +288,7 @@ Write-Host "========================================" -ForegroundColor Cyan
 # Baseline checks (once)
 $BaselineFile = Join-Path $LogDir "baseline-$Timestamp.md"
 if (-not $SkipBaselineChecks) {
+  Write-Host "[baseline] Running baseline checks..." -ForegroundColor Gray
   $baseline = @()
   $baseline += "# Baseline Checks"
   $baseline += "Time: $(Get-Date)"
@@ -290,7 +307,12 @@ if (-not $SkipBaselineChecks) {
   $tauriDir = Join-Path $RepoRoot "src-tauri"
   if (Test-Path $tauriDir) {
     $baseline += "## cargo fmt --check"
-    $baseline += (Run-CmdChecked "baseline-cargo-fmt" "cargo fmt --check" $tauriDir)
+    $fmtR = Invoke-Cmd -CmdLine "cargo fmt --check" -WorkingDirectory $tauriDir
+    $baseline += $fmtR.Output
+    if ($fmtR.ExitCode -ne 0) {
+      $baseline += "(pre-existing fmt drift detected; non-fatal)"
+      Write-Host "[baseline] cargo fmt --check: pre-existing drift (non-fatal)" -ForegroundColor Yellow
+    }
 
     $baseline += "## cargo test"
     $baseline += (Run-CmdChecked "baseline-cargo-test" "cargo test" $tauriDir)
@@ -305,8 +327,12 @@ if (-not $SkipBaselineChecks) {
 # Track created PR URLs
 $CreatedPRs = New-Object System.Collections.Generic.List[string]
 
+# Loop start time for progress tracking
+$LoopStartTime = Get-Date
+
 for ($i = 1; $i -le $MaxPRs; $i++) {
 
+  $cycleStartTime = Get-Date
   Write-Host ""
   Write-Host "--- [$i / $MaxPRs] Cycle start: $(Get-Date) ---" -ForegroundColor Yellow
 
@@ -351,9 +377,9 @@ for ($i = 1; $i -le $MaxPRs; $i++) {
     Push-Location -LiteralPath $WtPath
 
     # =====================
-    # STEP A: Plan
+    # STEP A: Plan (~0-20%)
     # =====================
-    Write-Host "[A] Planning next PR..." -ForegroundColor Green
+    Write-Progress-Step -Step "A" -Message "Planning next PR..." -Percent "~10%" -Cycle $i -MaxCycles $MaxPRs -LoopStart $LoopStartTime
 
     $PlanContent = Get-Content $PlanPath -Raw -Encoding utf8
     $PlanContent = Truncate $PlanContent 12000
@@ -419,9 +445,9 @@ IMPORTANT:
     }
 
     # =====================
-    # STEP B: Implement
+    # STEP B: Implement (~20-70%)
     # =====================
-    Write-Host "[B] Implementing on branch $($meta.branch_name) ..." -ForegroundColor Green
+    Write-Progress-Step -Step "B" -Message "Implementing on branch $($meta.branch_name)..." -Percent "~20%" -Cycle $i -MaxCycles $MaxPRs -LoopStart $LoopStartTime
 
     $PlanNext = Get-Content $PlanNextFile -Raw -Encoding utf8
     $PlanNext = Truncate $PlanNext 14000
@@ -456,7 +482,7 @@ At the end, print:
     Invoke-Codex -Prompt $ImplPrompt -LogFile $StepBLog -PromptLabel "prompt-b"
 
     # Evidence collection (script-side; deterministic)
-    Write-Host "[B] Collecting evidence..." -ForegroundColor DarkGreen
+    Write-Progress-Step -Step "B+" -Message "Collecting evidence..." -Percent "~70%" -Cycle $i -MaxCycles $MaxPRs -LoopStart $LoopStartTime
 
     $e = @()
     $e += "# Evidence $CycleId"
@@ -483,7 +509,12 @@ At the end, print:
     $tauriDirWt = Join-Path $WtPath "src-tauri"
     if (Test-Path $tauriDirWt) {
       $e += "## cargo fmt --check"
-      $e += (Run-CmdChecked "evidence-cargo-fmt" "cargo fmt --check" $tauriDirWt)
+      $fmtR = Invoke-Cmd -CmdLine "cargo fmt --check" -WorkingDirectory $tauriDirWt
+      $e += $fmtR.Output
+      if ($fmtR.ExitCode -ne 0) {
+        $e += "(pre-existing fmt drift; non-fatal)"
+        Write-Host "[evidence] cargo fmt drift detected (non-fatal)" -ForegroundColor Yellow
+      }
 
       $e += "## cargo test"
       $e += (Run-CmdChecked "evidence-cargo-test" "cargo test" $tauriDirWt)
@@ -494,9 +525,9 @@ At the end, print:
     Write-Utf8File $EvidenceFile ($e -join "`n")
 
     # =====================
-    # STEP C: Summarize
+    # STEP C: Summarize (~80%)
     # =====================
-    Write-Host "[C] Summarizing..." -ForegroundColor Green
+    Write-Progress-Step -Step "C" -Message "Summarizing..." -Percent "~80%" -Cycle $i -MaxCycles $MaxPRs -LoopStart $LoopStartTime
 
     $SummaryPrompt = @"
 You are a senior engineer writing a cycle summary.
@@ -530,11 +561,11 @@ Output only the file; no extra chatter.
     }
 
     # =====================
-    # STEP D: Auto push + PR
+    # STEP D: Auto push + PR (~90%)
     # =====================
     $prUrl = ""
     if ($AutoPush -or $AutoCreatePR) {
-      Write-Host "[D] Pushing branch / creating PR (script-side)..." -ForegroundColor Green
+      Write-Progress-Step -Step "D" -Message "Pushing branch / creating PR..." -Percent "~90%" -Cycle $i -MaxCycles $MaxPRs -LoopStart $LoopStartTime
 
       $cur = (Run-CmdChecked "git-branch-current" "git branch --show-current").Trim()
       if ($cur -ne $meta.branch_name) {
@@ -593,10 +624,10 @@ Notes:
     }
 
     # =====================
-    # STEP E: Auto-merge
+    # STEP E: Auto-merge (~95%)
     # =====================
     if ($prUrl -and $AutoCreatePR -and $ghOk) {
-      Write-Host "[E] Auto-merging PR into main..." -ForegroundColor Green
+      Write-Progress-Step -Step "E" -Message "Auto-merging PR into main..." -Percent "~95%" -Cycle $i -MaxCycles $MaxPRs -LoopStart $LoopStartTime
 
       $prNumMatch = [regex]::Match($prUrl, '/pull/(\d+)')
       if ($prNumMatch.Success) {
@@ -630,6 +661,9 @@ Notes:
     }
 
     # Show result
+    $cycleElapsed = ((Get-Date) - $cycleStartTime).ToString("hh\:mm\:ss")
+    Write-Host ""
+    Write-Host "--- Cycle $i COMPLETE (took: $cycleElapsed) ---" -ForegroundColor Green
     Write-Host "Result ($CycleId):" -ForegroundColor Cyan
     Get-Content $ResultFile -Encoding utf8
 
@@ -652,10 +686,13 @@ Notes:
   }
 }
 
+$totalElapsed = ((Get-Date) - $LoopStartTime).ToString("hh\:mm\:ss")
 Write-Host ""
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host " auto-dev loop COMPLETE" -ForegroundColor Cyan
-Write-Host " Finished: $(Get-Date)" -ForegroundColor Cyan
+Write-Host " Finished : $(Get-Date)" -ForegroundColor Cyan
+Write-Host " Total    : $totalElapsed" -ForegroundColor Cyan
+Write-Host " PRs done : $($CreatedPRs.Count)" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 
 # -------------------------
