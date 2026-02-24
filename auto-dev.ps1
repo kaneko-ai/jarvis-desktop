@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     auto-dev v3 – Codex 自動開発ループ（worktree分離・日本語Discord通知・ETA表示）
 .DESCRIPTION
@@ -234,9 +234,9 @@ Send-Discord ":rocket: **auto-dev v3 起動** | 最大 $MaxPRs PR | $(Get-Date -
 Write-Host "[baseline] Running baseline checks..." -ForegroundColor DarkGray
 $baselinePath = Join-Path $LogDir "baseline-$RunId.md"
 $baseOut = "# Baseline $RunId`n"
-try { $fmtBase = & cargo fmt --check 2>&1 | Out-String; $baseOut += "## cargo fmt`n$fmtBase`n" } catch {}
+try { $fmtBase = & cargo fmt --check --manifest-path src-tauri/Cargo.toml 2>&1 | Out-String; $baseOut += "## cargo fmt`n$fmtBase`n" } catch {}
 try { $lintBase = & npm run lint 2>&1 | Out-String; $baseOut += "## lint`n$lintBase`n" } catch {}
-try { $testBase = & cargo test 2>&1 | Out-String; $baseOut += "## test`n$testBase`n" } catch {}
+try { $testBase = & cargo test --manifest-path src-tauri/Cargo.toml 2>&1 | Out-String; $baseOut += "## test`n$testBase`n" } catch {}
 Write-FileSafe $baselinePath $baseOut
 Write-Host "[baseline] saved: $baselinePath" -ForegroundColor DarkGray
 
@@ -262,7 +262,7 @@ for ($cycle = 1; $cycle -le $MaxPRs; $cycle++) {
     $afterData  = @{ Tests = 0; TestPass = 0; LintWarn = 0; LintErr = 0; FmtDrift = "不明"; FilesChanged = 0; DiffLines = 0 }
 
     try {
-        $fmtChk = & cargo fmt --check 2>&1
+        $fmtChk = & cargo fmt --check --manifest-path src-tauri/Cargo.toml 2>&1
         $beforeData.FmtDrift = if ($LASTEXITCODE -ne 0) { "あり" } else { "なし" }
     } catch { $beforeData.FmtDrift = "不明" }
     try {
@@ -271,7 +271,7 @@ for ($cycle = 1; $cycle -le $MaxPRs; $cycle++) {
         if ($lo -match '(\d+)\s+warning') { $beforeData.LintWarn = [int]$Matches[1] }
     } catch {}
     try {
-        $to = & cargo test 2>&1 | Out-String
+        $to = & cargo test --manifest-path src-tauri/Cargo.toml 2>&1 | Out-String
         if ($to -match 'test result: \w+\.\s+(\d+)\s+passed') {
             $beforeData.TestPass = [int]$Matches[1]; $beforeData.Tests = [int]$Matches[1]
         }
@@ -320,7 +320,7 @@ Output a structured research report as research-$cycle.md covering:
 
     $researchFile = Join-Path $LogDir "research-$cycle.md"
     try {
-        codex -a full-auto --quiet -m o4-mini "$researchPrompt" 2>$null
+        codex -a full-auto -m o4-mini "$researchPrompt" 2>$null
         if (Test-Path "research-$cycle.md") {
             Move-Item "research-$cycle.md" $researchFile -Force
         } else {
@@ -368,7 +368,7 @@ Save output as plan.md
 
     $planOutFile = Join-Path $LogDir "plan-$cycle.md"
     try {
-        codex -a full-auto --quiet "$planPrompt" 2>$null
+        codex -a full-auto "$planPrompt" 2>$null
         if (Test-Path "plan.md") {
             Copy-Item "plan.md" $planOutFile -Force
             $planOut = Get-Content "plan.md" -Raw
@@ -407,7 +407,7 @@ Save annotated plan as plan-annotated.md
 "@
 
     try {
-        codex -a full-auto --quiet -m o4-mini "$annotPrompt" 2>$null
+        codex -a full-auto -m o4-mini "$annotPrompt" 2>$null
         if (Test-Path "plan-annotated.md") {
             $planOut = Get-Content "plan-annotated.md" -Raw
             Copy-Item "plan-annotated.md" (Join-Path $LogDir "plan-annotated-$cycle.md") -Force
@@ -445,7 +445,7 @@ $constraints
 "@
 
     try {
-        codex -a full-auto --quiet "$implPrompt" 2>$null
+        codex -a full-auto "$implPrompt" 2>$null
     } catch {
         Write-Host "  [B] Codex implementation error: $_" -ForegroundColor Yellow
     }
@@ -456,6 +456,7 @@ $constraints
     # ============================================================
     #  STEP B-test – テスト + 自己修復リトライ
     # ============================================================
+    $testResult = ""
     for ($retry = 1; $retry -le $MaxRetries; $retry++) {
         $stepMsg = Write-Step "B" "テスト実行中 (試行 $retry/$MaxRetries)..." $cycle $MaxPRs
 
@@ -464,9 +465,9 @@ $constraints
 
         # cargo fmt
         try {
-            & cargo fmt --check 2>&1 | Out-Null
+            & cargo fmt --check --manifest-path src-tauri/Cargo.toml 2>&1 | Out-Null
             if ($LASTEXITCODE -ne 0) {
-                & cargo fmt 2>$null
+                & cargo fmt --manifest-path src-tauri/Cargo.toml 2>$null
                 git add -A; git commit --amend --no-edit 2>$null
                 Write-Host "  [B-test] cargo fmt auto-fixed and commit amended." -ForegroundColor Yellow
             }
@@ -482,7 +483,7 @@ $constraints
 
         # cargo test
         try {
-            $testResult = & cargo test 2>&1 | Out-String
+            $testResult = & cargo test --manifest-path src-tauri/Cargo.toml 2>&1 | Out-String
             if ($LASTEXITCODE -ne 0) {
                 $testPassed = $false; $testErrors += "cargo test failed"
             }
@@ -511,7 +512,7 @@ $testResult
 $constraints
 "@
             try {
-                codex -a full-auto --quiet "$fixPrompt" 2>$null
+                codex -a full-auto "$fixPrompt" 2>$null
                 git add -A; git commit --amend --no-edit 2>$null
             } catch {}
         } else {
@@ -557,7 +558,7 @@ If no issues, save review-clean.md with "No issues found."
 "@
 
     try {
-        codex -a full-auto --quiet -m o4-mini "$reviewPrompt" 2>$null
+        codex -a full-auto -m o4-mini "$reviewPrompt" 2>$null
         if (Test-Path "review-fixes.md") {
             $reviewFixCount = (git diff --name-only 2>$null | Measure-Object).Count
             git add -A; git commit --amend --no-edit 2>$null
@@ -579,9 +580,9 @@ If no issues, save review-clean.md with "No issues found."
 
     $evidencePath = Join-Path $LogDir "evidence-$cycle.md"
     $ev = "# Evidence – Cycle $cycle`n`n"
-    try { $ev += "## cargo test`n$(& cargo test 2>&1 | Out-String)`n" } catch {}
+    try { $ev += "## cargo test`n$(& cargo test --manifest-path src-tauri/Cargo.toml 2>&1 | Out-String)`n" } catch {}
     try { $ev += "## npm run lint`n$(& npm run lint 2>&1 | Out-String)`n" } catch {}
-    try { $ev += "## cargo fmt --check`n$(& cargo fmt --check 2>&1 | Out-String)`n" } catch {}
+    try { $ev += "## cargo fmt --check`n$(& cargo fmt --check --manifest-path src-tauri/Cargo.toml 2>&1 | Out-String)`n" } catch {}
     try { $ev += "## git diff --stat`n$(git diff main --stat 2>&1 | Out-String)`n" } catch {}
     Write-FileSafe $evidencePath $ev
 
@@ -604,7 +605,7 @@ $(Get-Content $evidencePath -Raw -ErrorAction SilentlyContinue)
 
     $prBody = ""
     try {
-        codex -a full-auto --quiet -m o4-mini "$summaryPrompt" 2>$null
+        codex -a full-auto -m o4-mini "$summaryPrompt" 2>$null
         if (Test-Path "pr-summary.md") {
             $prBody = Get-Content "pr-summary.md" -Raw
             Copy-Item "pr-summary.md" (Join-Path $LogDir "summary-$cycle.md") -Force
@@ -642,7 +643,7 @@ $(Get-Content $evidencePath -Raw -ErrorAction SilentlyContinue)
 
     # ── After 計測 ──
     try {
-        $fc2 = & cargo fmt --check 2>&1
+        $fc2 = & cargo fmt --check --manifest-path src-tauri/Cargo.toml 2>&1
         $afterData.FmtDrift = if ($LASTEXITCODE -ne 0) { "あり" } else { "なし" }
     } catch { $afterData.FmtDrift = "不明" }
     try {
@@ -651,7 +652,7 @@ $(Get-Content $evidencePath -Raw -ErrorAction SilentlyContinue)
         if ($lo2 -match '(\d+)\s+warning') { $afterData.LintWarn = [int]$Matches[1] }
     } catch {}
     try {
-        $to2 = & cargo test 2>&1 | Out-String
+        $to2 = & cargo test --manifest-path src-tauri/Cargo.toml 2>&1 | Out-String
         if ($to2 -match 'test result: \w+\.\s+(\d+)\s+passed') {
             $afterData.TestPass = [int]$Matches[1]; $afterData.Tests = [int]$Matches[1]
         }
