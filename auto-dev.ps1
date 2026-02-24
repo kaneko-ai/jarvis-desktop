@@ -3,6 +3,11 @@
 # - Writes plan/meta/evidence/result into .codex-logs (UTF-8 no BOM)
 # - Script performs push + optional PR creation (gh) to avoid "local-only completion"
 # - Stops on dirty repo unless explicitly overridden
+#
+# IMPORTANT (Windows PowerShell 5.1):
+# - git/cargo/npm often print progress to stderr even on success.
+# - PowerShell 5.1 can treat that as an ErrorRecord; with $ErrorActionPreference="Stop" it kills the script.
+# - Therefore we run native tools through cmd.exe and check exit codes.
 
 [CmdletBinding()]
 param(
@@ -17,10 +22,10 @@ param(
   [switch]$AllowDirtyStart = $false,
   [switch]$SkipBaselineChecks = $false,
 
-  # PR automation
-[bool]$AutoPush = $true,
-[bool]$AutoCreatePR = $true,
-[bool]$DraftPR = $true,
+  # PR automation (bool, not switch)
+  [bool]$AutoPush = $true,
+  [bool]$AutoCreatePR = $true,
+  [bool]$DraftPR = $true,
 
   # Worktree options
   [switch]$KeepWorktrees = $false
@@ -28,6 +33,56 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+
+# -------------------------
+# Native-command safe runner (PS5.1)
+# -------------------------
+function Quote-CmdArg([string]$s) {
+  if ($null -eq $s) { return '""' }
+  return '"' + ($s -replace '"','""') + '"'
+}
+
+function Invoke-Cmd {
+  param(
+    [Parameter(Mandatory=$true)][string]$CmdLine,
+    [string]$WorkingDirectory = ""
+  )
+
+  $out = @()
+  $code = 0
+
+  if ($WorkingDirectory -and $WorkingDirectory.Trim() -ne "") {
+    Push-Location -LiteralPath $WorkingDirectory
+    try {
+      $out = cmd.exe /d /c "$CmdLine 2>&1"
+      $code = $LASTEXITCODE
+    } finally {
+      Pop-Location
+    }
+  } else {
+    $out = cmd.exe /d /c "$CmdLine 2>&1"
+    $code = $LASTEXITCODE
+  }
+
+  return [pscustomobject]@{
+    Output   = ($out -join "`n")
+    ExitCode = $code
+  }
+}
+
+function Run-CmdChecked {
+  param(
+    [Parameter(Mandatory=$true)][string]$Label,
+    [Parameter(Mandatory=$true)][string]$CmdLine,
+    [string]$WorkingDirectory = ""
+  )
+
+  $r = Invoke-Cmd -CmdLine $CmdLine -WorkingDirectory $WorkingDirectory
+  if ($r.ExitCode -ne 0) {
+    throw "[$Label] failed (exit=$($r.ExitCode)).`n$($r.Output)"
+  }
+  return $r.Output
+}
 
 # -------------------------
 # Helpers
@@ -78,14 +133,6 @@ function Truncate([string]$Text, [int]$MaxChars) {
   return $Text.Substring($Text.Length - $MaxChars)
 }
 
-function Run-Checked([string]$Label, [scriptblock]$Action) {
-  try {
-    return & $Action
-  } catch {
-    throw "[$Label] failed: $($_.Exception.Message)"
-  }
-}
-
 # -------------------------
 # Encoding (reduce mojibake)
 # -------------------------
@@ -105,11 +152,12 @@ if (-not $ProjectDir -or $ProjectDir.Trim() -eq "") {
 $ProjectDir = (Resolve-Path -LiteralPath $ProjectDir).Path
 
 Set-Location -LiteralPath $ProjectDir
-$repoTop = (git rev-parse --show-toplevel 2>$null)
-if (-not $repoTop) {
-  throw "This directory is not inside a git repository: $ProjectDir"
+
+$repoTopR = Invoke-Cmd "git rev-parse --show-toplevel"
+if ($repoTopR.ExitCode -ne 0 -or -not $repoTopR.Output.Trim()) {
+  throw "This directory is not inside a git repository: $ProjectDir`n$($repoTopR.Output)"
 }
-$RepoRoot = (Resolve-Path -LiteralPath $repoTop).Path
+$RepoRoot = (Resolve-Path -LiteralPath $repoTopR.Output.Trim()).Path
 Set-Location -LiteralPath $RepoRoot
 
 # Required files
@@ -130,25 +178,29 @@ Ensure-InfoExclude $RepoRoot @(
 )
 
 # Tools sanity
-$codexVer = (codex --version 2>$null)
-if (-not $codexVer) { throw "codex CLI not found. Install it first." }
+$codexVer = Invoke-Cmd "codex --version"
+if ($codexVer.ExitCode -ne 0) { throw "codex CLI not found. Install it first.`n$($codexVer.Output)" }
 
 # GitHub CLI optional checks
 $ghOk = $true
-try { gh --version | Out-Null } catch { $ghOk = $false }
+$ghVer = Invoke-Cmd "gh --version"
+if ($ghVer.ExitCode -ne 0) { $ghOk = $false }
+
 if ($AutoCreatePR -and -not $ghOk) {
   Write-Host "[warn] gh CLI missing; disabling AutoCreatePR." -ForegroundColor Yellow
   $AutoCreatePR = $false
 }
 if ($AutoCreatePR -and $ghOk) {
-  try { gh auth status | Out-Null } catch {
+  $ghAuth = Invoke-Cmd "gh auth status"
+  if ($ghAuth.ExitCode -ne 0) {
     Write-Host "[warn] gh auth status failed; disabling AutoCreatePR." -ForegroundColor Yellow
     $AutoCreatePR = $false
   }
 }
 
 # Repo cleanliness guard
-$dirty = (git status --porcelain)
+$dirtyR = Invoke-Cmd "git status --porcelain"
+$dirty = $dirtyR.Output.TrimEnd()
 if ($dirty -and -not $AllowDirtyStart) {
   throw "Dirty working tree detected at start. Fix or run with -AllowDirtyStart.`n$dirty"
 }
@@ -173,22 +225,23 @@ if (-not $SkipBaselineChecks) {
   $baseline += "Time: $(Get-Date)"
   $baseline += "Repo: $RepoRoot"
   $baseline += ""
+
   $baseline += "## git status --porcelain"
-  $baseline += (git status --porcelain | Out-String)
+  $baseline += (Run-CmdChecked "baseline-git-status" "git status --porcelain")
+
   $baseline += "## git log --oneline -5"
-  $baseline += (git log --oneline -5 | Out-String)
+  $baseline += (Run-CmdChecked "baseline-git-log" "git log --oneline -5")
 
   $baseline += "## npm run lint"
-  $baseline += (npm run lint 2>&1 | Out-String)
+  $baseline += (Run-CmdChecked "baseline-npm-lint" "npm run lint")
 
   $tauriDir = Join-Path $RepoRoot "src-tauri"
   if (Test-Path $tauriDir) {
-    Push-Location $tauriDir
     $baseline += "## cargo fmt --check"
-    $baseline += (cargo fmt --check 2>&1 | Out-String)
+    $baseline += (Run-CmdChecked "baseline-cargo-fmt" "cargo fmt --check" $tauriDir)
+
     $baseline += "## cargo test"
-    $baseline += (cargo test 2>&1 | Out-String)
-    Pop-Location
+    $baseline += (Run-CmdChecked "baseline-cargo-test" "cargo test" $tauriDir)
   } else {
     $baseline += "## src-tauri not found; skipping cargo checks"
   }
@@ -206,11 +259,12 @@ for ($i = 1; $i -le $MaxPRs; $i++) {
   Write-Host "--- [$i / $MaxPRs] Cycle start: $(Get-Date) ---" -ForegroundColor Yellow
 
   # Always sync main first (ff-only)
-  Run-Checked "git-switch-main" { git switch main | Out-Null }
-  Run-Checked "git-pull-ff"     { git pull --ff-only | Out-Null }
+  Run-CmdChecked "git-switch-main" "git switch main" | Out-Null
+  Run-CmdChecked "git-pull-ff" "git pull --ff-only" | Out-Null
 
   # Ensure clean before creating worktree
-  $dirtyNow = (git status --porcelain)
+  $dirtyNowR = Invoke-Cmd "git status --porcelain"
+  $dirtyNow = $dirtyNowR.Output.TrimEnd()
   if ($dirtyNow -and -not $AllowDirtyStart) {
     throw "Dirty working tree before cycle $i. Aborting.`n$dirtyNow"
   }
@@ -236,9 +290,11 @@ for ($i = 1; $i -le $MaxPRs; $i++) {
   # IMPORTANT:
   # main is already checked out in the primary worktree, so we cannot check out 'main' again.
   # Use detached HEAD worktree, then Codex will create a feature branch inside it.
-  git worktree prune | Out-Null
-  $wtOut = (git worktree add $WtPath --detach main 2>&1 | Out-String)
-  if ($LASTEXITCODE -ne 0 -or -not (Test-Path $WtPath)) {
+  Run-CmdChecked "git-worktree-prune" "git worktree prune" | Out-Null
+
+  $wtAddCmd = "git worktree add " + (Quote-CmdArg $WtPath) + " --detach main"
+  $wtOut = Run-CmdChecked "git-worktree-add" $wtAddCmd
+  if (-not (Test-Path $WtPath)) {
     throw "Failed to create worktree at $WtPath. git output:`n$wtOut"
   }
 
@@ -298,7 +354,16 @@ IMPORTANT:
 "@
 
     $StepALog = Join-Path $LogDir "step-a-$CycleId.log"
-    codex exec --full-auto $PlanPrompt 2>&1 | Tee-Object -FilePath $StepALog | Out-Null
+    $oldEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+      codex exec --full-auto $PlanPrompt 2>&1 | Tee-Object -FilePath $StepALog | Out-Null
+      if ($LASTEXITCODE -ne 0) {
+        throw "codex step A failed (exit=$LASTEXITCODE). See: $StepALog"
+      }
+    } finally {
+      $ErrorActionPreference = $oldEap
+    }
 
     if (-not (Test-Path $PlanNextFile)) { throw "Plan instruction file not generated: $PlanNextFile (see $StepALog)" }
     if (-not (Test-Path $MetaFile))     { throw "Meta JSON not generated: $MetaFile (see $StepALog)" }
@@ -344,7 +409,16 @@ At the end, print:
 "@
 
     $StepBLog = Join-Path $LogDir "step-b-$CycleId.log"
-    codex exec --full-auto $ImplPrompt 2>&1 | Tee-Object -FilePath $StepBLog | Out-Null
+    $oldEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+      codex exec --full-auto $ImplPrompt 2>&1 | Tee-Object -FilePath $StepBLog | Out-Null
+      if ($LASTEXITCODE -ne 0) {
+        throw "codex step B failed (exit=$LASTEXITCODE). See: $StepBLog"
+      }
+    } finally {
+      $ErrorActionPreference = $oldEap
+    }
 
     # Evidence collection (script-side; deterministic)
     Write-Host "[B] Collecting evidence..." -ForegroundColor DarkGreen
@@ -357,28 +431,27 @@ At the end, print:
     $e += ""
 
     $e += "## git status --porcelain"
-    $e += (git status --porcelain | Out-String)
+    $e += (Run-CmdChecked "evidence-git-status" "git status --porcelain")
 
     $e += "## git branch --show-current"
-    $e += (git branch --show-current | Out-String)
+    $e += (Run-CmdChecked "evidence-git-branch" "git branch --show-current")
 
     $e += "## git log -1 --oneline --decorate"
-    $e += (git log -1 --oneline --decorate | Out-String)
+    $e += (Run-CmdChecked "evidence-git-log" "git log -1 --oneline --decorate")
 
     $e += "## git diff --stat main...HEAD"
-    $e += (git diff --stat main...HEAD | Out-String)
+    $e += (Run-CmdChecked "evidence-git-diffstat" "git diff --stat main...HEAD")
 
     $e += "## npm run lint"
-    $e += (npm run lint 2>&1 | Out-String)
+    $e += (Run-CmdChecked "evidence-npm-lint" "npm run lint")
 
     $tauriDirWt = Join-Path $WtPath "src-tauri"
     if (Test-Path $tauriDirWt) {
-      Push-Location $tauriDirWt
       $e += "## cargo fmt --check"
-      $e += (cargo fmt --check 2>&1 | Out-String)
+      $e += (Run-CmdChecked "evidence-cargo-fmt" "cargo fmt --check" $tauriDirWt)
+
       $e += "## cargo test"
-      $e += (cargo test 2>&1 | Out-String)
-      Pop-Location
+      $e += (Run-CmdChecked "evidence-cargo-test" "cargo test" $tauriDirWt)
     } else {
       $e += "## src-tauri not found; skipping cargo checks"
     }
@@ -413,7 +486,16 @@ Output only the file; no extra chatter.
 "@
 
     $StepCLog = Join-Path $LogDir "step-c-$CycleId.log"
-    codex exec --full-auto $SummaryPrompt 2>&1 | Tee-Object -FilePath $StepCLog | Out-Null
+    $oldEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+      codex exec --full-auto $SummaryPrompt 2>&1 | Tee-Object -FilePath $StepCLog | Out-Null
+      if ($LASTEXITCODE -ne 0) {
+        throw "codex step C failed (exit=$LASTEXITCODE). See: $StepCLog"
+      }
+    } finally {
+      $ErrorActionPreference = $oldEap
+    }
 
     if (-not (Test-Path $ResultFile)) {
       Write-Utf8File $ResultFile "Result file not generated. See logs: $StepCLog"
@@ -424,28 +506,29 @@ Output only the file; no extra chatter.
     if ($AutoPush -or $AutoCreatePR) {
       Write-Host "[D] Pushing branch / creating PR (script-side)..." -ForegroundColor Green
 
-      $cur = (git branch --show-current).Trim()
+      $cur = (Run-CmdChecked "git-branch-current" "git branch --show-current").Trim()
       if ($cur -ne $meta.branch_name) {
         throw "Current branch '$cur' != expected '$($meta.branch_name)'. Aborting push/PR."
       }
 
       if ($AutoPush) {
-        git push -u origin $meta.branch_name | Out-Null
+        Run-CmdChecked "git-push" ("git push -u origin {0}" -f $meta.branch_name) | Out-Null
       }
 
       if ($AutoCreatePR -and $ghOk) {
         $draftFlag = ""
         if ($DraftPR) { $draftFlag = "--draft" }
 
+        # Check if PR already exists (do not hard-fail if not)
         $existing = ""
-        try {
-          $existing = (gh pr view $meta.branch_name --json url 2>$null | ConvertFrom-Json).url
-        } catch { $existing = "" }
+        $viewR = Invoke-Cmd ("gh pr view {0} --json url -q .url" -f $meta.branch_name)
+        if ($viewR.ExitCode -eq 0) { $existing = $viewR.Output.Trim() }
 
         if (-not $existing) {
+          $safeTitle = ($meta.pr_title -replace '"', "'")
           $body = @"
 Summary:
-- $($meta.pr_title)
+- $safeTitle
 
 How to test:
 - npm run lint
@@ -458,8 +541,16 @@ Notes:
           $tmpBody = Join-Path $LogDir "pr-body-$CycleId.txt"
           Write-Utf8File $tmpBody $body
 
-          $created = (gh pr create --base main --head $meta.branch_name --title $meta.pr_title --body-file $tmpBody $draftFlag 2>&1 | Out-String)
-          $prUrl = ($created | Select-String -Pattern "https://github\.com/.+/pull/\d+" -AllMatches).Matches.Value | Select-Object -First 1
+          $cmd = "gh pr create --base main --head {0} --title {1} --body-file {2} {3}" -f `
+            $meta.branch_name, (Quote-CmdArg $safeTitle), (Quote-CmdArg $tmpBody), $draftFlag
+
+          $created = Invoke-Cmd $cmd
+          if ($created.ExitCode -ne 0) {
+            throw "[gh-pr-create] failed (exit=$($created.ExitCode)).`n$($created.Output)"
+          }
+
+          $m = [regex]::Match($created.Output, 'https://github\.com/\S+/pull/\d+')
+          if ($m.Success) { $prUrl = $m.Value }
         } else {
           $prUrl = $existing
         }
@@ -480,7 +571,10 @@ Notes:
     Pop-Location
 
     if (-not $KeepWorktrees) {
-      try { git worktree remove $WtPath --force | Out-Null } catch {}
+      try {
+        $rmCmd = "git worktree remove " + (Quote-CmdArg $WtPath) + " --force"
+        Invoke-Cmd $rmCmd | Out-Null
+      } catch {}
       try { if (Test-Path $WtPath) { Remove-Item -Recurse -Force $WtPath } } catch {}
     }
   }
@@ -520,14 +614,18 @@ $MgmtEvidence += "# Nightly Evidence"
 $MgmtEvidence += "Time: $(Get-Date)"
 $MgmtEvidence += "Repo: $RepoRoot"
 $MgmtEvidence += ""
+
 $MgmtEvidence += "## git log --oneline -20"
-$MgmtEvidence += (git log --oneline -20 | Out-String)
+$MgmtEvidence += (Run-CmdChecked "mgmt-git-log" "git log --oneline -20")
+
 $MgmtEvidence += "## gh pr list (last 100)"
 if ($ghOk) {
-  $MgmtEvidence += (gh pr list --state all --limit 100 2>&1 | Out-String)
+  $prListR = Invoke-Cmd "gh pr list --state all --limit 100"
+  if ($prListR.ExitCode -eq 0) { $MgmtEvidence += $prListR.Output } else { $MgmtEvidence += "[gh pr list failed]`n$($prListR.Output)" }
 } else {
   $MgmtEvidence += "(gh not available)"
 }
+
 $MgmtEvidencePath = Join-Path $LogDir "mgmt-evidence-$Timestamp.md"
 Write-Utf8File $MgmtEvidencePath ($MgmtEvidence -join "`n")
 
@@ -566,7 +664,16 @@ Must include:
 "@
 
 $StepReportLog = Join-Path $LogDir "step-report-$Timestamp.log"
-codex exec --full-auto $ReportPrompt 2>&1 | Tee-Object -FilePath $StepReportLog | Out-Null
+$oldEap = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+try {
+  codex exec --full-auto $ReportPrompt 2>&1 | Tee-Object -FilePath $StepReportLog | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "codex report step failed (exit=$LASTEXITCODE). See: $StepReportLog"
+  }
+} finally {
+  $ErrorActionPreference = $oldEap
+}
 
 if (Test-Path $ReportFile) {
   Write-Host ""
