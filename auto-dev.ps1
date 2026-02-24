@@ -320,7 +320,7 @@ Output a structured research report as research-$cycle.md covering:
 
     $researchFile = Join-Path $LogDir "research-$cycle.md"
     try {
-        codex --full-auto -m o4-mini "$researchPrompt" 2>$null
+        codex --full-auto "$researchPrompt" 2>$null
         if (Test-Path "research-$cycle.md") {
             Move-Item "research-$cycle.md" $researchFile -Force
         } else {
@@ -407,7 +407,7 @@ Save annotated plan as plan-annotated.md
 "@
 
     try {
-        codex --full-auto -m o4-mini "$annotPrompt" 2>$null
+        codex --full-auto "$annotPrompt" 2>$null
         if (Test-Path "plan-annotated.md") {
             $planOut = Get-Content "plan-annotated.md" -Raw
             Copy-Item "plan-annotated.md" (Join-Path $LogDir "plan-annotated-$cycle.md") -Force
@@ -558,7 +558,7 @@ If no issues, save review-clean.md with "No issues found."
 "@
 
     try {
-        Write-FileSafe "review-prompt.txt" $reviewPrompt; codex --full-auto -m o4-mini (Get-Content "review-prompt.txt" -Raw) 2>$null
+        Write-FileSafe "review-prompt.txt" $reviewPrompt; codex --full-auto (Get-Content "review-prompt.txt" -Raw) 2>$null
         if (Test-Path "review-fixes.md") {
             $reviewFixCount = (git diff --name-only 2>$null | Measure-Object).Count
             git add -A; git commit --amend --no-edit 2>$null
@@ -605,7 +605,7 @@ $(Get-Content $evidencePath -Raw -ErrorAction SilentlyContinue)
 
     $prBody = ""
     try {
-        codex --full-auto -m o4-mini "$summaryPrompt" 2>$null
+        codex --full-auto "$summaryPrompt" 2>$null
         if (Test-Path "pr-summary.md") {
             $prBody = Get-Content "pr-summary.md" -Raw
             Copy-Item "pr-summary.md" (Join-Path $LogDir "summary-$cycle.md") -Force
@@ -778,6 +778,7 @@ Write-Host @"
  Report    : $(Join-Path $LogDir "nightly-$RunId.md")
 ========================================
 "@ -ForegroundColor Green
+
 
 
 
