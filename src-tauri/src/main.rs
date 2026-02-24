@@ -108,6 +108,15 @@ struct RunSummary {
     template_id: Option<String>,
 }
 
+#[derive(Serialize)]
+struct RunDashboardStats {
+    total_runs: u32,
+    success_runs: u32,
+    success_rate_pct: f64,
+    avg_duration_sec: Option<f64>,
+    duration_sample_count: u32,
+}
+
 #[derive(Deserialize, Default)]
 struct RunListFilter {
     query: Option<String>,
@@ -4942,6 +4951,123 @@ fn list_pipeline_runs_internal(runtime: &RuntimeConfig, limit: Option<u32>) -> R
     Ok(out)
 }
 
+fn valid_duration_seconds(value: f64) -> Option<f64> {
+    if value.is_finite() && value >= 0.0 {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+fn extract_duration_seconds_from_result_value(value: &serde_json::Value) -> Option<f64> {
+    let obj = value.as_object()?;
+    for (key, scale) in [
+        ("duration_sec", 1.0_f64),
+        ("duration_seconds", 1.0_f64),
+        ("elapsed_sec", 1.0_f64),
+        ("elapsed_seconds", 1.0_f64),
+        ("elapsed_ms", 0.001_f64),
+    ] {
+        if let Some(raw) = obj.get(key).and_then(|v| v.as_f64()) {
+            if let Some(sec) = valid_duration_seconds(raw * scale) {
+                return Some(sec);
+            }
+        }
+    }
+    None
+}
+
+fn parse_duration_seconds_from_result(path: &Path) -> Option<f64> {
+    let text = fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    extract_duration_seconds_from_result_value(&value)
+}
+
+fn collect_run_dashboard_stats_internal(runtime: &RuntimeConfig, limit: Option<u32>) -> Result<RunDashboardStats, String> {
+    let runs_dir = pipeline_runs_dir(runtime);
+    if !runs_dir.exists() {
+        return Ok(RunDashboardStats {
+            total_runs: 0,
+            success_runs: 0,
+            success_rate_pct: 0.0,
+            avg_duration_sec: None,
+            duration_sample_count: 0,
+        });
+    }
+    if !runs_dir.is_dir() {
+        return Err(format!("runs path is not a directory: {}", runs_dir.display()));
+    }
+    let runs_dir_canonical = runs_dir
+        .canonicalize()
+        .map_err(|e| format!("failed to canonicalize runs directory {}: {e}", runs_dir.display()))?;
+
+    let max_rows = usize::try_from(limit.unwrap_or(500).clamp(1, 2000)).unwrap_or(500);
+    let mut runs: Vec<(PathBuf, String, u64)> = Vec::new();
+    for entry in fs::read_dir(&runs_dir_canonical)
+        .map_err(|e| format!("failed to read runs directory {}: {e}", runs_dir_canonical.display()))?
+    {
+        let entry = match entry {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let run_id = entry.file_name().to_string_lossy().to_string();
+        if validate_pipeline_run_id_component(&run_id).is_err() {
+            continue;
+        }
+        let canonical = match path.canonicalize() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if !canonical.starts_with(&runs_dir_canonical) {
+            continue;
+        }
+        runs.push((canonical.clone(), run_id, modified_epoch_ms(&canonical)));
+    }
+
+    runs.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1)));
+    if runs.len() > max_rows {
+        runs.truncate(max_rows);
+    }
+
+    let mut success_runs: u32 = 0;
+    let mut duration_sum_sec = 0.0_f64;
+    let mut duration_sample_count: u32 = 0;
+    for (run_dir, _, _) in &runs {
+        let result_path = run_dir.join("result.json");
+        if parse_pipeline_run_status(&result_path) == "success" {
+            success_runs = success_runs.saturating_add(1);
+        }
+        if let Some(sec) = parse_duration_seconds_from_result(&result_path) {
+            duration_sum_sec += sec;
+            duration_sample_count = duration_sample_count.saturating_add(1);
+        }
+    }
+
+    let total_runs = u32::try_from(runs.len()).unwrap_or(u32::MAX);
+    let success_rate_pct = if total_runs == 0 {
+        0.0
+    } else {
+        (f64::from(success_runs) / f64::from(total_runs)) * 100.0
+    };
+    let avg_duration_sec = if duration_sample_count == 0 {
+        None
+    } else {
+        Some(duration_sum_sec / f64::from(duration_sample_count))
+    };
+
+    Ok(RunDashboardStats {
+        total_runs,
+        success_runs,
+        success_rate_pct,
+        avg_duration_sec,
+        duration_sample_count,
+    })
+}
+
 fn read_run_text_internal(runtime: &RuntimeConfig, run_id: &str, kind: &str) -> Result<String, String> {
     let rel = run_text_rel_path(kind)?;
     let run_dir = resolve_pipeline_run_dir_from_id(runtime, run_id)?;
@@ -5102,6 +5228,13 @@ fn list_pipeline_runs(limit: Option<u32>) -> Result<Vec<RunSummary>, String> {
     let root = repo_root();
     let runtime = resolve_runtime_config(&root)?;
     list_pipeline_runs_internal(&runtime, limit)
+}
+
+#[tauri::command]
+fn get_run_dashboard_stats(limit: Option<u32>) -> Result<RunDashboardStats, String> {
+    let root = repo_root();
+    let runtime = resolve_runtime_config(&root)?;
+    collect_run_dashboard_stats_internal(&runtime, limit)
 }
 
 #[tauri::command]
@@ -9116,6 +9249,7 @@ fn main() {
             list_runs,
             list_pipeline_runs,
             get_run_status,
+            get_run_dashboard_stats,
             read_run_text,
             read_run_text_tail,
             open_run_dir,
@@ -10183,6 +10317,83 @@ mod tests {
         let failed_ok = base.join("failed_ok.json");
         fs::write(&failed_ok, r#"{"ok":false}"#).expect("write failed ok");
         assert_eq!(parse_pipeline_run_status(&failed_ok), "failed");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn run_duration_extraction_supports_seconds_milliseconds_and_invalid_cases() {
+        let base = std::env::temp_dir().join(format!("jarvis_run_duration_{}", now_epoch_ms()));
+        let _ = fs::create_dir_all(&base);
+
+        let missing = base.join("missing_result.json");
+        assert_eq!(parse_duration_seconds_from_result(&missing), None);
+
+        let invalid = base.join("invalid_result.json");
+        fs::write(&invalid, "not json").expect("write invalid");
+        assert_eq!(parse_duration_seconds_from_result(&invalid), None);
+
+        let sec = base.join("sec_result.json");
+        fs::write(&sec, r#"{"duration_sec":12.5}"#).expect("write sec");
+        assert_eq!(parse_duration_seconds_from_result(&sec), Some(12.5));
+
+        let ms = base.join("ms_result.json");
+        fs::write(&ms, r#"{"elapsed_ms":1500}"#).expect("write ms");
+        assert_eq!(parse_duration_seconds_from_result(&ms), Some(1.5));
+
+        let negative = base.join("negative_result.json");
+        fs::write(&negative, r#"{"elapsed_seconds":-2}"#).expect("write negative");
+        assert_eq!(parse_duration_seconds_from_result(&negative), None);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn run_dashboard_stats_aggregate_math_is_correct() {
+        let base = std::env::temp_dir().join(format!("jarvis_run_dashboard_stats_{}", now_epoch_ms()));
+        let runtime = build_test_runtime(&base);
+        let runs_dir = runtime.pipeline_root.join("logs").join("runs");
+        let _ = fs::create_dir_all(&runs_dir);
+
+        let run_a = runs_dir.join("run_a");
+        let run_b = runs_dir.join("run_b");
+        let run_c = runs_dir.join("run_c");
+        let _ = fs::create_dir_all(&run_a);
+        let _ = fs::create_dir_all(&run_b);
+        let _ = fs::create_dir_all(&run_c);
+        fs::write(run_a.join("result.json"), r#"{"status":"succeeded","duration_sec":10}"#).expect("write run_a result");
+        fs::write(run_b.join("result.json"), r#"{"status":"failed","elapsed_ms":4000}"#).expect("write run_b result");
+        fs::write(run_c.join("result.json"), r#"{"status":"ok"}"#).expect("write run_c result");
+
+        let stats = collect_run_dashboard_stats_internal(&runtime, Some(50)).expect("collect stats");
+        assert_eq!(stats.total_runs, 3);
+        assert_eq!(stats.success_runs, 2);
+        assert!((stats.success_rate_pct - (200.0 / 3.0)).abs() < 1e-9);
+        assert_eq!(stats.duration_sample_count, 2);
+        assert_eq!(stats.avg_duration_sec, Some(7.0));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn run_dashboard_stats_handles_missing_or_invalid_result_deterministically() {
+        let base = std::env::temp_dir().join(format!("jarvis_run_dashboard_stats_det_{}", now_epoch_ms()));
+        let runtime = build_test_runtime(&base);
+        let runs_dir = runtime.pipeline_root.join("logs").join("runs");
+        let _ = fs::create_dir_all(&runs_dir);
+
+        let _ = fs::create_dir_all(runs_dir.join("run_missing"));
+        let run_invalid = runs_dir.join("run_invalid");
+        let _ = fs::create_dir_all(&run_invalid);
+        fs::write(run_invalid.join("result.json"), "not json").expect("write invalid result");
+
+        let first = collect_run_dashboard_stats_internal(&runtime, Some(50)).expect("collect first");
+        let second = collect_run_dashboard_stats_internal(&runtime, Some(50)).expect("collect second");
+        assert_eq!(serde_json::to_string(&first).expect("ser first"), serde_json::to_string(&second).expect("ser second"));
+        assert_eq!(first.total_runs, 2);
+        assert_eq!(first.success_runs, 0);
+        assert_eq!(first.duration_sample_count, 0);
+        assert_eq!(first.avg_duration_sec, None);
 
         let _ = fs::remove_dir_all(&base);
     }

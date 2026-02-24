@@ -325,6 +325,9 @@ export default function App() {
   const [pipelineRuns, setPipelineRuns] = useState([]);
   const [pipelineRunsLoading, setPipelineRunsLoading] = useState(false);
   const [pipelineRunsError, setPipelineRunsError] = useState("");
+  const [runDashboardStats, setRunDashboardStats] = useState(null);
+  const [runDashboardStatsLoading, setRunDashboardStatsLoading] = useState(false);
+  const [runDashboardStatsError, setRunDashboardStatsError] = useState("");
   const [selectedPipelineRunId, setSelectedPipelineRunId] = useState("");
   const [pipelineRunTab, setPipelineRunTab] = useState("input");
   const [pipelineRunQuery, setPipelineRunQuery] = useState("");
@@ -435,6 +438,20 @@ export default function App() {
       setSelectedPipelineRunId("");
     } finally {
       setPipelineRunsLoading(false);
+    }
+  }
+
+  async function loadRunDashboardStats() {
+    setRunDashboardStatsLoading(true);
+    setRunDashboardStatsError("");
+    try {
+      const stats = await invoke("get_run_dashboard_stats", { limit: 500 });
+      setRunDashboardStats(stats ?? null);
+    } catch (e) {
+      setRunDashboardStats(null);
+      setRunDashboardStatsError(String(e));
+    } finally {
+      setRunDashboardStatsLoading(false);
     }
   }
 
@@ -1659,6 +1676,7 @@ export default function App() {
     loadPreflight();
     loadTemplates();
     loadRuns();
+    loadRunDashboardStats();
     loadPipelineRuns();
     loadJobs();
     loadPipelines();
@@ -2279,6 +2297,12 @@ export default function App() {
     return rows;
   }, [jobs, opsNeedsAttentionOnly, opsAutoRetryPendingOnly]);
   const opsRunRows = useMemo(() => (Array.isArray(runs) ? runs : []), [runs]);
+  const runStatsSuccessRateText = Number(runDashboardStats?.success_rate_pct ?? 0).toFixed(1);
+  const runStatsAvgDuration = runDashboardStats?.avg_duration_sec;
+  const runStatsAvgDurationText =
+    typeof runStatsAvgDuration === "number" && Number.isFinite(runStatsAvgDuration)
+      ? `${runStatsAvgDuration.toFixed(1)}s`
+      : "-";
   const isLibrarySearchMode = String(librarySearchQuery ?? "").trim() !== "";
   const visibleLibraryRows = isLibrarySearchMode ? librarySearchRows : libraryRows;
   const artifactKind = artifactView?.kind ?? "";
@@ -4114,6 +4138,7 @@ export default function App() {
                 await loadPipelines();
                 await loadJobs();
                 await loadRuns();
+                await loadRunDashboardStats();
                 await loadSettings();
                 await loadPipelineRepoStatus();
                 await loadDiagnostics();
@@ -4153,6 +4178,32 @@ export default function App() {
               />
               Auto-retry enabled
             </label>
+          </div>
+
+          <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: 10, marginBottom: 12, fontSize: 12 }}>
+            <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 6, flexWrap: "wrap" }}>
+              <div style={{ fontWeight: 600, marginBottom: 0 }}>Run Stats</div>
+              {runDashboardStatsLoading ? <span style={{ opacity: 0.8, fontSize: 11 }}>Loading...</span> : null}
+            </div>
+            {runDashboardStatsError ? (
+              <div style={{ color: "#c00" }}>{runDashboardStatsError}</div>
+            ) : (
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(120px, 1fr))", gap: 8 }}>
+                <div>
+                  <div style={{ opacity: 0.8 }}>Run count</div>
+                  <div style={{ fontSize: 16, fontWeight: 600 }}>{runDashboardStats?.total_runs ?? 0}</div>
+                </div>
+                <div>
+                  <div style={{ opacity: 0.8 }}>Success rate</div>
+                  <div style={{ fontSize: 16, fontWeight: 600 }}>{runStatsSuccessRateText}%</div>
+                </div>
+                <div>
+                  <div style={{ opacity: 0.8 }}>Avg duration</div>
+                  <div style={{ fontSize: 16, fontWeight: 600 }}>{runStatsAvgDurationText}</div>
+                </div>
+              </div>
+            )}
+            <div style={{ marginTop: 6, opacity: 0.8 }}>duration samples: {runDashboardStats?.duration_sample_count ?? 0}</div>
           </div>
 
           <div style={{ border: "1px solid #ddd", borderRadius: 8, padding: 10, marginBottom: 12, fontSize: 12 }}>
