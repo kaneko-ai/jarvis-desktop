@@ -125,6 +125,22 @@ What it verifies:
 - pipeline CLI can generate a new run directory
 - required files exist (`input.json`, `result.json`, `paper_graph/tree/tree.md`)
 
+## Playwright E2E (critical UI flow)
+
+```powershell
+cd C:\Users\kaneko yu\Documents\jarvis-work\jarvis-desktop\jarvis-desktop
+npm run test:e2e
+```
+
+Debug selectors/waits locally:
+
+```powershell
+npm run test:e2e:headed
+```
+
+Notes:
+- Uses deterministic mocked Tauri `invoke` responses to validate UI behavior.
+- Failure artifacts are written under `playwright-report/` and `test-results/e2e/`.
 ## Clean-machine verification checklist
 
 - Checklist: `scripts/clean_machine_checklist.md`
