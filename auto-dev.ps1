@@ -1,7 +1,7 @@
-# auto-dev.ps1 (Hardened, Worktree-based, Long-run safe)
+﻿# auto-dev.ps1 (Hardened, Worktree-based, Long-run safe)
 # - 1 cycle = 1 worktree (no dirty start contamination)
-# - Writes plan/meta/evidence/result into .codex-logs (UTF-8)
-# - Script performs push + (draft) PR creation to avoid "local-only completion"
+# - Writes plan/meta/evidence/result into .codex-logs (UTF-8 no BOM)
+# - Script performs push + optional PR creation (gh) to avoid "local-only completion"
 # - Stops on dirty repo unless explicitly overridden
 
 [CmdletBinding()]
@@ -18,35 +18,34 @@ param(
   [switch]$SkipBaselineChecks = $false,
 
   # PR automation
-  [switch]$AutoPush = $true,
-  [switch]$AutoCreatePR = $true,
-  [switch]$DraftPR = $true,
+[bool]$AutoPush = $true,
+[bool]$AutoCreatePR = $true,
+[bool]$DraftPR = $true,
 
   # Worktree options
   [switch]$KeepWorktrees = $false
 )
 
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
+
 # -------------------------
 # Helpers
 # -------------------------
+function New-Utf8NoBom() {
+  return New-Object System.Text.UTF8Encoding($false)
+}
+
 function Write-Utf8File([string]$Path, [string]$Content) {
   $dir = Split-Path -Parent $Path
   if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
-  $Content | Out-File -FilePath $Path -Encoding utf8 -Force
+  [System.IO.File]::WriteAllText($Path, $Content, (New-Utf8NoBom))
 }
 
 function Append-Utf8File([string]$Path, [string]$Content) {
-  $Content | Out-File -FilePath $Path -Encoding utf8 -Append
-}
-
-function Invoke-Cmd([string]$Cmd, [string]$LogPath = "") {
-  if ($LogPath) {
-    $out = & powershell -NoProfile -Command $Cmd 2>&1 | Out-String
-    Write-Utf8File $LogPath $out
-    return $out
-  } else {
-    return (& powershell -NoProfile -Command $Cmd 2>&1 | Out-String)
-  }
+  $dir = Split-Path -Parent $Path
+  if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+  [System.IO.File]::AppendAllText($Path, $Content, (New-Utf8NoBom))
 }
 
 function Ensure-InfoExclude([string]$RepoRoot, [string[]]$Patterns) {
@@ -55,7 +54,9 @@ function Ensure-InfoExclude([string]$RepoRoot, [string[]]$Patterns) {
   $excludePath = Join-Path $infoDir "exclude"
   if (-not (Test-Path $excludePath)) { New-Item -ItemType File -Force -Path $excludePath | Out-Null }
 
-  $current = Get-Content $excludePath -ErrorAction SilentlyContinue
+  $current = @()
+  try { $current = Get-Content $excludePath -ErrorAction SilentlyContinue } catch { $current = @() }
+
   foreach ($p in $Patterns) {
     if ($current -notcontains $p) {
       Add-Content -Path $excludePath -Value $p
@@ -77,11 +78,19 @@ function Truncate([string]$Text, [int]$MaxChars) {
   return $Text.Substring($Text.Length - $MaxChars)
 }
 
+function Run-Checked([string]$Label, [scriptblock]$Action) {
+  try {
+    return & $Action
+  } catch {
+    throw "[$Label] failed: $($_.Exception.Message)"
+  }
+}
+
 # -------------------------
 # Encoding (reduce mojibake)
 # -------------------------
 try {
-  $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+  $utf8NoBom = New-Utf8NoBom
   [Console]::OutputEncoding = $utf8NoBom
   $OutputEncoding = $utf8NoBom
 } catch {}
@@ -95,7 +104,6 @@ if (-not $ProjectDir -or $ProjectDir.Trim() -eq "") {
 }
 $ProjectDir = (Resolve-Path -LiteralPath $ProjectDir).Path
 
-# Hard guard: must be a git repo root or inside a git repo
 Set-Location -LiteralPath $ProjectDir
 $repoTop = (git rev-parse --show-toplevel 2>$null)
 if (-not $repoTop) {
@@ -106,7 +114,7 @@ Set-Location -LiteralPath $RepoRoot
 
 # Required files
 $AgentsPath = Join-Path $RepoRoot "AGENTS.md"
-$PlanPath = Join-Path $RepoRoot $PlanFile
+$PlanPath   = Join-Path $RepoRoot $PlanFile
 if (-not (Test-Path $AgentsPath)) { throw "Missing AGENTS.md at repo root: $AgentsPath" }
 if (-not (Test-Path $PlanPath))   { throw "Missing plan file: $PlanPath" }
 
@@ -116,7 +124,6 @@ $WtRoot = Join-Path $RepoRoot ".wt"
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Force -Path $LogDir | Out-Null }
 if (-not (Test-Path $WtRoot)) { New-Item -ItemType Directory -Force -Path $WtRoot | Out-Null }
 
-# Ensure ignored locally (does NOT touch tracked .gitignore)
 Ensure-InfoExclude $RepoRoot @(
   ".codex-logs/",
   ".wt/"
@@ -124,7 +131,7 @@ Ensure-InfoExclude $RepoRoot @(
 
 # Tools sanity
 $codexVer = (codex --version 2>$null)
-if (-not $codexVer) { throw "codex CLI not found. Install: npm i -g @openai/codex" }
+if (-not $codexVer) { throw "codex CLI not found. Install it first." }
 
 # GitHub CLI optional checks
 $ghOk = $true
@@ -174,12 +181,17 @@ if (-not $SkipBaselineChecks) {
   $baseline += "## npm run lint"
   $baseline += (npm run lint 2>&1 | Out-String)
 
-  $baseline += "## cargo fmt --check"
-  Push-Location (Join-Path $RepoRoot "src-tauri")
-  $baseline += (cargo fmt --check 2>&1 | Out-String)
-  $baseline += "## cargo test"
-  $baseline += (cargo test 2>&1 | Out-String)
-  Pop-Location
+  $tauriDir = Join-Path $RepoRoot "src-tauri"
+  if (Test-Path $tauriDir) {
+    Push-Location $tauriDir
+    $baseline += "## cargo fmt --check"
+    $baseline += (cargo fmt --check 2>&1 | Out-String)
+    $baseline += "## cargo test"
+    $baseline += (cargo test 2>&1 | Out-String)
+    Pop-Location
+  } else {
+    $baseline += "## src-tauri not found; skipping cargo checks"
+  }
 
   Write-Utf8File $BaselineFile ($baseline -join "`n")
   Write-Host "[baseline] saved: $BaselineFile" -ForegroundColor Gray
@@ -194,8 +206,8 @@ for ($i = 1; $i -le $MaxPRs; $i++) {
   Write-Host "--- [$i / $MaxPRs] Cycle start: $(Get-Date) ---" -ForegroundColor Yellow
 
   # Always sync main first (ff-only)
-  git switch main | Out-Null
-  git pull --ff-only | Out-Null
+  Run-Checked "git-switch-main" { git switch main | Out-Null }
+  Run-Checked "git-pull-ff"     { git pull --ff-only | Out-Null }
 
   # Ensure clean before creating worktree
   $dirtyNow = (git status --porcelain)
@@ -209,7 +221,7 @@ for ($i = 1; $i -le $MaxPRs; $i++) {
   $EvidenceFile = Join-Path $LogDir "evidence-$CycleId.md"
   $ResultFile   = Join-Path $LogDir "result-$CycleId.md"
 
-  # Previous result = latest result file (not same timestamp bug)
+  # Previous result (latest available)
   $PrevResultPath = Get-LatestFile $LogDir "result-*.md"
   $PrevResult = "No previous result."
   if ($PrevResultPath) {
@@ -220,7 +232,15 @@ for ($i = 1; $i -le $MaxPRs; $i++) {
   # Create isolated worktree
   $WtPath = Join-Path $WtRoot "wt-$CycleId"
   if (Test-Path $WtPath) { Remove-Item -Recurse -Force $WtPath }
-  git worktree add $WtPath main | Out-Null
+
+  # IMPORTANT:
+  # main is already checked out in the primary worktree, so we cannot check out 'main' again.
+  # Use detached HEAD worktree, then Codex will create a feature branch inside it.
+  git worktree prune | Out-Null
+  $wtOut = (git worktree add $WtPath --detach main 2>&1 | Out-String)
+  if ($LASTEXITCODE -ne 0 -or -not (Test-Path $WtPath)) {
+    throw "Failed to create worktree at $WtPath. git output:`n$wtOut"
+  }
 
   try {
     Push-Location -LiteralPath $WtPath
@@ -280,12 +300,8 @@ IMPORTANT:
     $StepALog = Join-Path $LogDir "step-a-$CycleId.log"
     codex exec --full-auto $PlanPrompt 2>&1 | Tee-Object -FilePath $StepALog | Out-Null
 
-    if (-not (Test-Path $PlanNextFile)) {
-      throw "Plan instruction file not generated: $PlanNextFile (see $StepALog)"
-    }
-    if (-not (Test-Path $MetaFile)) {
-      throw "Meta JSON not generated: $MetaFile (see $StepALog)"
-    }
+    if (-not (Test-Path $PlanNextFile)) { throw "Plan instruction file not generated: $PlanNextFile (see $StepALog)" }
+    if (-not (Test-Path $MetaFile))     { throw "Meta JSON not generated: $MetaFile (see $StepALog)" }
 
     # Read meta
     $metaRaw = Get-Content $MetaFile -Raw -Encoding utf8
@@ -355,12 +371,17 @@ At the end, print:
     $e += "## npm run lint"
     $e += (npm run lint 2>&1 | Out-String)
 
-    Push-Location (Join-Path $WtPath "src-tauri")
-    $e += "## cargo fmt --check"
-    $e += (cargo fmt --check 2>&1 | Out-String)
-    $e += "## cargo test"
-    $e += (cargo test 2>&1 | Out-String)
-    Pop-Location
+    $tauriDirWt = Join-Path $WtPath "src-tauri"
+    if (Test-Path $tauriDirWt) {
+      Push-Location $tauriDirWt
+      $e += "## cargo fmt --check"
+      $e += (cargo fmt --check 2>&1 | Out-String)
+      $e += "## cargo test"
+      $e += (cargo test 2>&1 | Out-String)
+      Pop-Location
+    } else {
+      $e += "## src-tauri not found; skipping cargo checks"
+    }
 
     Write-Utf8File $EvidenceFile ($e -join "`n")
 
@@ -398,12 +419,11 @@ Output only the file; no extra chatter.
       Write-Utf8File $ResultFile "Result file not generated. See logs: $StepCLog"
     }
 
-    # Auto push + PR (script-controlled)
+    # STEP D: Auto push + PR (script-controlled)
     $prUrl = ""
     if ($AutoPush -or $AutoCreatePR) {
       Write-Host "[D] Pushing branch / creating PR (script-side)..." -ForegroundColor Green
 
-      # Ensure we're on expected branch
       $cur = (git branch --show-current).Trim()
       if ($cur -ne $meta.branch_name) {
         throw "Current branch '$cur' != expected '$($meta.branch_name)'. Aborting push/PR."
@@ -417,7 +437,6 @@ Output only the file; no extra chatter.
         $draftFlag = ""
         if ($DraftPR) { $draftFlag = "--draft" }
 
-        # Create PR if not exists
         $existing = ""
         try {
           $existing = (gh pr view $meta.branch_name --json url 2>$null | ConvertFrom-Json).url
@@ -440,7 +459,6 @@ Notes:
           Write-Utf8File $tmpBody $body
 
           $created = (gh pr create --base main --head $meta.branch_name --title $meta.pr_title --body-file $tmpBody $draftFlag 2>&1 | Out-String)
-          # gh outputs URL in stdout on success
           $prUrl = ($created | Select-String -Pattern "https://github\.com/.+/pull/\d+" -AllMatches).Matches.Value | Select-Object -First 1
         } else {
           $prUrl = $existing
@@ -462,13 +480,11 @@ Notes:
     Pop-Location
 
     if (-not $KeepWorktrees) {
-      # Remove worktree (force; branch already pushed if enabled)
       try { git worktree remove $WtPath --force | Out-Null } catch {}
       try { if (Test-Path $WtPath) { Remove-Item -Recurse -Force $WtPath } } catch {}
     }
   }
 
-  # Sleep
   if ($i -lt $MaxPRs) {
     Write-Host "Sleeping $SleepMinutes minutes..." -ForegroundColor Gray
     Start-Sleep -Seconds ($SleepMinutes * 60)
@@ -499,7 +515,6 @@ if ($CreatedPRs.Count -gt 0) {
   Write-Utf8File $PRListFile "(no PR urls recorded)"
 }
 
-# Collect deterministic repo evidence for report
 $MgmtEvidence = @()
 $MgmtEvidence += "# Nightly Evidence"
 $MgmtEvidence += "Time: $(Get-Date)"
