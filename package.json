@@ -11,7 +11,9 @@
     "release:win": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\scripts\\release_win.ps1",
     "preflight": "powershell -ExecutionPolicy Bypass -File .\\preflight_desktop.ps1",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:e2e": "playwright test",
+    "test:e2e:headed": "playwright test --headed"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.10.1",
@@ -21,6 +23,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1",
+    "@playwright/test": "^1.58.2",
     "@tauri-apps/cli": "^2.10.0",
     "@types/react": "^19.2.7",
     "@types/react-dom": "^19.2.3",
