@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -8,9 +10,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::{fs, io::{Read, Seek, SeekFrom, Write}};
-use chrono::{DateTime, Utc};
-use sha2::{Digest, Sha256};
+use std::{
+    fs,
+    io::{Read, Seek, SeekFrom, Write},
+};
 use tauri::Emitter;
 use zip::write::SimpleFileOptions;
 
@@ -22,7 +25,8 @@ const DIAG_AUDIT_TAIL_LINES: usize = 200;
 const DIAG_MAX_RECENT_ITEMS: usize = 20;
 const MAX_RUN_TEXT_PREVIEW_BYTES: usize = 200 * 1024;
 const DEFAULT_RUN_TEXT_TAIL_BYTES: u64 = 200_000;
-const DEFAULT_PIPELINE_REPO_REMOTE_URL: &str = "https://github.com/kaneko-ai/jarvis-ml-pipeline.git";
+const DEFAULT_PIPELINE_REPO_REMOTE_URL: &str =
+    "https://github.com/kaneko-ai/jarvis-ml-pipeline.git";
 const DEFAULT_PIPELINE_REPO_LOCAL_SUBDIR: &str = "pipeline_repo/jarvis-ml-pipeline";
 const DEFAULT_PIPELINE_REPO_REF: &str = "main";
 
@@ -1043,7 +1047,9 @@ fn json_i64_with_default(
     };
 
     if parsed < min || parsed > max {
-        return Err(format!("parameter out of range: {parsed} (allowed: {min}..{max})"));
+        return Err(format!(
+            "parameter out of range: {parsed} (allowed: {min}..{max})"
+        ));
     }
     Ok(parsed)
 }
@@ -1060,18 +1066,9 @@ fn build_template_args(
                 .map_err(|e| format!("identifier normalize error: {e}"))?;
 
             let obj = params.as_object();
-            let depth = json_i64_with_default(
-                obj.and_then(|m| m.get("depth")),
-                2,
-                1,
-                2,
-            )?;
-            let max_per_level = json_i64_with_default(
-                obj.and_then(|m| m.get("max_per_level")),
-                50,
-                1,
-                200,
-            )?;
+            let depth = json_i64_with_default(obj.and_then(|m| m.get("depth")), 2, 1, 2)?;
+            let max_per_level =
+                json_i64_with_default(obj.and_then(|m| m.get("max_per_level")), 50, 1, 200)?;
 
             let argv = vec![
                 "papers".to_string(),
@@ -1097,18 +1094,9 @@ fn build_template_args(
                 .map_err(|e| format!("identifier normalize error: {e}"))?;
 
             let obj = params.as_object();
-            let depth = json_i64_with_default(
-                obj.and_then(|m| m.get("depth")),
-                1,
-                1,
-                2,
-            )?;
-            let max_per_level = json_i64_with_default(
-                obj.and_then(|m| m.get("max_per_level")),
-                30,
-                1,
-                200,
-            )?;
+            let depth = json_i64_with_default(obj.and_then(|m| m.get("depth")), 1, 1, 2)?;
+            let max_per_level =
+                json_i64_with_default(obj.and_then(|m| m.get("max_per_level")), 30, 1, 200)?;
 
             let argv = vec![
                 "papers".to_string(),
@@ -1134,19 +1122,14 @@ fn build_template_args(
                 .map_err(|e| format!("identifier normalize error: {e}"))?;
 
             let obj = params.as_object();
-            let default_k = if template_id == "TEMPLATE_GRAPH" { 40 } else { 24 };
-            let k = json_i64_with_default(
-                obj.and_then(|m| m.get("k")),
-                default_k,
-                10,
-                50,
-            )?;
-            let seed = json_i64_with_default(
-                obj.and_then(|m| m.get("seed")),
-                42,
-                0,
-                2_147_483_647,
-            )?;
+            let default_k = if template_id == "TEMPLATE_GRAPH" {
+                40
+            } else {
+                24
+            };
+            let k = json_i64_with_default(obj.and_then(|m| m.get("k")), default_k, 10, 50)?;
+            let seed =
+                json_i64_with_default(obj.and_then(|m| m.get("seed")), 42, 0, 2_147_483_647)?;
 
             let argv = vec![
                 "papers".to_string(),
@@ -1171,7 +1154,11 @@ fn build_template_args(
 }
 
 fn split_url_tail(raw: &str) -> String {
-    raw.split(&['?', '#'][..]).next().unwrap_or("").trim().to_string()
+    raw.split(&['?', '#'][..])
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string()
 }
 
 fn normalize_identifier_internal(input: &str) -> NormalizedIdentifier {
@@ -1334,7 +1321,8 @@ fn normalize_identifier_internal(input: &str) -> NormalizedIdentifier {
         }
     }
 
-    if s.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '/' || c == '-')
+    if s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '/' || c == '-')
         && (s.contains('.') || s.contains('/'))
     {
         return NormalizedIdentifier {
@@ -1506,7 +1494,10 @@ fn cache_library_records(out_dir: &Path, records: &[LibraryRecord]) -> Result<()
     Ok(())
 }
 
-fn load_library_records_cached(out_dir: &Path, force_reload: bool) -> Result<Vec<LibraryRecord>, String> {
+fn load_library_records_cached(
+    out_dir: &Path,
+    force_reload: bool,
+) -> Result<Vec<LibraryRecord>, String> {
     let state = library_cache_state();
     let src_mtime = library_source_mtime_ms(out_dir);
 
@@ -1618,7 +1609,10 @@ fn make_highlight(field: &str, value: &str, token: &str) -> LibrarySearchHighlig
     }
 }
 
-fn score_library_record(rec: &LibraryRecord, tokens: &[String]) -> (i64, Vec<LibrarySearchHighlight>, bool) {
+fn score_library_record(
+    rec: &LibraryRecord,
+    tokens: &[String],
+) -> (i64, Vec<LibrarySearchHighlight>, bool) {
     let canonical = rec.canonical_id.clone().unwrap_or_default();
     let canonical_lower = canonical.to_lowercase();
     let title = rec.title.clone().unwrap_or_default();
@@ -1669,7 +1663,11 @@ fn score_library_record(rec: &LibraryRecord, tokens: &[String]) -> (i64, Vec<Lib
         if run_ids_lower.iter().any(|r| r.contains(tok)) {
             score += 20;
             token_matched = true;
-            if let Some(run) = rec.runs.iter().find(|r| r.run_id.to_lowercase().contains(tok)) {
+            if let Some(run) = rec
+                .runs
+                .iter()
+                .find(|r| r.run_id.to_lowercase().contains(tok))
+            {
                 highlights.push(make_highlight("run_id", &run.run_id, tok));
             }
         }
@@ -1752,7 +1750,15 @@ fn parse_primary_viz_from_input(v: &serde_json::Value) -> Option<PrimaryVizRef> 
     Some(PrimaryVizRef { name, kind })
 }
 
-fn extract_run_for_library(run_dir: &Path) -> Option<(String, LibraryRunEntry, Option<String>, Option<String>, Option<i32>)> {
+fn extract_run_for_library(
+    run_dir: &Path,
+) -> Option<(
+    String,
+    LibraryRunEntry,
+    Option<String>,
+    Option<String>,
+    Option<i32>,
+)> {
     let run_id = run_dir.file_name()?.to_string_lossy().to_string();
     let meta = fs::metadata(run_dir).ok()?;
     let created_at = meta
@@ -1834,7 +1840,11 @@ fn extract_run_for_library(run_dir: &Path) -> Option<(String, LibraryRunEntry, O
                         _ => "unknown".to_string(),
                     };
                 } else if let Some(ok) = v.get("ok").and_then(|x| x.as_bool()) {
-                    status = if ok { "succeeded".to_string() } else { "failed".to_string() };
+                    status = if ok {
+                        "succeeded".to_string()
+                    } else {
+                        "failed".to_string()
+                    };
                 }
 
                 let (needs_retry, _retry_after) = inspect_retry_fields(&v);
@@ -1868,7 +1878,10 @@ fn extract_run_for_library(run_dir: &Path) -> Option<(String, LibraryRunEntry, O
     Some((paper_key, run, canonical_id, title, year))
 }
 
-fn build_library_records(out_dir: &Path, existing: &[LibraryRecord]) -> Result<Vec<LibraryRecord>, String> {
+fn build_library_records(
+    out_dir: &Path,
+    existing: &[LibraryRecord],
+) -> Result<Vec<LibraryRecord>, String> {
     let mut existing_tags = std::collections::HashMap::<String, Vec<String>>::new();
     for rec in existing {
         existing_tags.insert(rec.paper_key.clone(), rec.tags.clone());
@@ -1883,25 +1896,28 @@ fn build_library_records(out_dir: &Path, existing: &[LibraryRecord]) -> Result<V
         if !run_dir.is_dir() {
             continue;
         }
-        let Some((paper_key, run, canonical_id, title, year)) = extract_run_for_library(&run_dir) else {
+        let Some((paper_key, run, canonical_id, title, year)) = extract_run_for_library(&run_dir)
+        else {
             continue;
         };
 
         let now = Utc::now().to_rfc3339();
-        let rec = grouped.entry(paper_key.clone()).or_insert_with(|| LibraryRecord {
-            paper_key: paper_key.clone(),
-            canonical_id: canonical_id.clone(),
-            title: title.clone(),
-            year,
-            source_kind: canonical_kind(canonical_id.as_deref()),
-            tags: existing_tags.get(&paper_key).cloned().unwrap_or_default(),
-            runs: Vec::new(),
-            primary_viz: None,
-            last_run_id: None,
-            last_status: "unknown".to_string(),
-            created_at: now.clone(),
-            updated_at: now,
-        });
+        let rec = grouped
+            .entry(paper_key.clone())
+            .or_insert_with(|| LibraryRecord {
+                paper_key: paper_key.clone(),
+                canonical_id: canonical_id.clone(),
+                title: title.clone(),
+                year,
+                source_kind: canonical_kind(canonical_id.as_deref()),
+                tags: existing_tags.get(&paper_key).cloned().unwrap_or_default(),
+                runs: Vec::new(),
+                primary_viz: None,
+                last_run_id: None,
+                last_status: "unknown".to_string(),
+                created_at: now.clone(),
+                updated_at: now,
+            });
 
         if rec.canonical_id.is_none() {
             rec.canonical_id = canonical_id.clone();
@@ -2051,10 +2067,7 @@ fn subsystem_display_name(subsystem: &str) -> &str {
 }
 
 fn parse_schema_version(value: &serde_json::Value) -> Result<u32, String> {
-    if let Some(n) = value
-        .get("schema_version")
-        .and_then(|v| v.as_u64())
-    {
+    if let Some(n) = value.get("schema_version").and_then(|v| v.as_u64()) {
         return u32::try_from(n)
             .map_err(|_| "schema_version is out of supported range".to_string());
     }
@@ -2079,10 +2092,20 @@ fn load_with_migration<T, F>(path: &Path, subsystem: &str, decode: F) -> Result<
 where
     F: FnOnce(serde_json::Value) -> Result<T, String>,
 {
-    let raw = fs::read_to_string(path)
-        .map_err(|e| format!("failed to read {} {}: {e}", subsystem_display_name(subsystem), path.display()))?;
-    let mut value: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| format!("failed to parse {} {}: {e}", subsystem_display_name(subsystem), path.display()))?;
+    let raw = fs::read_to_string(path).map_err(|e| {
+        format!(
+            "failed to read {} {}: {e}",
+            subsystem_display_name(subsystem),
+            path.display()
+        )
+    })?;
+    let mut value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+        format!(
+            "failed to parse {} {}: {e}",
+            subsystem_display_name(subsystem),
+            path.display()
+        )
+    })?;
     if !value.is_object() {
         return Err(format!(
             "invalid {} {}: root must be an object",
@@ -2120,10 +2143,20 @@ fn ensure_schema_writable(path: &Path, subsystem: &str) -> Result<(), String> {
     if !path.exists() {
         return Ok(());
     }
-    let raw = fs::read_to_string(path)
-        .map_err(|e| format!("failed to read {} {}: {e}", subsystem_display_name(subsystem), path.display()))?;
-    let value: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| format!("failed to parse {} {}: {e}", subsystem_display_name(subsystem), path.display()))?;
+    let raw = fs::read_to_string(path).map_err(|e| {
+        format!(
+            "failed to read {} {}: {e}",
+            subsystem_display_name(subsystem),
+            path.display()
+        )
+    })?;
+    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+        format!(
+            "failed to parse {} {}: {e}",
+            subsystem_display_name(subsystem),
+            path.display()
+        )
+    })?;
     let version = parse_schema_version(&value)?;
     if version > SCHEMA_VERSION {
         return Err(format!(
@@ -2193,8 +2226,12 @@ fn load_settings(out_dir: &Path) -> Result<DesktopSettings, String> {
                 .map_err(|e| format!("failed to decode settings file {}: {e}", path.display()))?;
             return Ok(payload.settings);
         }
-        serde_json::from_value::<DesktopSettings>(value)
-            .map_err(|e| format!("failed to parse legacy settings file {}: {e}", path.display()))
+        serde_json::from_value::<DesktopSettings>(value).map_err(|e| {
+            format!(
+                "failed to parse legacy settings file {}: {e}",
+                path.display()
+            )
+        })
     })?;
     Ok(pipeline_repo_settings_with_defaults(loaded))
 }
@@ -2226,8 +2263,12 @@ fn append_audit_auto_retry(out_dir: &Path, entry: &AuditAutoRetryEntry) -> Resul
         .map_err(|e| format!("failed to open audit log {}: {e}", path.display()))?;
     file.write_all(line.as_bytes())
         .map_err(|e| format!("failed to append audit log {}: {e}", path.display()))?;
-    file.write_all(b"\n")
-        .map_err(|e| format!("failed to append newline to audit log {}: {e}", path.display()))
+    file.write_all(b"\n").map_err(|e| {
+        format!(
+            "failed to append newline to audit log {}: {e}",
+            path.display()
+        )
+    })
 }
 
 fn compute_next_retry_at_ms(
@@ -2237,7 +2278,8 @@ fn compute_next_retry_at_ms(
     settings: &DesktopSettings,
 ) -> String {
     let delay_seconds = if let Some(sec) = retry_after_seconds {
-        sec.max(0.0).min(settings.auto_retry_max_delay_seconds as f64)
+        sec.max(0.0)
+            .min(settings.auto_retry_max_delay_seconds as f64)
     } else {
         let exp = auto_retry_attempt_count.saturating_sub(1).min(31);
         let base = settings.auto_retry_base_delay_seconds as u128;
@@ -2520,7 +2562,10 @@ fn load_env_config() -> Result<EnvConfig, String> {
     })
 }
 
-fn parse_u64_field_from_json(value: Option<&serde_json::Value>, key: &str) -> Result<Option<u64>, String> {
+fn parse_u64_field_from_json(
+    value: Option<&serde_json::Value>,
+    key: &str,
+) -> Result<Option<u64>, String> {
     match value {
         None => Ok(None),
         Some(v) if v.is_null() => Ok(None),
@@ -2542,7 +2587,10 @@ fn parse_u64_field_from_json(value: Option<&serde_json::Value>, key: &str) -> Re
     }
 }
 
-fn parse_u32_field_from_json(value: Option<&serde_json::Value>, key: &str) -> Result<Option<u32>, String> {
+fn parse_u32_field_from_json(
+    value: Option<&serde_json::Value>,
+    key: &str,
+) -> Result<Option<u32>, String> {
     match parse_u64_field_from_json(value, key)? {
         None => Ok(None),
         Some(v) => u32::try_from(v)
@@ -2551,7 +2599,10 @@ fn parse_u32_field_from_json(value: Option<&serde_json::Value>, key: &str) -> Re
     }
 }
 
-fn parse_f64_field_from_json(value: Option<&serde_json::Value>, key: &str) -> Result<Option<f64>, String> {
+fn parse_f64_field_from_json(
+    value: Option<&serde_json::Value>,
+    key: &str,
+) -> Result<Option<f64>, String> {
     match value {
         None => Ok(None),
         Some(v) if v.is_null() => Ok(None),
@@ -2583,9 +2634,12 @@ fn read_desktop_config_file(path: &Path) -> Result<Option<DesktopConfigFile>, St
     let value = serde_json::from_str::<serde_json::Value>(&text)
         .map_err(|e| format!("Invalid config JSON at {}: {e}", path.display()))?;
 
-    let obj = value
-        .as_object()
-        .ok_or_else(|| format!("Invalid config JSON at {}: root must be an object", path.display()))?;
+    let obj = value.as_object().ok_or_else(|| {
+        format!(
+            "Invalid config JSON at {}: root must be an object",
+            path.display()
+        )
+    })?;
 
     let cfg = DesktopConfigFile {
         JARVIS_PIPELINE_ROOT: obj
@@ -2597,15 +2651,23 @@ fn read_desktop_config_file(path: &Path) -> Result<Option<DesktopConfigFile>, St
         S2_API_KEY: obj
             .get("S2_API_KEY")
             .and_then(|v| v.as_str().map(|s| s.to_string())),
-        S2_MIN_INTERVAL_MS: parse_u64_field_from_json(obj.get("S2_MIN_INTERVAL_MS"), "S2_MIN_INTERVAL_MS")?,
+        S2_MIN_INTERVAL_MS: parse_u64_field_from_json(
+            obj.get("S2_MIN_INTERVAL_MS"),
+            "S2_MIN_INTERVAL_MS",
+        )?,
         S2_MAX_RETRIES: parse_u32_field_from_json(obj.get("S2_MAX_RETRIES"), "S2_MAX_RETRIES")?,
-        S2_BACKOFF_BASE_SEC: parse_f64_field_from_json(obj.get("S2_BACKOFF_BASE_SEC"), "S2_BACKOFF_BASE_SEC")?,
+        S2_BACKOFF_BASE_SEC: parse_f64_field_from_json(
+            obj.get("S2_BACKOFF_BASE_SEC"),
+            "S2_BACKOFF_BASE_SEC",
+        )?,
     };
 
     Ok(Some(cfg))
 }
 
-fn read_config_json_root(path: &Path) -> Result<Option<serde_json::Map<String, serde_json::Value>>, String> {
+fn read_config_json_root(
+    path: &Path,
+) -> Result<Option<serde_json::Map<String, serde_json::Value>>, String> {
     if !path.exists() {
         return Ok(None);
     }
@@ -2615,14 +2677,20 @@ fn read_config_json_root(path: &Path) -> Result<Option<serde_json::Map<String, s
     let value = serde_json::from_str::<serde_json::Value>(&text)
         .map_err(|e| format!("Invalid config JSON at {}: {e}", path.display()))?;
 
-    let obj = value
-        .as_object()
-        .ok_or_else(|| format!("Invalid config JSON at {}: root must be an object", path.display()))?;
+    let obj = value.as_object().ok_or_else(|| {
+        format!(
+            "Invalid config JSON at {}: root must be an object",
+            path.display()
+        )
+    })?;
 
     Ok(Some(obj.clone()))
 }
 
-fn write_config_json_root(path: &Path, obj: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+fn write_config_json_root(
+    path: &Path,
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
     let value = serde_json::Value::Object(obj.clone());
     let text = serde_json::to_string_pretty(&value)
         .map_err(|e| format!("Failed to serialize config file {}: {e}", path.display()))?;
@@ -2649,15 +2717,26 @@ fn validate_out_dir_writable(path: &Path) -> Result<PathBuf, String> {
 
     let canonical = canonical_or_self(path);
     let probe = canonical.join(".jarvis_desktop_write_probe.tmp");
-    let mut f = fs::File::create(&probe)
-        .map_err(|e| format!("out_dir is not writable (create probe failed): {}: {e}", canonical.display()))?;
-    f.write_all(b"ok")
-        .map_err(|e| format!("out_dir is not writable (write probe failed): {}: {e}", canonical.display()))?;
+    let mut f = fs::File::create(&probe).map_err(|e| {
+        format!(
+            "out_dir is not writable (create probe failed): {}: {e}",
+            canonical.display()
+        )
+    })?;
+    f.write_all(b"ok").map_err(|e| {
+        format!(
+            "out_dir is not writable (write probe failed): {}: {e}",
+            canonical.display()
+        )
+    })?;
     let _ = fs::remove_file(&probe);
     Ok(canonical)
 }
 
-fn resolve_runtime_config_with_config_path(repo_root: &Path, cfg_path: &Path) -> Result<RuntimeConfig, String> {
+fn resolve_runtime_config_with_config_path(
+    repo_root: &Path,
+    cfg_path: &Path,
+) -> Result<RuntimeConfig, String> {
     let file_cfg_opt = read_desktop_config_file(cfg_path)?;
     let file_cfg = file_cfg_opt.clone().unwrap_or_default();
     let env_cfg = load_env_config()?;
@@ -3049,7 +3128,9 @@ fn validate_pipeline_repo_url(raw: &str) -> Result<String, String> {
         return Err("RULE_PIPELINE_REPO_URL_EMPTY: remote_url is empty".to_string());
     }
     if !trimmed.to_ascii_lowercase().starts_with("https://") {
-        return Err("RULE_PIPELINE_REPO_URL_SCHEME: only https:// remote_url is allowed".to_string());
+        return Err(
+            "RULE_PIPELINE_REPO_URL_SCHEME: only https:// remote_url is allowed".to_string(),
+        );
     }
     Ok(trimmed.to_string())
 }
@@ -3063,7 +3144,9 @@ fn validate_pipeline_repo_ref(raw: &str) -> Result<String, String> {
         .chars()
         .any(|c| !(c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '/' || c == '.'))
     {
-        return Err("RULE_PIPELINE_REPO_REF_INVALID: git_ref contains invalid characters".to_string());
+        return Err(
+            "RULE_PIPELINE_REPO_REF_INVALID: git_ref contains invalid characters".to_string(),
+        );
     }
     Ok(trimmed.to_string())
 }
@@ -3096,10 +3179,13 @@ fn validate_pipeline_repo_local_path(raw: &str, allowed_root: &Path) -> Result<P
         .components()
         .any(|c| matches!(c, std::path::Component::ParentDir))
     {
-        return Err("RULE_PIPELINE_REPO_PATH_TRAVERSAL: local_path cannot contain `..`".to_string());
+        return Err(
+            "RULE_PIPELINE_REPO_PATH_TRAVERSAL: local_path cannot contain `..`".to_string(),
+        );
     }
 
-    let allowed_canonical = canonicalize_existing_dir(allowed_root, "RULE_PIPELINE_REPO_ALLOWED_ROOT")?;
+    let allowed_canonical =
+        canonicalize_existing_dir(allowed_root, "RULE_PIPELINE_REPO_ALLOWED_ROOT")?;
     let absolute = if requested.is_absolute() {
         requested
     } else {
@@ -3121,9 +3207,14 @@ fn validate_pipeline_repo_local_path(raw: &str, allowed_root: &Path) -> Result<P
     let parent = absolute
         .parent()
         .ok_or_else(|| "RULE_PIPELINE_REPO_PATH_PARENT: local_path has no parent".to_string())?;
-    fs::create_dir_all(parent)
-        .map_err(|e| format!("RULE_PIPELINE_REPO_PATH_PARENT_CREATE: failed to create {}: {e}", parent.display()))?;
-    let parent_canonical = canonicalize_existing_dir(parent, "RULE_PIPELINE_REPO_PATH_PARENT_INVALID")?;
+    fs::create_dir_all(parent).map_err(|e| {
+        format!(
+            "RULE_PIPELINE_REPO_PATH_PARENT_CREATE: failed to create {}: {e}",
+            parent.display()
+        )
+    })?;
+    let parent_canonical =
+        canonicalize_existing_dir(parent, "RULE_PIPELINE_REPO_PATH_PARENT_INVALID")?;
     if !parent_canonical.starts_with(&allowed_canonical) {
         return Err(format!(
             "RULE_PIPELINE_REPO_PATH_PARENT_OUTSIDE_ALLOWED: {} is outside {}",
@@ -3221,8 +3312,7 @@ fn run_pipeline_repo_update_internal_with_logging(
     if normalize_remote_url(&remote_stdout) != normalize_remote_url(&settings.remote_url) {
         return Err(format!(
             "RULE_PIPELINE_REPO_REMOTE_MISMATCH: origin remote mismatch. expected={} actual={}",
-            settings.remote_url,
-            remote_stdout
+            settings.remote_url, remote_stdout
         ));
     }
 
@@ -3244,13 +3334,12 @@ fn run_pipeline_repo_update_internal_with_logging(
         "origin".to_string(),
         settings.git_ref.clone(),
     ];
-    let (pull_stdout, pull_stderr) = run_git_capture_with_logging(window, "git pull --ff-only", &pull_args)?;
+    let (pull_stdout, pull_stderr) =
+        run_git_capture_with_logging(window, "git pull --ff-only", &pull_args)?;
 
     let stdout = format!(
         "remote={}\n{}\n{}",
-        remote_stdout,
-        fetch_stdout,
-        pull_stdout
+        remote_stdout, fetch_stdout, pull_stdout
     )
     .trim()
     .to_string();
@@ -3296,8 +3385,12 @@ fn append_audit_pipeline_repo_event(
         .map_err(|e| format!("failed to open audit log {}: {e}", path.display()))?;
     file.write_all(serialized.as_bytes())
         .map_err(|e| format!("failed to append audit log {}: {e}", path.display()))?;
-    file.write_all(b"\n")
-        .map_err(|e| format!("failed to append newline to audit log {}: {e}", path.display()))
+    file.write_all(b"\n").map_err(|e| {
+        format!(
+            "failed to append newline to audit log {}: {e}",
+            path.display()
+        )
+    })
 }
 
 fn pipeline_repo_settings_with_defaults(mut settings: DesktopSettings) -> DesktopSettings {
@@ -3506,7 +3599,11 @@ fn classify_job_status(
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
                 let (needs_retry, retry_after) = inspect_retry_fields(&v);
                 if needs_retry {
-                    return (JobStatus::NeedsRetry, retry_after, Some("needs retry from result.json".to_string()));
+                    return (
+                        JobStatus::NeedsRetry,
+                        retry_after,
+                        Some("needs retry from result.json".to_string()),
+                    );
                 }
                 if let Some(status) = v.get("status").and_then(|x| x.as_str()) {
                     if status.eq_ignore_ascii_case("ok") {
@@ -3562,7 +3659,8 @@ fn apply_job_result(
 
         let canceled = guard.cancel_requested.contains(job_id);
         let resolved_run_id = run_id.clone().unwrap_or_default();
-        let (status, retry_after, err) = classify_job_status(run_result, &runtime, &resolved_run_id, canceled);
+        let (status, retry_after, err) =
+            classify_job_status(run_result, &runtime, &resolved_run_id, canceled);
 
         let updated_at = now_epoch_ms_string();
         let retry_at = if status == JobStatus::NeedsRetry {
@@ -3595,7 +3693,10 @@ fn apply_job_result(
     persist_state(state, jobs_path)?;
 
     if let (Some(run_id), Some(status)) = (run_id_for_index, status_for_index) {
-        if status == JobStatus::Succeeded || status == JobStatus::Failed || status == JobStatus::NeedsRetry {
+        if status == JobStatus::Succeeded
+            || status == JobStatus::Failed
+            || status == JobStatus::NeedsRetry
+        {
             let _ = upsert_library_run(&runtime.out_base_dir, &run_id);
         }
     }
@@ -3716,7 +3817,10 @@ fn library_list(filters: Option<LibraryListFilter>) -> Result<Vec<LibraryRecordS
 }
 
 #[tauri::command]
-fn library_search(query: String, opts: Option<LibrarySearchOpts>) -> Result<Vec<LibrarySearchResult>, String> {
+fn library_search(
+    query: String,
+    opts: Option<LibrarySearchOpts>,
+) -> Result<Vec<LibrarySearchResult>, String> {
     let tokens = tokenize_query(&query);
     if tokens.is_empty() {
         return Ok(Vec::new());
@@ -3762,7 +3866,11 @@ fn library_search(query: String, opts: Option<LibrarySearchOpts>) -> Result<Vec<
             last_status: rec.last_status,
             last_run_id: rec.last_run_id,
             score,
-            highlights: if highlights.is_empty() { None } else { Some(highlights) },
+            highlights: if highlights.is_empty() {
+                None
+            } else {
+                Some(highlights)
+            },
             updated_at: rec.updated_at,
         });
     }
@@ -3872,7 +3980,10 @@ fn start_job_worker_if_needed() -> Result<(), String> {
             if guard.running_job_id.is_some() {
                 None
             } else {
-                let next_idx = guard.jobs.iter().position(|j| j.status == JobStatus::Queued);
+                let next_idx = guard
+                    .jobs
+                    .iter()
+                    .position(|j| j.status == JobStatus::Queued);
                 if let Some(idx) = next_idx {
                     guard.jobs[idx].status = JobStatus::Running;
                     guard.jobs[idx].attempt = guard.jobs[idx].attempt.saturating_add(1);
@@ -3888,26 +3999,32 @@ fn start_job_worker_if_needed() -> Result<(), String> {
         if let Some(job) = next_job {
             let _ = persist_state(&worker_state, &worker_jobs_path);
 
-            let (argv, normalized_params) = match build_template_args(&job.template_id, &job.canonical_id, &job.params) {
-                Ok(v) => v,
-                Err(e) => {
-                    let mut failed = RunResult {
-                        ok: false,
-                        exit_code: 1,
-                        stdout: "".to_string(),
-                        stderr: e.clone(),
-                        run_id: "".to_string(),
-                        run_dir: "".to_string(),
-                        status: "error".to_string(),
-                        message: e,
-                        retry_after_sec: None,
-                    };
-                    failed.run_id = make_run_id();
-                    let _ = apply_job_result(&worker_state, &worker_jobs_path, &job.job_id, &failed);
-                    thread::sleep(Duration::from_millis(100));
-                    continue;
-                }
-            };
+            let (argv, normalized_params) =
+                match build_template_args(&job.template_id, &job.canonical_id, &job.params) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let mut failed = RunResult {
+                            ok: false,
+                            exit_code: 1,
+                            stdout: "".to_string(),
+                            stderr: e.clone(),
+                            run_id: "".to_string(),
+                            run_dir: "".to_string(),
+                            status: "error".to_string(),
+                            message: e,
+                            retry_after_sec: None,
+                        };
+                        failed.run_id = make_run_id();
+                        let _ = apply_job_result(
+                            &worker_state,
+                            &worker_jobs_path,
+                            &job.job_id,
+                            &failed,
+                        );
+                        thread::sleep(Duration::from_millis(100));
+                        continue;
+                    }
+                };
 
             let result = execute_pipeline_task(
                 argv,
@@ -4379,7 +4496,11 @@ fn as_stringish(value: &serde_json::Value) -> Option<String> {
     match value {
         serde_json::Value::String(s) => {
             let t = s.trim();
-            if t.is_empty() { None } else { Some(t.to_string()) }
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
         }
         serde_json::Value::Number(n) => Some(n.to_string()),
         serde_json::Value::Bool(b) => Some(b.to_string()),
@@ -4395,7 +4516,10 @@ fn as_stringish(value: &serde_json::Value) -> Option<String> {
     }
 }
 
-fn get_first_string_field<'a>(obj: &'a serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> Option<String> {
+fn get_first_string_field<'a>(
+    obj: &'a serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+) -> Option<String> {
     for key in keys {
         if let Some(v) = obj.get(*key).and_then(as_stringish) {
             return Some(v);
@@ -4404,7 +4528,10 @@ fn get_first_string_field<'a>(obj: &'a serde_json::Map<String, serde_json::Value
     None
 }
 
-fn get_optional_i32_field(obj: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> Option<i32> {
+fn get_optional_i32_field(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+) -> Option<i32> {
     for key in keys {
         if let Some(v) = obj.get(*key) {
             match v {
@@ -4429,7 +4556,10 @@ fn get_optional_i32_field(obj: &serde_json::Map<String, serde_json::Value>, keys
     None
 }
 
-fn get_optional_f64_field(obj: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> Option<f64> {
+fn get_optional_f64_field(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+) -> Option<f64> {
     for key in keys {
         if let Some(v) = obj.get(*key) {
             match v {
@@ -4450,7 +4580,13 @@ fn get_optional_f64_field(obj: &serde_json::Map<String, serde_json::Value>, keys
     None
 }
 
-fn extract_graph_arrays<'a>(root: &'a serde_json::Value) -> (Option<&'a Vec<serde_json::Value>>, Option<&'a Vec<serde_json::Value>>, Vec<String>) {
+fn extract_graph_arrays<'a>(
+    root: &'a serde_json::Value,
+) -> (
+    Option<&'a Vec<serde_json::Value>>,
+    Option<&'a Vec<serde_json::Value>>,
+    Vec<String>,
+) {
     let mut warnings = Vec::new();
 
     if let Some(obj) = root.as_object() {
@@ -4465,7 +4601,9 @@ fn extract_graph_arrays<'a>(root: &'a serde_json::Value) -> (Option<&'a Vec<serd
                 let out_nodes = container.get("nodes").and_then(|v| v.as_array());
                 let out_edges = container.get("edges").and_then(|v| v.as_array());
                 if out_nodes.is_some() || out_edges.is_some() {
-                    warnings.push(format!("graph arrays detected in nested key `{container_key}`"));
+                    warnings.push(format!(
+                        "graph arrays detected in nested key `{container_key}`"
+                    ));
                     return (out_nodes, out_edges, warnings);
                 }
             }
@@ -4477,8 +4615,8 @@ fn extract_graph_arrays<'a>(root: &'a serde_json::Value) -> (Option<&'a Vec<serd
 }
 
 fn parse_graph_json_internal(content: &str) -> Result<GraphParseResult, String> {
-    let root: serde_json::Value = serde_json::from_str(content)
-        .map_err(|e| format!("invalid graph json: {e}"))?;
+    let root: serde_json::Value =
+        serde_json::from_str(content).map_err(|e| format!("invalid graph json: {e}"))?;
 
     let mut top_level_keys = root
         .as_object()
@@ -4506,7 +4644,8 @@ fn parse_graph_json_internal(content: &str) -> Result<GraphParseResult, String> 
                 .unwrap_or_else(|| format!("node:{idx}"));
                 let label = get_first_string_field(obj, &["label", "title", "name"]);
                 let node_type = get_first_string_field(obj, &["type", "kind", "node_type"]);
-                let year = get_optional_i32_field(obj, &["year", "publication_year", "published_year"]);
+                let year =
+                    get_optional_i32_field(obj, &["year", "publication_year", "published_year"]);
                 let score = get_optional_f64_field(obj, &["score", "weight", "rank"]);
                 (id, label, node_type, year, score)
             } else {
@@ -4599,9 +4738,12 @@ fn kind_priority(kind: &str) -> i32 {
 }
 
 fn list_run_artifacts_internal(run_dir: &Path) -> Result<Vec<ArtifactItem>, String> {
-    let run_dir_canonical = run_dir
-        .canonicalize()
-        .map_err(|e| format!("failed to canonicalize run directory {}: {e}", run_dir.display()))?;
+    let run_dir_canonical = run_dir.canonicalize().map_err(|e| {
+        format!(
+            "failed to canonicalize run directory {}: {e}",
+            run_dir.display()
+        )
+    })?;
 
     let mut out: Vec<ArtifactItem> = Vec::new();
     let specs = known_artifact_specs();
@@ -4711,10 +4853,16 @@ fn resolve_named_artifact_from_catalog(run_dir: &Path, name: &str) -> Result<Art
     Ok(hits.remove(0))
 }
 
-fn read_artifact_content_internal(run_dir: &Path, item: &ArtifactItem) -> Result<NamedArtifactView, String> {
-    let run_dir_canonical = run_dir
-        .canonicalize()
-        .map_err(|e| format!("failed to canonicalize run directory {}: {e}", run_dir.display()))?;
+fn read_artifact_content_internal(
+    run_dir: &Path,
+    item: &ArtifactItem,
+) -> Result<NamedArtifactView, String> {
+    let run_dir_canonical = run_dir.canonicalize().map_err(|e| {
+        format!(
+            "failed to canonicalize run directory {}: {e}",
+            run_dir.display()
+        )
+    })?;
     let target = run_dir_canonical.join(rel_path_to_pathbuf(&item.rel_path));
     let canonical = target
         .canonicalize()
@@ -4792,14 +4940,23 @@ fn resolve_run_dir_from_id(runtime: &RuntimeConfig, run_id: &str) -> Result<Path
     let run_component = validate_run_id_component(run_id)?;
     let candidate = runtime.out_base_dir.join(&run_component);
     if !candidate.exists() {
-        return Err(format!("run directory does not exist: {}", candidate.display()));
+        return Err(format!(
+            "run directory does not exist: {}",
+            candidate.display()
+        ));
     }
     if !candidate.is_dir() {
-        return Err(format!("run path is not a directory: {}", candidate.display()));
+        return Err(format!(
+            "run path is not a directory: {}",
+            candidate.display()
+        ));
     }
-    let canonical = candidate
-        .canonicalize()
-        .map_err(|e| format!("failed to canonicalize run directory {}: {e}", candidate.display()))?;
+    let canonical = candidate.canonicalize().map_err(|e| {
+        format!(
+            "failed to canonicalize run directory {}: {e}",
+            candidate.display()
+        )
+    })?;
     if !canonical.starts_with(&runtime.out_base_dir) {
         return Err(format!(
             "run directory is outside out_dir: {}",
@@ -4813,29 +4970,50 @@ fn pipeline_runs_dir(runtime: &RuntimeConfig) -> PathBuf {
     runtime.pipeline_root.join("logs").join("runs")
 }
 
-fn resolve_pipeline_run_dir_from_id(runtime: &RuntimeConfig, run_id: &str) -> Result<PathBuf, String> {
+fn resolve_pipeline_run_dir_from_id(
+    runtime: &RuntimeConfig,
+    run_id: &str,
+) -> Result<PathBuf, String> {
     let run_component = validate_pipeline_run_id_component(run_id)?;
     let runs_dir = pipeline_runs_dir(runtime);
     if !runs_dir.exists() {
-        return Err(format!("runs directory does not exist: {}", runs_dir.display()));
+        return Err(format!(
+            "runs directory does not exist: {}",
+            runs_dir.display()
+        ));
     }
     if !runs_dir.is_dir() {
-        return Err(format!("runs path is not a directory: {}", runs_dir.display()));
+        return Err(format!(
+            "runs path is not a directory: {}",
+            runs_dir.display()
+        ));
     }
-    let runs_dir_canonical = runs_dir
-        .canonicalize()
-        .map_err(|e| format!("failed to canonicalize runs directory {}: {e}", runs_dir.display()))?;
+    let runs_dir_canonical = runs_dir.canonicalize().map_err(|e| {
+        format!(
+            "failed to canonicalize runs directory {}: {e}",
+            runs_dir.display()
+        )
+    })?;
 
     let candidate = runs_dir.join(&run_component);
     if !candidate.exists() {
-        return Err(format!("run directory does not exist: {}", candidate.display()));
+        return Err(format!(
+            "run directory does not exist: {}",
+            candidate.display()
+        ));
     }
     if !candidate.is_dir() {
-        return Err(format!("run path is not a directory: {}", candidate.display()));
+        return Err(format!(
+            "run path is not a directory: {}",
+            candidate.display()
+        ));
     }
-    let canonical = candidate
-        .canonicalize()
-        .map_err(|e| format!("failed to canonicalize run directory {}: {e}", candidate.display()))?;
+    let canonical = candidate.canonicalize().map_err(|e| {
+        format!(
+            "failed to canonicalize run directory {}: {e}",
+            candidate.display()
+        )
+    })?;
     if !canonical.starts_with(&runs_dir_canonical) {
         return Err(format!(
             "run directory is outside runs directory: {}",
@@ -4867,8 +5045,7 @@ fn read_run_text_preview(path: &Path, max_bytes: usize) -> Result<String, String
     let file = fs::File::open(path)
         .map_err(|e| format!("failed to open artifact {}: {e}", path.display()))?;
     let mut buf = Vec::new();
-    file
-        .take((max_bytes as u64).saturating_add(1))
+    file.take((max_bytes as u64).saturating_add(1))
         .read_to_end(&mut buf)
         .map_err(|e| format!("failed to read artifact {}: {e}", path.display()))?;
 
@@ -4886,23 +5063,35 @@ fn read_run_text_preview(path: &Path, max_bytes: usize) -> Result<String, String
     Ok(out)
 }
 
-fn list_pipeline_runs_internal(runtime: &RuntimeConfig, limit: Option<u32>) -> Result<Vec<RunSummary>, String> {
+fn list_pipeline_runs_internal(
+    runtime: &RuntimeConfig,
+    limit: Option<u32>,
+) -> Result<Vec<RunSummary>, String> {
     let runs_dir = pipeline_runs_dir(runtime);
     if !runs_dir.exists() {
         return Ok(Vec::new());
     }
     if !runs_dir.is_dir() {
-        return Err(format!("runs path is not a directory: {}", runs_dir.display()));
+        return Err(format!(
+            "runs path is not a directory: {}",
+            runs_dir.display()
+        ));
     }
-    let runs_dir_canonical = runs_dir
-        .canonicalize()
-        .map_err(|e| format!("failed to canonicalize runs directory {}: {e}", runs_dir.display()))?;
+    let runs_dir_canonical = runs_dir.canonicalize().map_err(|e| {
+        format!(
+            "failed to canonicalize runs directory {}: {e}",
+            runs_dir.display()
+        )
+    })?;
 
     let max_rows = usize::try_from(limit.unwrap_or(200).clamp(1, 2000)).unwrap_or(200);
     let mut rows: Vec<(RunSummary, u64)> = Vec::new();
-    for entry in fs::read_dir(&runs_dir_canonical)
-        .map_err(|e| format!("failed to read runs directory {}: {e}", runs_dir_canonical.display()))?
-    {
+    for entry in fs::read_dir(&runs_dir_canonical).map_err(|e| {
+        format!(
+            "failed to read runs directory {}: {e}",
+            runs_dir_canonical.display()
+        )
+    })? {
         let entry = match entry {
             Ok(v) => v,
             Err(_) => continue,
@@ -4922,14 +5111,13 @@ fn list_pipeline_runs_internal(runtime: &RuntimeConfig, limit: Option<u32>) -> R
         if !canonical.starts_with(&runs_dir_canonical) {
             continue;
         }
-        let modified = fs::metadata(&canonical)
-            .and_then(|m| m.modified())
-            .ok();
+        let modified = fs::metadata(&canonical).and_then(|m| m.modified()).ok();
         let created_at = modified
             .map(to_iso_from_system_time)
             .unwrap_or_else(|| "".to_string());
         let ts = modified_epoch_ms(&canonical);
-        let (canonical_id, template_id) = parse_pipeline_run_metadata(&canonical.join("input.json"));
+        let (canonical_id, template_id) =
+            parse_pipeline_run_metadata(&canonical.join("input.json"));
         rows.push((
             RunSummary {
                 run_id,
@@ -4983,7 +5171,10 @@ fn parse_duration_seconds_from_result(path: &Path) -> Option<f64> {
     extract_duration_seconds_from_result_value(&value)
 }
 
-fn collect_run_dashboard_stats_internal(runtime: &RuntimeConfig, limit: Option<u32>) -> Result<RunDashboardStats, String> {
+fn collect_run_dashboard_stats_internal(
+    runtime: &RuntimeConfig,
+    limit: Option<u32>,
+) -> Result<RunDashboardStats, String> {
     let runs_dir = pipeline_runs_dir(runtime);
     if !runs_dir.exists() {
         return Ok(RunDashboardStats {
@@ -4995,17 +5186,26 @@ fn collect_run_dashboard_stats_internal(runtime: &RuntimeConfig, limit: Option<u
         });
     }
     if !runs_dir.is_dir() {
-        return Err(format!("runs path is not a directory: {}", runs_dir.display()));
+        return Err(format!(
+            "runs path is not a directory: {}",
+            runs_dir.display()
+        ));
     }
-    let runs_dir_canonical = runs_dir
-        .canonicalize()
-        .map_err(|e| format!("failed to canonicalize runs directory {}: {e}", runs_dir.display()))?;
+    let runs_dir_canonical = runs_dir.canonicalize().map_err(|e| {
+        format!(
+            "failed to canonicalize runs directory {}: {e}",
+            runs_dir.display()
+        )
+    })?;
 
     let max_rows = usize::try_from(limit.unwrap_or(500).clamp(1, 2000)).unwrap_or(500);
     let mut runs: Vec<(PathBuf, String, u64)> = Vec::new();
-    for entry in fs::read_dir(&runs_dir_canonical)
-        .map_err(|e| format!("failed to read runs directory {}: {e}", runs_dir_canonical.display()))?
-    {
+    for entry in fs::read_dir(&runs_dir_canonical).map_err(|e| {
+        format!(
+            "failed to read runs directory {}: {e}",
+            runs_dir_canonical.display()
+        )
+    })? {
         let entry = match entry {
             Ok(v) => v,
             Err(_) => continue,
@@ -5068,12 +5268,19 @@ fn collect_run_dashboard_stats_internal(runtime: &RuntimeConfig, limit: Option<u
     })
 }
 
-fn read_run_text_internal(runtime: &RuntimeConfig, run_id: &str, kind: &str) -> Result<String, String> {
+fn read_run_text_internal(
+    runtime: &RuntimeConfig,
+    run_id: &str,
+    kind: &str,
+) -> Result<String, String> {
     let rel = run_text_rel_path(kind)?;
     let run_dir = resolve_pipeline_run_dir_from_id(runtime, run_id)?;
     let target = run_dir.join(rel);
     if !target.exists() || !target.is_file() {
-        return Err(format!("artifact file does not exist: {}", target.display()));
+        return Err(format!(
+            "artifact file does not exist: {}",
+            target.display()
+        ));
     }
     let canonical = target
         .canonicalize()
@@ -5088,8 +5295,8 @@ fn read_run_text_internal(runtime: &RuntimeConfig, run_id: &str, kind: &str) -> 
 }
 
 fn read_text_file_tail(path: &Path, max_bytes: u64) -> Result<(String, bool), String> {
-    let mut file =
-        fs::File::open(path).map_err(|e| format!("failed to open artifact {}: {e}", path.display()))?;
+    let mut file = fs::File::open(path)
+        .map_err(|e| format!("failed to open artifact {}: {e}", path.display()))?;
     let size = file
         .metadata()
         .map_err(|e| format!("failed to stat artifact {}: {e}", path.display()))?
@@ -5118,7 +5325,10 @@ fn read_run_text_tail_internal(
     let run_dir = resolve_pipeline_run_dir_from_id(runtime, run_id)?;
     let target = run_dir.join(rel);
     if !target.exists() || !target.is_file() {
-        return Err(format!("artifact file does not exist: {}", target.display()));
+        return Err(format!(
+            "artifact file does not exist: {}",
+            target.display()
+        ));
     }
     let canonical = target
         .canonicalize()
@@ -5129,13 +5339,18 @@ fn read_run_text_tail_internal(
             canonical.display()
         ));
     }
-    let limit = max_bytes.unwrap_or(DEFAULT_RUN_TEXT_TAIL_BYTES).clamp(1, 2_000_000);
+    let limit = max_bytes
+        .unwrap_or(DEFAULT_RUN_TEXT_TAIL_BYTES)
+        .clamp(1, 2_000_000);
     let (content, truncated) = read_text_file_tail(&canonical, limit)?;
     Ok(RunTextTailView { content, truncated })
 }
 
 #[tauri::command]
-fn list_runs(limit: Option<usize>, filters: Option<RunListFilter>) -> Result<Vec<RunListItem>, String> {
+fn list_runs(
+    limit: Option<usize>,
+    filters: Option<RunListFilter>,
+) -> Result<Vec<RunListItem>, String> {
     let root = repo_root();
     let runtime = resolve_runtime_config(&root)?;
     let f = filters.unwrap_or_default();
@@ -5144,9 +5359,12 @@ fn list_runs(limit: Option<usize>, filters: Option<RunListFilter>) -> Result<Vec
     let max_rows = limit.unwrap_or(500).clamp(1, 5000);
 
     let mut entries: Vec<(PathBuf, u64)> = Vec::new();
-    for entry in fs::read_dir(&runtime.out_base_dir)
-        .map_err(|e| format!("failed to read out_dir {}: {e}", runtime.out_base_dir.display()))?
-    {
+    for entry in fs::read_dir(&runtime.out_base_dir).map_err(|e| {
+        format!(
+            "failed to read out_dir {}: {e}",
+            runtime.out_base_dir.display()
+        )
+    })? {
         let entry = match entry {
             Ok(v) => v,
             Err(_) => continue,
@@ -5161,8 +5379,14 @@ fn list_runs(limit: Option<usize>, filters: Option<RunListFilter>) -> Result<Vec
 
     entries.sort_by(|a, b| {
         b.1.cmp(&a.1).then_with(|| {
-            let an = a.0.file_name().map(|v| v.to_string_lossy().to_string()).unwrap_or_default();
-            let bn = b.0.file_name().map(|v| v.to_string_lossy().to_string()).unwrap_or_default();
+            let an =
+                a.0.file_name()
+                    .map(|v| v.to_string_lossy().to_string())
+                    .unwrap_or_default();
+            let bn =
+                b.0.file_name()
+                    .map(|v| v.to_string_lossy().to_string())
+                    .unwrap_or_default();
             an.cmp(&bn)
         })
     });
@@ -5189,7 +5413,12 @@ fn list_runs(limit: Option<usize>, filters: Option<RunListFilter>) -> Result<Vec
             continue;
         }
         if !query.is_empty() {
-            let hay = format!("{} {} {}", run_id.to_lowercase(), paper_id.to_lowercase(), status.to_lowercase());
+            let hay = format!(
+                "{} {} {}",
+                run_id.to_lowercase(),
+                paper_id.to_lowercase(),
+                status.to_lowercase()
+            );
             if !hay.contains(&query) {
                 continue;
             }
@@ -5499,11 +5728,20 @@ fn copy_diagnostic_files_with_caps(
 
         let dst = diag_dir.join(rel_path_to_pathbuf(rel));
         if let Some(parent) = dst.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("failed to create diagnostic directory {}: {e}", parent.display()))?;
+            fs::create_dir_all(parent).map_err(|e| {
+                format!(
+                    "failed to create diagnostic directory {}: {e}",
+                    parent.display()
+                )
+            })?;
         }
-        fs::copy(src, &dst)
-            .map_err(|e| format!("failed to copy diagnostic file {} -> {}: {e}", src.display(), dst.display()))?;
+        fs::copy(src, &dst).map_err(|e| {
+            format!(
+                "failed to copy diagnostic file {} -> {}: {e}",
+                src.display(),
+                dst.display()
+            )
+        })?;
 
         total = total.saturating_add(size);
         entries.push(DiagnosticFileEntry {
@@ -5523,8 +5761,17 @@ fn render_diag_report(summary: &DiagnosticSummary) -> String {
     out.push_str("# Diagnostics Report\n\n");
     out.push_str(&format!("- diag_id: {}\n", summary.diag_id));
     out.push_str(&format!("- created_at: {}\n", summary.created_at));
-    out.push_str(&format!("- app_version: {}\n", summary.app_version.clone().unwrap_or_else(|| "unknown".to_string())));
-    out.push_str(&format!("\n- os: {}\n- arch: {}\n", summary.os, summary.arch));
+    out.push_str(&format!(
+        "- app_version: {}\n",
+        summary
+            .app_version
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string())
+    ));
+    out.push_str(&format!(
+        "\n- os: {}\n- arch: {}\n",
+        summary.os, summary.arch
+    ));
     out.push_str("\n## Resolved Config\n");
     out.push_str(&format!("- out_dir: {}\n", summary.out_dir));
     out.push_str(&format!("- pipeline_root: {}\n", summary.pipeline_root));
@@ -5544,8 +5791,7 @@ fn render_diag_report(summary: &DiagnosticSummary) -> String {
     out.push_str(&format!("- runs: {}\n", summary.runs.len()));
     out.push_str(&format!(
         "- copied_bytes: {} / {}\n",
-        summary.total_included_bytes,
-        summary.max_total_bytes
+        summary.total_included_bytes, summary.max_total_bytes
     ));
 
     out.push_str("\n## Skipped Files\n");
@@ -5674,7 +5920,10 @@ fn build_manifest_and_payloads(
     let mut skipped = Vec::<ManifestSkippedEntry>::new();
     let mut redactions = Vec::<ManifestRedactionEntry>::new();
 
-    let mut rels = vec!["diag_report.md".to_string(), "diag_summary.json".to_string()];
+    let mut rels = vec![
+        "diag_report.md".to_string(),
+        "diag_summary.json".to_string(),
+    ];
     for f in &summary.files {
         if f.included {
             rels.push(f.rel_path.clone());
@@ -5682,7 +5931,10 @@ fn build_manifest_and_payloads(
             skipped.push(ManifestSkippedEntry {
                 path: f.rel_path.clone(),
                 size_bytes: f.size_bytes,
-                reason: if matches!(f.reason.as_deref(), Some("file_too_large") | Some("total_limit_exceeded")) {
+                reason: if matches!(
+                    f.reason.as_deref(),
+                    Some("file_too_large") | Some("total_limit_exceeded")
+                ) {
                     "too_large".to_string()
                 } else {
                     f.reason.clone().unwrap_or_else(|| "skipped".to_string())
@@ -5732,7 +5984,11 @@ fn build_manifest_and_payloads(
     }
 
     included.sort_by(|a, b| a.path.cmp(&b.path));
-    skipped.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.pointer_path.cmp(&b.pointer_path)));
+    skipped.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then_with(|| a.pointer_path.cmp(&b.pointer_path))
+    });
     redactions.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.rule.cmp(&b.rule)));
     redactions.dedup_by(|a, b| a.path == b.path && a.rule == b.rule);
 
@@ -5752,13 +6008,16 @@ fn write_deterministic_zip(
     zip_path: &Path,
     mut payloads: Vec<(String, Vec<u8>)>,
 ) -> Result<(), String> {
-    let file = fs::File::create(zip_path)
-        .map_err(|e| format!("failed to create diagnostic zip {}: {e}", zip_path.display()))?;
+    let file = fs::File::create(zip_path).map_err(|e| {
+        format!(
+            "failed to create diagnostic zip {}: {e}",
+            zip_path.display()
+        )
+    })?;
     let mut writer = zip::ZipWriter::new(file);
     payloads.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let fixed_ts = zip::DateTime::from_date_and_time(1980, 1, 1, 0, 0, 0)
-        .unwrap_or_default();
+    let fixed_ts = zip::DateTime::from_date_and_time(1980, 1, 1, 0, 0, 0).unwrap_or_default();
     let options = SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Stored)
         .last_modified_time(fixed_ts)
@@ -5774,9 +6033,12 @@ fn write_deterministic_zip(
             .map_err(|e| format!("failed to write file content to zip: {e}"))?;
     }
 
-    writer
-        .finish()
-        .map_err(|e| format!("failed to finalize diagnostic zip {}: {e}", zip_path.display()))?;
+    writer.finish().map_err(|e| {
+        format!(
+            "failed to finalize diagnostic zip {}: {e}",
+            zip_path.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -5822,11 +6084,17 @@ fn is_safe_archive_relpath(path: &str) -> bool {
 }
 
 fn is_allowed_workspace_entry(rel: &str) -> bool {
-    matches!(rel, "settings.json" | "jobs.json" | "pipelines.json" | "audit.jsonl" | "config.json")
-        || rel.starts_with("diag/")
+    matches!(
+        rel,
+        "settings.json" | "jobs.json" | "pipelines.json" | "audit.jsonl" | "config.json"
+    ) || rel.starts_with("diag/")
 }
 
-fn maybe_redact_text_bytes(path: &str, bytes: Vec<u8>, redact: bool) -> (Vec<u8>, Vec<WorkspaceManifestRedaction>) {
+fn maybe_redact_text_bytes(
+    path: &str,
+    bytes: Vec<u8>,
+    redact: bool,
+) -> (Vec<u8>, Vec<WorkspaceManifestRedaction>) {
     if !redact || !is_text_like_path(path) {
         return (bytes, Vec::new());
     }
@@ -5890,9 +6158,15 @@ fn encode_settings_with_schema(settings: &DesktopSettings) -> Result<String, Str
     .map_err(|e| format!("failed to serialize settings payload: {e}"))
 }
 
-fn import_value_to_current_schema(subsystem: &str, mut value: serde_json::Value) -> Result<serde_json::Value, String> {
+fn import_value_to_current_schema(
+    subsystem: &str,
+    mut value: serde_json::Value,
+) -> Result<serde_json::Value, String> {
     if !value.is_object() {
-        return Err(format!("invalid {} payload: root must be object", subsystem));
+        return Err(format!(
+            "invalid {} payload: root must be object",
+            subsystem
+        ));
     }
     let mut version = parse_schema_version(&value)?;
     if version > SCHEMA_VERSION {
@@ -5920,8 +6194,8 @@ fn import_value_to_current_schema(subsystem: &str, mut value: serde_json::Value)
 fn decode_imported_settings(bytes: &[u8]) -> Result<DesktopSettings, String> {
     let raw = String::from_utf8(bytes.to_vec())
         .map_err(|e| format!("invalid settings.json encoding: {e}"))?;
-    let value: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| format!("invalid settings.json: {e}"))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("invalid settings.json: {e}"))?;
 
     if value.get("settings").is_some() {
         let normalized = import_value_to_current_schema("settings", value)?;
@@ -5936,8 +6210,8 @@ fn decode_imported_settings(bytes: &[u8]) -> Result<DesktopSettings, String> {
 fn decode_imported_jobs(bytes: &[u8]) -> Result<Vec<JobRecord>, String> {
     let raw = String::from_utf8(bytes.to_vec())
         .map_err(|e| format!("invalid jobs.json encoding: {e}"))?;
-    let value: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| format!("invalid jobs.json: {e}"))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("invalid jobs.json: {e}"))?;
     let normalized = import_value_to_current_schema("jobs", value)?;
     let payload: JobFilePayload = serde_json::from_value(normalized)
         .map_err(|e| format!("failed to decode imported jobs payload: {e}"))?;
@@ -5947,19 +6221,21 @@ fn decode_imported_jobs(bytes: &[u8]) -> Result<Vec<JobRecord>, String> {
 fn decode_imported_pipelines(bytes: &[u8]) -> Result<Vec<PipelineRecord>, String> {
     let raw = String::from_utf8(bytes.to_vec())
         .map_err(|e| format!("invalid pipelines.json encoding: {e}"))?;
-    let value: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| format!("invalid pipelines.json: {e}"))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("invalid pipelines.json: {e}"))?;
     let normalized = import_value_to_current_schema("pipelines", value)?;
     let payload: PipelineFilePayload = serde_json::from_value(normalized)
         .map_err(|e| format!("failed to decode imported pipelines payload: {e}"))?;
     Ok(payload.pipelines)
 }
 
-fn decode_imported_config_root(bytes: &[u8]) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+fn decode_imported_config_root(
+    bytes: &[u8],
+) -> Result<serde_json::Map<String, serde_json::Value>, String> {
     let raw = String::from_utf8(bytes.to_vec())
         .map_err(|e| format!("invalid config.json encoding: {e}"))?;
-    let value: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| format!("invalid config.json: {e}"))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("invalid config.json: {e}"))?;
     let obj = value
         .as_object()
         .ok_or_else(|| "invalid config.json: root must be an object".to_string())?;
@@ -5974,9 +6250,15 @@ fn decode_imported_config_root(bytes: &[u8]) -> Result<serde_json::Map<String, s
         S2_API_KEY: obj
             .get("S2_API_KEY")
             .and_then(|v| v.as_str().map(|s| s.to_string())),
-        S2_MIN_INTERVAL_MS: parse_u64_field_from_json(obj.get("S2_MIN_INTERVAL_MS"), "S2_MIN_INTERVAL_MS")?,
+        S2_MIN_INTERVAL_MS: parse_u64_field_from_json(
+            obj.get("S2_MIN_INTERVAL_MS"),
+            "S2_MIN_INTERVAL_MS",
+        )?,
         S2_MAX_RETRIES: parse_u32_field_from_json(obj.get("S2_MAX_RETRIES"), "S2_MAX_RETRIES")?,
-        S2_BACKOFF_BASE_SEC: parse_f64_field_from_json(obj.get("S2_BACKOFF_BASE_SEC"), "S2_BACKOFF_BASE_SEC")?,
+        S2_BACKOFF_BASE_SEC: parse_f64_field_from_json(
+            obj.get("S2_BACKOFF_BASE_SEC"),
+            "S2_BACKOFF_BASE_SEC",
+        )?,
     };
 
     Ok(obj.clone())
@@ -5994,15 +6276,15 @@ fn merge_settings_keep_current(
     let cur_v = serde_json::to_value(current).unwrap_or_else(|_| serde_json::json!({}));
     let imp_v = serde_json::to_value(imported).unwrap_or_else(|_| serde_json::json!({}));
     let mut merged = cur_v.clone();
-    if let (Some(cur_obj), Some(imp_obj), Some(dst_obj)) = (
-        cur_v.as_object(),
-        imp_v.as_object(),
-        merged.as_object_mut(),
-    ) {
+    if let (Some(cur_obj), Some(imp_obj), Some(dst_obj)) =
+        (cur_v.as_object(), imp_v.as_object(), merged.as_object_mut())
+    {
         for (k, v) in imp_obj {
             if let Some(cv) = cur_obj.get(k) {
                 if cv != v {
-                    warnings.push(format!("settings conflict on key `{k}`: keep current value"));
+                    warnings.push(format!(
+                        "settings conflict on key `{k}`: keep current value"
+                    ));
                 }
             } else {
                 dst_obj.insert(k.clone(), v.clone());
@@ -6020,15 +6302,15 @@ fn merge_settings_keep_imported(
     let cur_v = serde_json::to_value(current).unwrap_or_else(|_| serde_json::json!({}));
     let imp_v = serde_json::to_value(imported).unwrap_or_else(|_| serde_json::json!({}));
     let mut merged = cur_v.clone();
-    if let (Some(cur_obj), Some(imp_obj), Some(dst_obj)) = (
-        cur_v.as_object(),
-        imp_v.as_object(),
-        merged.as_object_mut(),
-    ) {
+    if let (Some(cur_obj), Some(imp_obj), Some(dst_obj)) =
+        (cur_v.as_object(), imp_v.as_object(), merged.as_object_mut())
+    {
         for (k, v) in imp_obj {
             if let Some(cv) = cur_obj.get(k) {
                 if cv != v {
-                    warnings.push(format!("settings conflict on key `{k}`: keep imported value"));
+                    warnings.push(format!(
+                        "settings conflict on key `{k}`: keep imported value"
+                    ));
                 }
             }
             dst_obj.insert(k.clone(), v.clone());
@@ -6104,7 +6386,11 @@ fn merge_config_keep_imported(
     merged
 }
 
-fn merge_jobs_keep_newest(current: &[JobRecord], imported: &[JobRecord], warnings: &mut Vec<String>) -> Vec<JobRecord> {
+fn merge_jobs_keep_newest(
+    current: &[JobRecord],
+    imported: &[JobRecord],
+    warnings: &mut Vec<String>,
+) -> Vec<JobRecord> {
     let mut map = std::collections::BTreeMap::<String, JobRecord>::new();
     for j in current {
         map.insert(j.job_id.clone(), j.clone());
@@ -6112,11 +6398,16 @@ fn merge_jobs_keep_newest(current: &[JobRecord], imported: &[JobRecord], warning
     for j in imported {
         if let Some(existing) = map.get(&j.job_id) {
             if serde_json::to_string(existing).ok() != serde_json::to_string(j).ok() {
-                let keep_imported = parse_updated_epoch_ms(&j.updated_at) > parse_updated_epoch_ms(&existing.updated_at);
+                let keep_imported = parse_updated_epoch_ms(&j.updated_at)
+                    > parse_updated_epoch_ms(&existing.updated_at);
                 warnings.push(format!(
                     "jobs collision id={} -> keep {}",
                     j.job_id,
-                    if keep_imported { "imported(newer)" } else { "current" }
+                    if keep_imported {
+                        "imported(newer)"
+                    } else {
+                        "current"
+                    }
                 ));
                 if keep_imported {
                     map.insert(j.job_id.clone(), j.clone());
@@ -6143,11 +6434,16 @@ fn merge_pipelines_keep_newest(
     for p in imported {
         if let Some(existing) = map.get(&p.pipeline_id) {
             if serde_json::to_string(existing).ok() != serde_json::to_string(p).ok() {
-                let keep_imported = parse_updated_epoch_ms(&p.updated_at) > parse_updated_epoch_ms(&existing.updated_at);
+                let keep_imported = parse_updated_epoch_ms(&p.updated_at)
+                    > parse_updated_epoch_ms(&existing.updated_at);
                 warnings.push(format!(
                     "pipelines collision id={} -> keep {}",
                     p.pipeline_id,
-                    if keep_imported { "imported(newer)" } else { "current" }
+                    if keep_imported {
+                        "imported(newer)"
+                    } else {
+                        "current"
+                    }
                 ));
                 if keep_imported {
                     map.insert(p.pipeline_id.clone(), p.clone());
@@ -6158,24 +6454,26 @@ fn merge_pipelines_keep_newest(
         }
     }
     let mut out = map.into_values().collect::<Vec<_>>();
-    out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then_with(|| a.pipeline_id.cmp(&b.pipeline_id)));
+    out.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| a.pipeline_id.cmp(&b.pipeline_id))
+    });
     out
 }
 
-fn apply_workspace_text_files_atomically(
-    files: &[(PathBuf, String)],
-) -> Result<(), String> {
+fn apply_workspace_text_files_atomically(files: &[(PathBuf, String)]) -> Result<(), String> {
     let originals = files
         .iter()
         .map(|(path, _)| {
-            let old = if path.exists() {
-                Some(
-                    fs::read_to_string(path)
-                        .map_err(|e| format!("failed to read existing file {}: {e}", path.display()))?,
-                )
-            } else {
-                None
-            };
+            let old =
+                if path.exists() {
+                    Some(fs::read_to_string(path).map_err(|e| {
+                        format!("failed to read existing file {}: {e}", path.display())
+                    })?)
+                } else {
+                    None
+                };
             Ok((path.clone(), old))
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -6238,7 +6536,11 @@ fn render_workspace_import_report(
     out
 }
 
-fn list_workspace_history(base_dir: &Path, zip_name: &str, report_name: &str) -> Vec<WorkspaceHistoryItem> {
+fn list_workspace_history(
+    base_dir: &Path,
+    zip_name: &str,
+    report_name: &str,
+) -> Vec<WorkspaceHistoryItem> {
     let mut out = Vec::new();
     let rd = match fs::read_dir(base_dir) {
         Ok(v) => v,
@@ -6269,7 +6571,11 @@ fn list_workspace_history(base_dir: &Path, zip_name: &str, report_name: &str) ->
             } else {
                 None
             },
-            report_path: if report.exists() { Some(report.to_string_lossy().to_string()) } else { None },
+            report_path: if report.exists() {
+                Some(report.to_string_lossy().to_string())
+            } else {
+                None
+            },
         });
     }
     out.sort_by(|a, b| b.id.cmp(&a.id));
@@ -6287,8 +6593,12 @@ fn export_workspace_internal(
     let redact = options.redact.unwrap_or(true);
 
     let state_root = workspace_state_root(&runtime.out_base_dir);
-    fs::create_dir_all(&state_root)
-        .map_err(|e| format!("failed to create workspace state root {}: {e}", state_root.display()))?;
+    fs::create_dir_all(&state_root).map_err(|e| {
+        format!(
+            "failed to create workspace state root {}: {e}",
+            state_root.display()
+        )
+    })?;
 
     let export_id = make_workspace_transfer_id();
     let export_dir = workspace_exports_root(&runtime.out_base_dir).join(&export_id);
@@ -6302,9 +6612,18 @@ fn export_workspace_internal(
     let mut total: u64 = 0;
 
     let mut candidates = vec![
-        (settings_file_path(&runtime.out_base_dir), ".jarvis-desktop/settings.json".to_string()),
-        (jobs_file_path(&runtime.out_base_dir), ".jarvis-desktop/jobs.json".to_string()),
-        (pipelines_file_path(&runtime.out_base_dir), ".jarvis-desktop/pipelines.json".to_string()),
+        (
+            settings_file_path(&runtime.out_base_dir),
+            ".jarvis-desktop/settings.json".to_string(),
+        ),
+        (
+            jobs_file_path(&runtime.out_base_dir),
+            ".jarvis-desktop/jobs.json".to_string(),
+        ),
+        (
+            pipelines_file_path(&runtime.out_base_dir),
+            ".jarvis-desktop/pipelines.json".to_string(),
+        ),
     ];
     let config_path = config_file_path();
     if config_path.exists() && config_path.is_file() {
@@ -6388,7 +6707,10 @@ fn export_workspace_internal(
     let manifest_text = serde_json::to_string_pretty(&manifest)
         .map_err(|e| format!("failed to serialize export manifest: {e}"))?;
     atomic_write_text(&manifest_path, &manifest_text)?;
-    payloads.push(("export_manifest.json".to_string(), manifest_text.into_bytes()));
+    payloads.push((
+        "export_manifest.json".to_string(),
+        manifest_text.into_bytes(),
+    ));
 
     let report_path = export_dir.join("export_report.md");
     let report_text = render_workspace_export_report(&manifest);
@@ -6428,8 +6750,12 @@ fn import_workspace_internal(
     let import_id = make_workspace_transfer_id();
     let import_dir = workspace_imports_root(&runtime.out_base_dir).join(&import_id);
     let staging_dir = import_dir.join("staging");
-    fs::create_dir_all(&staging_dir)
-        .map_err(|e| format!("failed to create import staging dir {}: {e}", staging_dir.display()))?;
+    fs::create_dir_all(&staging_dir).map_err(|e| {
+        format!(
+            "failed to create import staging dir {}: {e}",
+            staging_dir.display()
+        )
+    })?;
 
     let mut warnings = Vec::<String>::new();
     warnings.push(format!("mode applied: {}", mode.as_str()));
@@ -6446,7 +6772,8 @@ fn import_workspace_internal(
     let mut imported_config: Option<serde_json::Map<String, serde_json::Value>> = None;
 
     for idx in 0..archive.len() {
-        let mut entry = archive.by_index(idx)
+        let mut entry = archive
+            .by_index(idx)
             .map_err(|e| format!("failed to read zip entry at index {idx}: {e}"))?;
         if entry.is_dir() {
             continue;
@@ -6470,7 +6797,9 @@ fn import_workspace_internal(
 
         let entry_size = entry.size();
         if entry_size > DIAG_MAX_FILE_BYTES {
-            return Err(format!("import rejected (file too large): {name} ({entry_size} bytes)"));
+            return Err(format!(
+                "import rejected (file too large): {name} ({entry_size} bytes)"
+            ));
         }
         if total.saturating_add(entry_size) > DIAG_MAX_TOTAL_BYTES {
             return Err("import rejected (total extracted size exceeds limit)".to_string());
@@ -6484,8 +6813,12 @@ fn import_workspace_internal(
 
         let dst = staging_dir.join(rel_path_to_pathbuf(&rel));
         if let Some(parent) = dst.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("failed to create staging directory {}: {e}", parent.display()))?;
+            fs::create_dir_all(parent).map_err(|e| {
+                format!(
+                    "failed to create staging directory {}: {e}",
+                    parent.display()
+                )
+            })?;
         }
         fs::write(&dst, &bytes)
             .map_err(|e| format!("failed to write staging file {}: {e}", dst.display()))?;
@@ -6503,16 +6836,14 @@ fn import_workspace_internal(
             "audit.jsonl" => {
                 imported_audit = Some(String::from_utf8(bytes).unwrap_or_default());
             }
-            "config.json" => {
-                match decode_imported_config_root(&bytes) {
-                    Ok(cfg) => {
-                        imported_config = Some(cfg);
-                    }
-                    Err(e) => {
-                        warnings.push(format!("ignored invalid config.json: {e}"));
-                    }
+            "config.json" => match decode_imported_config_root(&bytes) {
+                Ok(cfg) => {
+                    imported_config = Some(cfg);
                 }
-            }
+                Err(e) => {
+                    warnings.push(format!("ignored invalid config.json: {e}"));
+                }
+            },
             _ => {}
         }
     }
@@ -6520,7 +6851,8 @@ fn import_workspace_internal(
     let current_settings = load_settings(&runtime.out_base_dir)?;
     let current_jobs = load_jobs_from_file(&jobs_file_path(&runtime.out_base_dir))?;
     let current_pipelines = load_pipelines_from_file(&pipelines_file_path(&runtime.out_base_dir))?;
-    let current_audit = fs::read_to_string(audit_jsonl_path(&runtime.out_base_dir)).unwrap_or_default();
+    let current_audit =
+        fs::read_to_string(audit_jsonl_path(&runtime.out_base_dir)).unwrap_or_default();
     let current_config_path = config_file_path();
     let current_config_opt = read_config_json_root(&current_config_path)?;
     let current_config = current_config_opt.clone().unwrap_or_default();
@@ -6542,7 +6874,10 @@ fn import_workspace_internal(
         final_config_opt = match imported_config_sanitized {
             Some(c) if !c.is_empty() => Some(c),
             Some(_) => {
-                warnings.push("replace mode: imported config has no valid keys; keep current config".to_string());
+                warnings.push(
+                    "replace mode: imported config has no valid keys; keep current config"
+                        .to_string(),
+                );
                 current_config_opt.clone()
             }
             None => current_config_opt.clone(),
@@ -6612,8 +6947,12 @@ fn import_workspace_internal(
     if !dry_run {
         if mode == ImportConflictMode::Replace {
             let backup_dir = workspace_backups_root(&runtime.out_base_dir).join(&import_id);
-            fs::create_dir_all(&backup_dir)
-                .map_err(|e| format!("failed to create backup directory {}: {e}", backup_dir.display()))?;
+            fs::create_dir_all(&backup_dir).map_err(|e| {
+                format!(
+                    "failed to create backup directory {}: {e}",
+                    backup_dir.display()
+                )
+            })?;
             for path in [
                 settings_file_path(&runtime.out_base_dir),
                 jobs_file_path(&runtime.out_base_dir),
@@ -6641,7 +6980,8 @@ fn import_workspace_internal(
         applied = true;
     }
 
-    let report = render_workspace_import_report(&import_id, mode.as_str(), dry_run, applied, &warnings);
+    let report =
+        render_workspace_import_report(&import_id, mode.as_str(), dry_run, applied, &warnings);
     atomic_write_text(&report_path, &report)?;
 
     Ok(ImportWorkspaceResult {
@@ -6789,13 +7129,21 @@ fn collect_diagnostics_internal(
     let include_zip = options.include_zip.unwrap_or(true);
 
     let diag_root = diagnostics_root(&runtime.out_base_dir);
-    fs::create_dir_all(&diag_root)
-        .map_err(|e| format!("failed to create diagnostics root {}: {e}", diag_root.display()))?;
+    fs::create_dir_all(&diag_root).map_err(|e| {
+        format!(
+            "failed to create diagnostics root {}: {e}",
+            diag_root.display()
+        )
+    })?;
 
     let diag_id = make_diag_id();
     let diag_dir = diag_root.join(&diag_id);
-    fs::create_dir_all(&diag_dir)
-        .map_err(|e| format!("failed to create diagnostic dir {}: {e}", diag_dir.display()))?;
+    fs::create_dir_all(&diag_dir).map_err(|e| {
+        format!(
+            "failed to create diagnostic dir {}: {e}",
+            diag_dir.display()
+        )
+    })?;
 
     let mut jobs = load_jobs_from_file(&jobs_file_path(&runtime.out_base_dir))?;
     sort_jobs_for_display(&mut jobs);
@@ -6815,7 +7163,11 @@ fn collect_diagnostics_internal(
         .collect::<Vec<_>>();
 
     let mut pipelines = load_pipelines_from_file(&pipelines_file_path(&runtime.out_base_dir))?;
-    pipelines.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then_with(|| a.pipeline_id.cmp(&b.pipeline_id)));
+    pipelines.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| a.pipeline_id.cmp(&b.pipeline_id))
+    });
     if pipelines.len() > DIAG_MAX_RECENT_ITEMS {
         pipelines.truncate(DIAG_MAX_RECENT_ITEMS);
     }
@@ -6836,10 +7188,17 @@ fn collect_diagnostics_internal(
     } else {
         Vec::new()
     };
-    run_rows.sort_by(|a, b| b.mtime_epoch_ms.cmp(&a.mtime_epoch_ms).then_with(|| a.run_id.cmp(&b.run_id)));
+    run_rows.sort_by(|a, b| {
+        b.mtime_epoch_ms
+            .cmp(&a.mtime_epoch_ms)
+            .then_with(|| a.run_id.cmp(&b.run_id))
+    });
 
     let audit_tail = if include_audit {
-        read_tail_lines(&audit_jsonl_path(&runtime.out_base_dir), DIAG_AUDIT_TAIL_LINES)
+        read_tail_lines(
+            &audit_jsonl_path(&runtime.out_base_dir),
+            DIAG_AUDIT_TAIL_LINES,
+        )
     } else {
         Vec::new()
     };
@@ -6915,7 +7274,9 @@ fn collect_diagnostics_internal(
 }
 
 #[tauri::command]
-fn collect_diagnostics(opts: Option<DiagnosticsCollectOptions>) -> Result<DiagnosticsCollectResult, String> {
+fn collect_diagnostics(
+    opts: Option<DiagnosticsCollectOptions>,
+) -> Result<DiagnosticsCollectResult, String> {
     let root = repo_root();
     let runtime = resolve_runtime_config(&root)?;
     collect_diagnostics_internal(&root, &runtime, opts.unwrap_or_default())
@@ -6931,9 +7292,12 @@ fn list_diagnostics() -> Result<Vec<DiagnosticListItem>, String> {
     }
 
     let mut out = Vec::new();
-    for entry in fs::read_dir(&diag_root)
-        .map_err(|e| format!("failed to read diagnostics root {}: {e}", diag_root.display()))?
-    {
+    for entry in fs::read_dir(&diag_root).map_err(|e| {
+        format!(
+            "failed to read diagnostics root {}: {e}",
+            diag_root.display()
+        )
+    })? {
         let entry = match entry {
             Ok(v) => v,
             Err(_) => continue,
@@ -6964,7 +7328,11 @@ fn list_diagnostics() -> Result<Vec<DiagnosticListItem>, String> {
         });
     }
 
-    out.sort_by(|a, b| b.diag_id.cmp(&a.diag_id).then_with(|| a.created_at.cmp(&b.created_at)));
+    out.sort_by(|a, b| {
+        b.diag_id
+            .cmp(&a.diag_id)
+            .then_with(|| a.created_at.cmp(&b.created_at))
+    });
     Ok(out)
 }
 
@@ -6979,14 +7347,21 @@ fn read_diagnostic_report(diag_id: String) -> Result<String, String> {
     if !target.exists() {
         return Err(format!("diagnostic report not found: {}", target.display()));
     }
-    let canonical = target
-        .canonicalize()
-        .map_err(|e| format!("failed to canonicalize diagnostic report {}: {e}", target.display()))?;
+    let canonical = target.canonicalize().map_err(|e| {
+        format!(
+            "failed to canonicalize diagnostic report {}: {e}",
+            target.display()
+        )
+    })?;
     if !canonical.starts_with(&root_canonical) {
         return Err("diagnostic report path is outside diagnostics root".to_string());
     }
-    fs::read_to_string(&canonical)
-        .map_err(|e| format!("failed to read diagnostic report {}: {e}", canonical.display()))
+    fs::read_to_string(&canonical).map_err(|e| {
+        format!(
+            "failed to read diagnostic report {}: {e}",
+            canonical.display()
+        )
+    })
 }
 
 #[tauri::command]
@@ -7019,9 +7394,12 @@ fn open_diagnostic_zip(diag_id: String) -> Result<String, String> {
     if !zip.exists() || !zip.is_file() {
         return Err(format!("diagnostic zip not found: {}", zip.display()));
     }
-    let canonical = zip
-        .canonicalize()
-        .map_err(|e| format!("failed to canonicalize diagnostic zip {}: {e}", zip.display()))?;
+    let canonical = zip.canonicalize().map_err(|e| {
+        format!(
+            "failed to canonicalize diagnostic zip {}: {e}",
+            zip.display()
+        )
+    })?;
     if !canonical.starts_with(&root_canonical) {
         return Err("diagnostic zip is outside diagnostics root".to_string());
     }
@@ -7066,16 +7444,27 @@ fn create_diagnostic_zip(diag_id: String) -> Result<DiagnosticsCollectResult, St
     let report_path = diag_dir.join("diag_report.md");
     let summary_path = diag_dir.join("diag_summary.json");
     if !diag_dir.exists() || !diag_dir.is_dir() {
-        return Err(format!("diagnostic folder not found: {}", diag_dir.display()));
+        return Err(format!(
+            "diagnostic folder not found: {}",
+            diag_dir.display()
+        ));
     }
     if !report_path.exists() || !summary_path.exists() {
         return Err("diagnostic report or summary is missing".to_string());
     }
 
-    let summary_raw = fs::read_to_string(&summary_path)
-        .map_err(|e| format!("failed to read diagnostic summary {}: {e}", summary_path.display()))?;
-    let mut summary: DiagnosticSummary = serde_json::from_str(&summary_raw)
-        .map_err(|e| format!("failed to parse diagnostic summary {}: {e}", summary_path.display()))?;
+    let summary_raw = fs::read_to_string(&summary_path).map_err(|e| {
+        format!(
+            "failed to read diagnostic summary {}: {e}",
+            summary_path.display()
+        )
+    })?;
+    let mut summary: DiagnosticSummary = serde_json::from_str(&summary_raw).map_err(|e| {
+        format!(
+            "failed to parse diagnostic summary {}: {e}",
+            summary_path.display()
+        )
+    })?;
 
     let zip_path = diag_dir.join("bundle.zip");
     summary.zip_path = Some(zip_path.to_string_lossy().to_string());
@@ -7249,7 +7638,10 @@ fn merge_desktop_input_metadata(
             "arch": std::env::consts::ARCH,
         }),
     );
-    desktop_obj.insert("invoked_at".to_string(), serde_json::json!(Utc::now().to_rfc3339()));
+    desktop_obj.insert(
+        "invoked_at".to_string(),
+        serde_json::json!(Utc::now().to_rfc3339()),
+    );
     desktop_obj.insert("source".to_string(), serde_json::json!("jarvis-desktop"));
     if let Some(pv) = primary_viz {
         desktop_obj.insert(
@@ -7446,7 +7838,9 @@ fn validate_template_inputs_internal(
     let obj = match params.as_object() {
         Some(v) => v,
         None => {
-            result.invalid.push("params must be a JSON object".to_string());
+            result
+                .invalid
+                .push("params must be a JSON object".to_string());
             result.ok = false;
             return result;
         }
@@ -7487,30 +7881,35 @@ fn validate_template_inputs_internal(
                 continue;
             }
 
-            let expected_type = spec.get("type").and_then(|v| v.as_str()).unwrap_or("string");
+            let expected_type = spec
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("string");
             let valid_type = match expected_type {
-                "integer" => value
-                    .as_i64()
-                    .is_some()
-                    || value
-                        .as_str()
-                        .and_then(|s| s.trim().parse::<i64>().ok())
-                        .is_some(),
-                "number" => value
-                    .as_f64()
-                    .is_some()
-                    || value
-                        .as_str()
-                        .and_then(|s| s.trim().parse::<f64>().ok())
-                        .is_some(),
-                "boolean" => value.as_bool().is_some()
-                    || value
-                        .as_str()
-                        .map(|s| {
-                            let lowered = s.trim().to_ascii_lowercase();
-                            lowered == "true" || lowered == "false"
-                        })
-                        .unwrap_or(false),
+                "integer" => {
+                    value.as_i64().is_some()
+                        || value
+                            .as_str()
+                            .and_then(|s| s.trim().parse::<i64>().ok())
+                            .is_some()
+                }
+                "number" => {
+                    value.as_f64().is_some()
+                        || value
+                            .as_str()
+                            .and_then(|s| s.trim().parse::<f64>().ok())
+                            .is_some()
+                }
+                "boolean" => {
+                    value.as_bool().is_some()
+                        || value
+                            .as_str()
+                            .map(|s| {
+                                let lowered = s.trim().to_ascii_lowercase();
+                                lowered == "true" || lowered == "false"
+                            })
+                            .unwrap_or(false)
+                }
                 "string" => value.as_str().is_some(),
                 "array" => value.as_array().is_some(),
                 "object" => value.as_object().is_some(),
@@ -7525,17 +7924,20 @@ fn validate_template_inputs_internal(
 
             if let Some(enum_values) = spec.get("enum").and_then(|v| v.as_array()) {
                 if !enum_values.contains(value) {
-                    result.invalid.push(format!("{key}: must be one of enum values"));
+                    result
+                        .invalid
+                        .push(format!("{key}: must be one of enum values"));
                     continue;
                 }
             }
 
             if expected_type == "integer" || expected_type == "number" {
                 let numeric = if expected_type == "integer" {
-                    value
-                        .as_i64()
-                        .map(|v| v as f64)
-                        .or_else(|| value.as_str().and_then(|s| s.trim().parse::<i64>().ok().map(|v| v as f64)))
+                    value.as_i64().map(|v| v as f64).or_else(|| {
+                        value
+                            .as_str()
+                            .and_then(|s| s.trim().parse::<i64>().ok().map(|v| v as f64))
+                    })
                 } else {
                     value
                         .as_f64()
@@ -7632,14 +8034,18 @@ fn enqueue_job_internal(
     canonical_id: String,
     params: serde_json::Value,
 ) -> Result<String, String> {
-    let tpl = find_template(&template_id).ok_or_else(|| format!("unknown template id: {template_id}"))?;
+    let tpl =
+        find_template(&template_id).ok_or_else(|| format!("unknown template id: {template_id}"))?;
     if !tpl.wired {
         return Err(format!("template not wired: {}", tpl.id));
     }
 
     let normalized = normalize_identifier_internal(&canonical_id);
     if !normalized.errors.is_empty() {
-        return Err(format!("invalid canonical_id: {}", normalized.errors.join("; ")));
+        return Err(format!(
+            "invalid canonical_id: {}",
+            normalized.errors.join("; ")
+        ));
     }
 
     let job_id = format!("job_{}_{}", now_epoch_ms(), make_run_id());
@@ -7728,7 +8134,8 @@ fn cancel_job(job_id: String) -> Result<JobRecord, String> {
     }
     persist_state(&state, &jobs_path)?;
     if let Ok((runtime, _)) = runtime_and_jobs_path() {
-        let _ = reconcile_pipelines_with_jobs(&runtime.out_base_dir, &state, &jobs_path, Some(&job_id));
+        let _ =
+            reconcile_pipelines_with_jobs(&runtime.out_base_dir, &state, &jobs_path, Some(&job_id));
     }
     Ok(updated)
 }
@@ -7757,7 +8164,10 @@ fn retry_job(job_id: String, force: Option<bool>) -> Result<JobRecord, String> {
             if let Some(retry_at) = guard.jobs[idx].retry_at.as_ref() {
                 if let Ok(ts) = retry_at.parse::<u128>() {
                     if now_epoch_ms() < ts {
-                        return Err("retry window has not started yet; pass force=true to override".to_string());
+                        return Err(
+                            "retry window has not started yet; pass force=true to override"
+                                .to_string(),
+                        );
                     }
                 }
             }
@@ -7772,7 +8182,8 @@ fn retry_job(job_id: String, force: Option<bool>) -> Result<JobRecord, String> {
     }
     persist_state(&state, &jobs_path)?;
     if let Ok((runtime, _)) = runtime_and_jobs_path() {
-        let _ = reconcile_pipelines_with_jobs(&runtime.out_base_dir, &state, &jobs_path, Some(&job_id));
+        let _ =
+            reconcile_pipelines_with_jobs(&runtime.out_base_dir, &state, &jobs_path, Some(&job_id));
     }
     start_job_worker_if_needed()?;
     Ok(updated)
@@ -7788,7 +8199,9 @@ fn clear_finished_jobs() -> Result<usize, String> {
             .map_err(|_| "failed to lock job runtime".to_string())?;
         let before = guard.jobs.len();
         guard.jobs.retain(|j| {
-            !(j.status == JobStatus::Succeeded || j.status == JobStatus::Failed || j.status == JobStatus::Canceled)
+            !(j.status == JobStatus::Succeeded
+                || j.status == JobStatus::Failed
+                || j.status == JobStatus::Canceled)
         });
         removed = before.saturating_sub(guard.jobs.len());
     }
@@ -7960,7 +8373,10 @@ fn create_pipeline(
 
     let normalized = normalize_identifier_internal(&canonical_id);
     if !normalized.errors.is_empty() {
-        return Err(format!("invalid canonical_id: {}", normalized.errors.join("; ")));
+        return Err(format!(
+            "invalid canonical_id: {}",
+            normalized.errors.join("; ")
+        ));
     }
     let canonical = normalized.canonical;
 
@@ -8048,7 +8464,11 @@ fn list_pipelines(filters: Option<PipelineListFilter>) -> Result<Vec<PipelineSum
         });
     }
 
-    out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then_with(|| a.pipeline_id.cmp(&b.pipeline_id)));
+    out.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| a.pipeline_id.cmp(&b.pipeline_id))
+    });
     Ok(out)
 }
 
@@ -8197,7 +8617,8 @@ fn update_settings(settings: DesktopSettings) -> Result<DesktopSettings, String>
     }
 
     let (runtime, _) = runtime_and_jobs_path()?;
-    settings.pipeline_repo.remote_url = validate_pipeline_repo_url(&settings.pipeline_repo.remote_url)?;
+    settings.pipeline_repo.remote_url =
+        validate_pipeline_repo_url(&settings.pipeline_repo.remote_url)?;
     settings.pipeline_repo.git_ref = validate_pipeline_repo_ref(&settings.pipeline_repo.git_ref)?;
     let local_path = validate_pipeline_repo_local_path(
         &settings.pipeline_repo.local_path,
@@ -8223,8 +8644,7 @@ fn run_pipeline_repo_update_internal(
     if normalize_remote_url(&remote_stdout) != normalize_remote_url(&settings.remote_url) {
         return Err(format!(
             "RULE_PIPELINE_REPO_REMOTE_MISMATCH: origin remote mismatch. expected={} actual={}",
-            settings.remote_url,
-            remote_stdout
+            settings.remote_url, remote_stdout
         ));
     }
 
@@ -8249,9 +8669,7 @@ fn run_pipeline_repo_update_internal(
 
     let stdout = format!(
         "remote={}\n{}\n{}",
-        remote_stdout,
-        fetch_stdout,
-        pull_stdout
+        remote_stdout, fetch_stdout, pull_stdout
     )
     .trim()
     .to_string();
@@ -8265,7 +8683,9 @@ fn run_pipeline_repo_update_internal(
 }
 
 #[tauri::command]
-fn update_pipeline_repo_settings(update: PipelineRepoSettingsUpdate) -> Result<DesktopSettings, String> {
+fn update_pipeline_repo_settings(
+    update: PipelineRepoSettingsUpdate,
+) -> Result<DesktopSettings, String> {
     let (runtime, _) = runtime_and_jobs_path()?;
     let mut settings = load_settings(&runtime.out_base_dir)?;
     settings.pipeline_repo.remote_url = validate_pipeline_repo_url(&update.remote_url)?;
@@ -8280,7 +8700,10 @@ fn update_pipeline_repo_settings(update: PipelineRepoSettingsUpdate) -> Result<D
 fn get_pipeline_repo_status() -> Result<PipelineRepoStatus, String> {
     let (runtime, _) = runtime_and_jobs_path()?;
     let settings = load_settings(&runtime.out_base_dir)?;
-    let local_path = validate_pipeline_repo_local_path(&settings.pipeline_repo.local_path, &runtime.out_base_dir)?;
+    let local_path = validate_pipeline_repo_local_path(
+        &settings.pipeline_repo.local_path,
+        &runtime.out_base_dir,
+    )?;
 
     let exists = local_path.exists();
     let mut is_git_repo = false;
@@ -8348,16 +8771,39 @@ fn validate_pipeline_repo() -> Result<PipelineRepoValidateResult, String> {
     let mut checks = Vec::new();
 
     match validate_pipeline_repo_url(&settings.pipeline_repo.remote_url) {
-        Ok(_) => checks.push(preflight_item("pipeline_repo_remote_url", true, "remote_url OK".to_string(), "")),
-        Err(e) => checks.push(preflight_item("pipeline_repo_remote_url", false, e, "Use https:// remote URL.")),
+        Ok(_) => checks.push(preflight_item(
+            "pipeline_repo_remote_url",
+            true,
+            "remote_url OK".to_string(),
+            "",
+        )),
+        Err(e) => checks.push(preflight_item(
+            "pipeline_repo_remote_url",
+            false,
+            e,
+            "Use https:// remote URL.",
+        )),
     }
 
     match validate_pipeline_repo_ref(&settings.pipeline_repo.git_ref) {
-        Ok(_) => checks.push(preflight_item("pipeline_repo_ref", true, "git_ref OK".to_string(), "")),
-        Err(e) => checks.push(preflight_item("pipeline_repo_ref", false, e, "Use branch/ref with [A-Za-z0-9._/-].")),
+        Ok(_) => checks.push(preflight_item(
+            "pipeline_repo_ref",
+            true,
+            "git_ref OK".to_string(),
+            "",
+        )),
+        Err(e) => checks.push(preflight_item(
+            "pipeline_repo_ref",
+            false,
+            e,
+            "Use branch/ref with [A-Za-z0-9._/-].",
+        )),
     }
 
-    match validate_pipeline_repo_local_path(&settings.pipeline_repo.local_path, &runtime.out_base_dir) {
+    match validate_pipeline_repo_local_path(
+        &settings.pipeline_repo.local_path,
+        &runtime.out_base_dir,
+    ) {
         Ok(local_path) => {
             checks.push(preflight_item(
                 "pipeline_repo_local_path",
@@ -8398,16 +8844,24 @@ fn validate_pipeline_repo() -> Result<PipelineRepoValidateResult, String> {
 fn bootstrap_pipeline_repo() -> Result<PipelineRepoStatus, String> {
     let (runtime, _) = runtime_and_jobs_path()?;
     let mut settings = load_settings(&runtime.out_base_dir)?;
-    settings.pipeline_repo.remote_url = validate_pipeline_repo_url(&settings.pipeline_repo.remote_url)?;
+    settings.pipeline_repo.remote_url =
+        validate_pipeline_repo_url(&settings.pipeline_repo.remote_url)?;
     settings.pipeline_repo.git_ref = validate_pipeline_repo_ref(&settings.pipeline_repo.git_ref)?;
-    let local_path = validate_pipeline_repo_local_path(&settings.pipeline_repo.local_path, &runtime.out_base_dir)?;
+    let local_path = validate_pipeline_repo_local_path(
+        &settings.pipeline_repo.local_path,
+        &runtime.out_base_dir,
+    )?;
 
     let action_result = (|| -> Result<String, String> {
         let _ = run_git_capture(&["--version".to_string()])?;
         if !local_path.exists() {
             if let Some(parent) = local_path.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|e| format!("failed to create parent directory {}: {e}", parent.display()))?;
+                fs::create_dir_all(parent).map_err(|e| {
+                    format!(
+                        "failed to create parent directory {}: {e}",
+                        parent.display()
+                    )
+                })?;
             }
             let clone_args = vec![
                 "clone".to_string(),
@@ -8470,28 +8924,34 @@ fn bootstrap_pipeline_repo_stream(window: tauri::Window) -> Result<PipelineRepoS
 
         let mut settings = load_settings(&runtime.out_base_dir)?;
         emit_bootstrap_log(&window, "[bootstrap] settings loaded");
-        settings.pipeline_repo.remote_url = validate_pipeline_repo_url(&settings.pipeline_repo.remote_url)?;
-        settings.pipeline_repo.git_ref = validate_pipeline_repo_ref(&settings.pipeline_repo.git_ref)?;
-        let local_path = validate_pipeline_repo_local_path(&settings.pipeline_repo.local_path, &runtime.out_base_dir)?;
+        settings.pipeline_repo.remote_url =
+            validate_pipeline_repo_url(&settings.pipeline_repo.remote_url)?;
+        settings.pipeline_repo.git_ref =
+            validate_pipeline_repo_ref(&settings.pipeline_repo.git_ref)?;
+        let local_path = validate_pipeline_repo_local_path(
+            &settings.pipeline_repo.local_path,
+            &runtime.out_base_dir,
+        )?;
         emit_bootstrap_log(
             &window,
             &format!("[bootstrap] local_path={}", local_path.display()),
         );
 
         let action_result = (|| -> Result<String, String> {
-            let _ = run_git_capture_with_logging(
-                &window,
-                "git --version",
-                &["--version".to_string()],
-            )?;
+            let _ =
+                run_git_capture_with_logging(&window, "git --version", &["--version".to_string()])?;
             if !local_path.exists() {
                 if let Some(parent) = local_path.parent() {
                     emit_bootstrap_log(
                         &window,
                         &format!("[bootstrap] creating parent dir: {}", parent.display()),
                     );
-                    fs::create_dir_all(parent)
-                        .map_err(|e| format!("failed to create parent directory {}: {e}", parent.display()))?;
+                    fs::create_dir_all(parent).map_err(|e| {
+                        format!(
+                            "failed to create parent directory {}: {e}",
+                            parent.display()
+                        )
+                    })?;
                 }
                 let clone_args = vec![
                     "clone".to_string(),
@@ -8502,7 +8962,8 @@ fn bootstrap_pipeline_repo_stream(window: tauri::Window) -> Result<PipelineRepoS
                     settings.pipeline_repo.remote_url.clone(),
                     local_path.to_string_lossy().to_string(),
                 ];
-                let (stdout, stderr) = run_git_capture_with_logging(&window, "git clone", &clone_args)?;
+                let (stdout, stderr) =
+                    run_git_capture_with_logging(&window, "git clone", &clone_args)?;
                 return Ok([stdout, stderr].join("\n").trim().to_string());
             }
 
@@ -8568,9 +9029,13 @@ fn bootstrap_pipeline_repo_stream(window: tauri::Window) -> Result<PipelineRepoS
 fn update_pipeline_repo() -> Result<PipelineRepoStatus, String> {
     let (runtime, _) = runtime_and_jobs_path()?;
     let mut settings = load_settings(&runtime.out_base_dir)?;
-    settings.pipeline_repo.remote_url = validate_pipeline_repo_url(&settings.pipeline_repo.remote_url)?;
+    settings.pipeline_repo.remote_url =
+        validate_pipeline_repo_url(&settings.pipeline_repo.remote_url)?;
     settings.pipeline_repo.git_ref = validate_pipeline_repo_ref(&settings.pipeline_repo.git_ref)?;
-    let local_path = validate_pipeline_repo_local_path(&settings.pipeline_repo.local_path, &runtime.out_base_dir)?;
+    let local_path = validate_pipeline_repo_local_path(
+        &settings.pipeline_repo.local_path,
+        &runtime.out_base_dir,
+    )?;
     if !local_path.exists() {
         return Err(format!(
             "RULE_PIPELINE_REPO_NOT_FOUND: local path does not exist: {}",
@@ -8609,9 +9074,15 @@ fn update_pipeline_repo() -> Result<PipelineRepoStatus, String> {
 fn open_pipeline_repo_folder() -> Result<String, String> {
     let (runtime, _) = runtime_and_jobs_path()?;
     let settings = load_settings(&runtime.out_base_dir)?;
-    let local_path = validate_pipeline_repo_local_path(&settings.pipeline_repo.local_path, &runtime.out_base_dir)?;
+    let local_path = validate_pipeline_repo_local_path(
+        &settings.pipeline_repo.local_path,
+        &runtime.out_base_dir,
+    )?;
     if !local_path.exists() {
-        return Err(format!("pipeline repo path not found: {}", local_path.display()));
+        return Err(format!(
+            "pipeline repo path not found: {}",
+            local_path.display()
+        ));
     }
     let canonical = canonicalize_existing_dir(&local_path, "RULE_PIPELINE_REPO_OPEN_INVALID")?;
 
@@ -8701,7 +9172,10 @@ fn tick_auto_retry() -> Result<AutoRetryTickResult, String> {
 
             let mut pipeline_ref: Option<(String, String, usize)> = None;
             for (pidx, p) in pipelines.iter().enumerate() {
-                let step = p.steps.iter().find(|s| s.job_id.as_deref() == Some(job.job_id.as_str()));
+                let step = p
+                    .steps
+                    .iter()
+                    .find(|s| s.job_id.as_deref() == Some(job.job_id.as_str()));
                 if let Some(s) = step {
                     if p.auto_retry_attempt_count < settings.auto_retry_max_per_pipeline {
                         pipeline_ref = Some((p.pipeline_id.clone(), s.step_id.clone(), pidx));
@@ -8711,7 +9185,8 @@ fn tick_auto_retry() -> Result<AutoRetryTickResult, String> {
             }
 
             if let Some((_, _, pidx)) = pipeline_ref.as_ref() {
-                if pipelines[*pidx].auto_retry_attempt_count >= settings.auto_retry_max_per_pipeline {
+                if pipelines[*pidx].auto_retry_attempt_count >= settings.auto_retry_max_per_pipeline
+                {
                     continue;
                 }
             }
@@ -8741,7 +9216,8 @@ fn tick_auto_retry() -> Result<AutoRetryTickResult, String> {
         let _ = retry_pipeline_step(pipeline_id.clone(), step_id, Some(false))?;
         pipeline_id_for_audit = Some(pipeline_id.clone());
         if pidx < pipelines.len() {
-            pipelines[pidx].auto_retry_attempt_count = pipelines[pidx].auto_retry_attempt_count.saturating_add(1);
+            pipelines[pidx].auto_retry_attempt_count =
+                pipelines[pidx].auto_retry_attempt_count.saturating_add(1);
             pipelines[pidx].updated_at = now_epoch_ms_string();
             save_pipelines_to_file(&pipelines_path, &pipelines)?;
         }
@@ -8822,7 +9298,8 @@ fn run_task_template(
         };
     }
 
-    let (argv, normalized_params) = match build_template_args(&template_id, &canonical_id, &params) {
+    let (argv, normalized_params) = match build_template_args(&template_id, &canonical_id, &params)
+    {
         Ok(v) => v,
         Err(e) => {
             return RunResult {
@@ -9089,11 +9566,15 @@ fn set_config_out_dir(out_dir: String) -> RuntimeConfigView {
     }
 
     let candidate = PathBuf::from(trimmed);
-    if candidate
-        .components()
-        .all(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir))
-    {
-        return runtime_config_view_from_result(Err("selected out_dir is invalid: path traversal only".to_string()));
+    if candidate.components().all(|c| {
+        matches!(
+            c,
+            std::path::Component::ParentDir | std::path::Component::CurDir
+        )
+    }) {
+        return runtime_config_view_from_result(Err(
+            "selected out_dir is invalid: path traversal only".to_string(),
+        ));
     }
 
     let runtime = match resolve_runtime_config(&root) {
@@ -9176,14 +9657,8 @@ fn maybe_run_smoke_template_tree_cli() -> Option<i32> {
         .get(2)
         .cloned()
         .unwrap_or_else(|| "arxiv:1706.03762".to_string());
-    let depth = args
-        .get(3)
-        .and_then(|s| s.parse::<u8>().ok())
-        .unwrap_or(1);
-    let max_per_level = args
-        .get(4)
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(5);
+    let depth = args.get(3).and_then(|s| s.parse::<u8>().ok()).unwrap_or(1);
+    let max_per_level = args.get(4).and_then(|s| s.parse::<u32>().ok()).unwrap_or(5);
 
     let result = run_task_template(
         "TEMPLATE_TREE".to_string(),
@@ -9294,8 +9769,7 @@ mod tests {
 
     fn config_file_test_guard() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK
-            .get_or_init(|| Mutex::new(()))
+        LOCK.get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|e| e.into_inner())
     }
@@ -9323,23 +9797,30 @@ mod tests {
 
         let _ = fs::create_dir_all(pipeline_file.join("jarvis_core"));
         let _ = fs::create_dir_all(pipeline_env.join("jarvis_core"));
-        fs::write(pipeline_file.join("pyproject.toml"), "[tool.poetry]").expect("write file pyproject");
+        fs::write(pipeline_file.join("pyproject.toml"), "[tool.poetry]")
+            .expect("write file pyproject");
         fs::write(pipeline_file.join("jarvis_cli.py"), "print('ok')").expect("write file cli");
-        fs::write(pipeline_env.join("pyproject.toml"), "[tool.poetry]").expect("write env pyproject");
+        fs::write(pipeline_env.join("pyproject.toml"), "[tool.poetry]")
+            .expect("write env pyproject");
         fs::write(pipeline_env.join("jarvis_cli.py"), "print('ok')").expect("write env cli");
 
         let config_path = base.join("config.json");
         let config_text = format!(
             "{{\n  \"JARVIS_PIPELINE_ROOT\": {}\n}}\n",
-            serde_json::to_string(&pipeline_file.to_string_lossy().to_string()).expect("serialize path")
+            serde_json::to_string(&pipeline_file.to_string_lossy().to_string())
+                .expect("serialize path")
         );
         fs::write(&config_path, config_text).expect("write config");
 
         unsafe {
-            std::env::set_var("JARVIS_PIPELINE_ROOT", pipeline_env.to_string_lossy().to_string());
+            std::env::set_var(
+                "JARVIS_PIPELINE_ROOT",
+                pipeline_env.to_string_lossy().to_string(),
+            );
         }
 
-        let resolved = resolve_runtime_config_with_config_path(&base, &config_path).expect("resolve runtime config");
+        let resolved = resolve_runtime_config_with_config_path(&base, &config_path)
+            .expect("resolve runtime config");
         assert_eq!(resolved.pipeline_root, canonical_or_self(&pipeline_file));
 
         unsafe {
@@ -9364,12 +9845,14 @@ mod tests {
         let config_path = base.join("config.json");
         let config_text = format!(
             "{{\n  \"JARVIS_PIPELINE_ROOT\": {},\n  \"JARVIS_PIPELINE_OUT_DIR\": {}\n}}\n",
-            serde_json::to_string(&pipeline_root.to_string_lossy().to_string()).expect("serialize root"),
+            serde_json::to_string(&pipeline_root.to_string_lossy().to_string())
+                .expect("serialize root"),
             serde_json::to_string(out_dir_rel).expect("serialize out dir")
         );
         fs::write(&config_path, config_text).expect("write config");
 
-        let resolved = resolve_runtime_config_with_config_path(&base, &config_path).expect("resolve runtime config");
+        let resolved = resolve_runtime_config_with_config_path(&base, &config_path)
+            .expect("resolve runtime config");
         assert_eq!(resolved.out_base_dir, canonical_or_self(&expected_out));
 
         let _ = fs::remove_dir_all(&base);
@@ -9377,9 +9860,14 @@ mod tests {
 
     #[test]
     fn pipeline_repo_url_rejects_non_https() {
-        assert!(validate_pipeline_repo_url("git@github.com:kaneko-ai/jarvis-ml-pipeline.git").is_err());
+        assert!(
+            validate_pipeline_repo_url("git@github.com:kaneko-ai/jarvis-ml-pipeline.git").is_err()
+        );
         assert!(validate_pipeline_repo_url("http://example.com/repo.git").is_err());
-        assert!(validate_pipeline_repo_url("https://github.com/kaneko-ai/jarvis-ml-pipeline.git").is_ok());
+        assert!(
+            validate_pipeline_repo_url("https://github.com/kaneko-ai/jarvis-ml-pipeline.git")
+                .is_ok()
+        );
     }
 
     #[test]
@@ -9540,7 +10028,10 @@ mod tests {
             .find(|t| t.id == "TEMPLATE_TREE")
             .expect("TEMPLATE_TREE missing");
         assert!(tree.required_fields.is_none());
-        let schema = tree.params_schema.as_ref().expect("tree params_schema missing");
+        let schema = tree
+            .params_schema
+            .as_ref()
+            .expect("tree params_schema missing");
         assert_eq!(schema.get("type"), Some(&serde_json::json!("object")));
         let properties = schema
             .get("properties")
@@ -9647,7 +10138,8 @@ mod tests {
         assert!(!missing.ok);
         assert_eq!(missing.missing, vec!["depth".to_string()]);
 
-        let invalid = validate_template_inputs_internal(&template, &serde_json::json!({"depth": "x"}));
+        let invalid =
+            validate_template_inputs_internal(&template, &serde_json::json!({"depth": "x"}));
         assert!(!invalid.ok);
         assert!(invalid.invalid.iter().any(|v| v.contains("depth")));
     }
@@ -9702,7 +10194,8 @@ mod tests {
             })),
         };
 
-        let invalid = validate_template_inputs_internal(&template, &serde_json::json!({"mode": "turbo"}));
+        let invalid =
+            validate_template_inputs_internal(&template, &serde_json::json!({"mode": "turbo"}));
         assert!(!invalid.ok);
         assert!(invalid.invalid.iter().any(|v| v.contains("mode")));
     }
@@ -9730,8 +10223,9 @@ mod tests {
     #[test]
     fn template_build_args_are_deterministic() {
         let params = serde_json::json!({ "depth": 1, "max_per_level": 5 });
-        let (argv, normalized_params) = build_template_args("TEMPLATE_TREE", "arxiv:1706.03762", &params)
-            .expect("build args failed");
+        let (argv, normalized_params) =
+            build_template_args("TEMPLATE_TREE", "arxiv:1706.03762", &params)
+                .expect("build args failed");
 
         let expected = vec![
             "papers".to_string(),
@@ -9767,7 +10261,10 @@ mod tests {
                 "12".to_string(),
             ]
         );
-        assert_eq!(related_normalized, serde_json::json!({"depth": 2, "max_per_level": 12}));
+        assert_eq!(
+            related_normalized,
+            serde_json::json!({"depth": 2, "max_per_level": 12})
+        );
 
         let map_params = serde_json::json!({ "k": 22, "seed": 7 });
         let (map_argv, map_normalized) =
@@ -9863,13 +10360,30 @@ mod tests {
         )
         .expect("merge input metadata");
 
-        let updated_raw = fs::read_to_string(run_dir.join("input.json")).expect("read merged input");
-        let updated: serde_json::Value = serde_json::from_str(&updated_raw).expect("parse merged input");
+        let updated_raw =
+            fs::read_to_string(run_dir.join("input.json")).expect("read merged input");
+        let updated: serde_json::Value =
+            serde_json::from_str(&updated_raw).expect("parse merged input");
         assert_eq!(updated.get("title"), Some(&serde_json::json!("A")));
-        assert_eq!(updated.get("request").and_then(|v| v.get("id")), Some(&serde_json::json!("x")));
-        assert_eq!(updated.get("desktop").and_then(|v| v.get("custom")), Some(&serde_json::json!("keep")));
-        assert_eq!(updated.get("desktop").and_then(|v| v.get("template_id")), Some(&serde_json::json!("TEMPLATE_MAP")));
-        assert_eq!(updated.get("desktop").and_then(|v| v.get("primary_viz")).and_then(|v| v.get("kind")), Some(&serde_json::json!("html")));
+        assert_eq!(
+            updated.get("request").and_then(|v| v.get("id")),
+            Some(&serde_json::json!("x"))
+        );
+        assert_eq!(
+            updated.get("desktop").and_then(|v| v.get("custom")),
+            Some(&serde_json::json!("keep"))
+        );
+        assert_eq!(
+            updated.get("desktop").and_then(|v| v.get("template_id")),
+            Some(&serde_json::json!("TEMPLATE_MAP"))
+        );
+        assert_eq!(
+            updated
+                .get("desktop")
+                .and_then(|v| v.get("primary_viz"))
+                .and_then(|v| v.get("kind")),
+            Some(&serde_json::json!("html"))
+        );
 
         let _ = fs::remove_dir_all(&base);
     }
@@ -9890,13 +10404,30 @@ mod tests {
         )
         .expect("inject desktop metadata");
 
-        let updated_raw = fs::read_to_string(run_dir.join("input.json")).expect("read merged input");
-        let updated: serde_json::Value = serde_json::from_str(&updated_raw).expect("parse merged input");
+        let updated_raw =
+            fs::read_to_string(run_dir.join("input.json")).expect("read merged input");
+        let updated: serde_json::Value =
+            serde_json::from_str(&updated_raw).expect("parse merged input");
         assert_eq!(updated.get("title"), Some(&serde_json::json!("A")));
-        assert_eq!(updated.get("desktop").and_then(|v| v.get("template_id")), Some(&serde_json::json!("TEMPLATE_TREE")));
-        assert_eq!(updated.get("desktop").and_then(|v| v.get("canonical_id")), Some(&serde_json::json!("arxiv:1706.03762")));
-        assert_eq!(updated.get("desktop").and_then(|v| v.get("source")), Some(&serde_json::json!("jarvis-desktop")));
-        assert_eq!(updated.get("desktop").and_then(|v| v.get("desktop_app")).and_then(|v| v.get("version")), Some(&serde_json::json!(env!("CARGO_PKG_VERSION"))));
+        assert_eq!(
+            updated.get("desktop").and_then(|v| v.get("template_id")),
+            Some(&serde_json::json!("TEMPLATE_TREE"))
+        );
+        assert_eq!(
+            updated.get("desktop").and_then(|v| v.get("canonical_id")),
+            Some(&serde_json::json!("arxiv:1706.03762"))
+        );
+        assert_eq!(
+            updated.get("desktop").and_then(|v| v.get("source")),
+            Some(&serde_json::json!("jarvis-desktop"))
+        );
+        assert_eq!(
+            updated
+                .get("desktop")
+                .and_then(|v| v.get("desktop_app"))
+                .and_then(|v| v.get("version")),
+            Some(&serde_json::json!(env!("CARGO_PKG_VERSION")))
+        );
 
         let _ = fs::remove_dir_all(&base);
     }
@@ -10033,8 +10564,11 @@ mod tests {
             r#"{"desktop":{"canonical_id":"arxiv:1706.03762","template_id":"TEMPLATE_TREE"},"title":"A"}"#,
         )
         .expect("write input run1");
-        fs::write(run1.join("result.json"), r#"{"status":"succeeded","year":2017}"#)
-            .expect("write result run1");
+        fs::write(
+            run1.join("result.json"),
+            r#"{"status":"succeeded","year":2017}"#,
+        )
+        .expect("write result run1");
 
         let run2 = base.join("run_b");
         let _ = fs::create_dir_all(&run2);
@@ -10070,7 +10604,8 @@ mod tests {
             r#"{"desktop":{"canonical_id":"arxiv:1706.03762","template_id":"TEMPLATE_TREE"}}"#,
         )
         .expect("write run2 input");
-        fs::write(run2.join("result.json"), r#"{"status":"succeeded"}"#).expect("write run2 result");
+        fs::write(run2.join("result.json"), r#"{"status":"succeeded"}"#)
+            .expect("write run2 result");
 
         let r1 = build_library_records(&base, &[]).expect("build first");
         let r2 = build_library_records(&base, &[]).expect("build second");
@@ -10108,7 +10643,10 @@ mod tests {
         write_library_records(&out_dir, &loaded).expect("write updated library");
 
         let reloaded = read_library_records(&out_dir).expect("reload updated library");
-        assert_eq!(reloaded[0].tags, vec!["tag1".to_string(), "tag2".to_string()]);
+        assert_eq!(
+            reloaded[0].tags,
+            vec!["tag1".to_string(), "tag2".to_string()]
+        );
 
         let _ = fs::remove_dir_all(&out_dir);
     }
@@ -10147,32 +10685,39 @@ mod tests {
     #[test]
     fn library_search_tokenization_trims_and_lowers() {
         let tokens = tokenize_query("  DOI:10.1000/XYZ   failed ");
-        assert_eq!(tokens, vec!["doi:10.1000/xyz".to_string(), "failed".to_string()]);
+        assert_eq!(
+            tokens,
+            vec!["doi:10.1000/xyz".to_string(), "failed".to_string()]
+        );
     }
 
     #[test]
     fn list_run_artifacts_returns_safe_relative_paths() {
         let run_dir = std::env::temp_dir().join(format!("jarvis_artifacts_{}", now_epoch_ms()));
         let _ = fs::create_dir_all(run_dir.join("paper_graph").join("tree"));
-        fs::write(run_dir.join("paper_graph").join("tree").join("tree.md"), "# tree")
-            .expect("write tree");
-        fs::write(run_dir.join("result.json"), "{}")
-            .expect("write result");
+        fs::write(
+            run_dir.join("paper_graph").join("tree").join("tree.md"),
+            "# tree",
+        )
+        .expect("write tree");
+        fs::write(run_dir.join("result.json"), "{}").expect("write result");
 
         let items = list_run_artifacts_internal(&run_dir).expect("list artifacts");
         assert!(items.iter().any(|a| a.name == "tree.md"));
         assert!(items.iter().all(|a| !a.rel_path.starts_with("..")));
-        assert!(items.iter().all(|a| !PathBuf::from(&a.rel_path).is_absolute()));
+        assert!(items
+            .iter()
+            .all(|a| !PathBuf::from(&a.rel_path).is_absolute()));
 
         let _ = fs::remove_dir_all(&run_dir);
     }
 
     #[test]
     fn artifact_name_rejects_traversal_patterns() {
-        let run_dir = std::env::temp_dir().join(format!("jarvis_artifacts_bad_name_{}", now_epoch_ms()));
+        let run_dir =
+            std::env::temp_dir().join(format!("jarvis_artifacts_bad_name_{}", now_epoch_ms()));
         let _ = fs::create_dir_all(&run_dir);
-        fs::write(run_dir.join("result.json"), "{}")
-            .expect("write result");
+        fs::write(run_dir.join("result.json"), "{}").expect("write result");
 
         let bad = resolve_named_artifact_from_catalog(&run_dir, "../result.json");
         assert!(bad.is_err());
@@ -10202,7 +10747,9 @@ mod tests {
         let _ = fs::create_dir_all(&run_dir);
         fs::write(run_dir.join("input.json"), r#"{"ok":true}"#).expect("write input");
 
-        let err = read_run_text_internal(&runtime, run_id, "unknown").err().unwrap_or_default();
+        let err = read_run_text_internal(&runtime, run_id, "unknown")
+            .err()
+            .unwrap_or_default();
         assert!(err.contains("unsupported kind"));
 
         let _ = fs::remove_dir_all(&base);
@@ -10213,11 +10760,17 @@ mod tests {
         let base = std::env::temp_dir().join(format!("jarvis_run_text_id_{}", now_epoch_ms()));
         let runtime = build_test_runtime(&base);
 
-        let err_parent = read_run_text_internal(&runtime, "..", "input").err().unwrap_or_default();
+        let err_parent = read_run_text_internal(&runtime, "..", "input")
+            .err()
+            .unwrap_or_default();
         assert!(err_parent.contains("run_id"));
-        let err_slash = read_run_text_internal(&runtime, "a/b", "input").err().unwrap_or_default();
+        let err_slash = read_run_text_internal(&runtime, "a/b", "input")
+            .err()
+            .unwrap_or_default();
         assert!(err_slash.contains("run_id"));
-        let err_backslash = read_run_text_internal(&runtime, "a\\b", "input").err().unwrap_or_default();
+        let err_backslash = read_run_text_internal(&runtime, "a\\b", "input")
+            .err()
+            .unwrap_or_default();
         assert!(err_backslash.contains("run_id"));
 
         let _ = fs::remove_dir_all(&base);
@@ -10229,7 +10782,11 @@ mod tests {
         let runtime = build_test_runtime(&base);
 
         let run_large = "20260218_130000_deadbeef";
-        let run_large_dir = runtime.pipeline_root.join("logs").join("runs").join(run_large);
+        let run_large_dir = runtime
+            .pipeline_root
+            .join("logs")
+            .join("runs")
+            .join(run_large);
         let _ = fs::create_dir_all(&run_large_dir);
         fs::write(
             run_large_dir.join("result.json"),
@@ -10243,7 +10800,11 @@ mod tests {
         assert!(tail.content.ends_with("line-5\n"));
 
         let run_small = "20260218_130100_deadbeef";
-        let run_small_dir = runtime.pipeline_root.join("logs").join("runs").join(run_small);
+        let run_small_dir = runtime
+            .pipeline_root
+            .join("logs")
+            .join("runs")
+            .join(run_small);
         let _ = fs::create_dir_all(&run_small_dir);
         fs::write(run_small_dir.join("result.json"), "ok\n").expect("write small result");
 
@@ -10275,7 +10836,10 @@ mod tests {
         .expect("write tree");
 
         let rows = list_pipeline_runs_internal(&runtime, Some(50)).expect("list pipeline runs");
-        let row = rows.iter().find(|r| r.run_id == run_id).expect("run row not found");
+        let row = rows
+            .iter()
+            .find(|r| r.run_id == run_id)
+            .expect("run row not found");
         assert_eq!(row.status, "success");
         assert_eq!(row.canonical_id.as_deref(), Some("arxiv:1706.03762"));
         assert_eq!(row.template_id.as_deref(), Some("TEMPLATE_TREE"));
@@ -10350,7 +10914,8 @@ mod tests {
 
     #[test]
     fn run_dashboard_stats_aggregate_math_is_correct() {
-        let base = std::env::temp_dir().join(format!("jarvis_run_dashboard_stats_{}", now_epoch_ms()));
+        let base =
+            std::env::temp_dir().join(format!("jarvis_run_dashboard_stats_{}", now_epoch_ms()));
         let runtime = build_test_runtime(&base);
         let runs_dir = runtime.pipeline_root.join("logs").join("runs");
         let _ = fs::create_dir_all(&runs_dir);
@@ -10361,11 +10926,20 @@ mod tests {
         let _ = fs::create_dir_all(&run_a);
         let _ = fs::create_dir_all(&run_b);
         let _ = fs::create_dir_all(&run_c);
-        fs::write(run_a.join("result.json"), r#"{"status":"succeeded","duration_sec":10}"#).expect("write run_a result");
-        fs::write(run_b.join("result.json"), r#"{"status":"failed","elapsed_ms":4000}"#).expect("write run_b result");
+        fs::write(
+            run_a.join("result.json"),
+            r#"{"status":"succeeded","duration_sec":10}"#,
+        )
+        .expect("write run_a result");
+        fs::write(
+            run_b.join("result.json"),
+            r#"{"status":"failed","elapsed_ms":4000}"#,
+        )
+        .expect("write run_b result");
         fs::write(run_c.join("result.json"), r#"{"status":"ok"}"#).expect("write run_c result");
 
-        let stats = collect_run_dashboard_stats_internal(&runtime, Some(50)).expect("collect stats");
+        let stats =
+            collect_run_dashboard_stats_internal(&runtime, Some(50)).expect("collect stats");
         assert_eq!(stats.total_runs, 3);
         assert_eq!(stats.success_runs, 2);
         assert!((stats.success_rate_pct - (200.0 / 3.0)).abs() < 1e-9);
@@ -10377,7 +10951,8 @@ mod tests {
 
     #[test]
     fn run_dashboard_stats_handles_missing_or_invalid_result_deterministically() {
-        let base = std::env::temp_dir().join(format!("jarvis_run_dashboard_stats_det_{}", now_epoch_ms()));
+        let base =
+            std::env::temp_dir().join(format!("jarvis_run_dashboard_stats_det_{}", now_epoch_ms()));
         let runtime = build_test_runtime(&base);
         let runs_dir = runtime.pipeline_root.join("logs").join("runs");
         let _ = fs::create_dir_all(&runs_dir);
@@ -10387,9 +10962,14 @@ mod tests {
         let _ = fs::create_dir_all(&run_invalid);
         fs::write(run_invalid.join("result.json"), "not json").expect("write invalid result");
 
-        let first = collect_run_dashboard_stats_internal(&runtime, Some(50)).expect("collect first");
-        let second = collect_run_dashboard_stats_internal(&runtime, Some(50)).expect("collect second");
-        assert_eq!(serde_json::to_string(&first).expect("ser first"), serde_json::to_string(&second).expect("ser second"));
+        let first =
+            collect_run_dashboard_stats_internal(&runtime, Some(50)).expect("collect first");
+        let second =
+            collect_run_dashboard_stats_internal(&runtime, Some(50)).expect("collect second");
+        assert_eq!(
+            serde_json::to_string(&first).expect("ser first"),
+            serde_json::to_string(&second).expect("ser second")
+        );
         assert_eq!(first.total_runs, 2);
         assert_eq!(first.success_runs, 0);
         assert_eq!(first.duration_sample_count, 0);
@@ -10400,14 +10980,16 @@ mod tests {
 
     #[test]
     fn artifact_catalog_order_is_deterministic() {
-        let run_dir = std::env::temp_dir().join(format!("jarvis_artifacts_order_{}", now_epoch_ms()));
+        let run_dir =
+            std::env::temp_dir().join(format!("jarvis_artifacts_order_{}", now_epoch_ms()));
         let _ = fs::create_dir_all(run_dir.join("paper_graph").join("tree"));
-        fs::write(run_dir.join("paper_graph").join("tree").join("tree.md"), "# tree")
-            .expect("write tree");
-        fs::write(run_dir.join("a.json"), "{}")
-            .expect("write a json");
-        fs::write(run_dir.join("z.log"), "ok")
-            .expect("write z log");
+        fs::write(
+            run_dir.join("paper_graph").join("tree").join("tree.md"),
+            "# tree",
+        )
+        .expect("write tree");
+        fs::write(run_dir.join("a.json"), "{}").expect("write a json");
+        fs::write(run_dir.join("z.log"), "ok").expect("write z log");
 
         let first = list_run_artifacts_internal(&run_dir).expect("list first");
         let second = list_run_artifacts_internal(&run_dir).expect("list second");
@@ -10420,7 +11002,8 @@ mod tests {
 
     #[test]
     fn artifact_size_limit_returns_truncated_message() {
-        let run_dir = std::env::temp_dir().join(format!("jarvis_artifacts_size_{}", now_epoch_ms()));
+        let run_dir =
+            std::env::temp_dir().join(format!("jarvis_artifacts_size_{}", now_epoch_ms()));
         let _ = fs::create_dir_all(&run_dir);
         let big = "A".repeat((MAX_ARTIFACT_READ_BYTES + 1024) as usize);
         fs::write(run_dir.join("stdout.log"), big).expect("write big log");
@@ -10441,7 +11024,8 @@ mod tests {
 
     #[test]
     fn classify_graph_json_by_name_and_structure() {
-        let run_dir = std::env::temp_dir().join(format!("jarvis_artifacts_graph_kind_{}", now_epoch_ms()));
+        let run_dir =
+            std::env::temp_dir().join(format!("jarvis_artifacts_graph_kind_{}", now_epoch_ms()));
         let _ = fs::create_dir_all(&run_dir);
 
         let named = run_dir.join("my_graph_payload.json");
@@ -10465,10 +11049,14 @@ mod tests {
         assert!(safe.to_lowercase().contains("content-security-policy"));
         assert!(!safe.to_lowercase().contains("<script"));
         assert!(warnings.iter().any(|w| w.contains("scripts were removed")));
-        assert!(warnings.iter().any(|w| w.contains("external refs detected")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("external refs detected")));
     }
 
-    fn degree_map_for_test(edges: &[GraphEdgeNormalized]) -> std::collections::BTreeMap<String, usize> {
+    fn degree_map_for_test(
+        edges: &[GraphEdgeNormalized],
+    ) -> std::collections::BTreeMap<String, usize> {
         let mut out = std::collections::BTreeMap::new();
         for e in edges {
             *out.entry(e.source.clone()).or_insert(0) += 1;
@@ -10602,7 +11190,8 @@ mod tests {
         };
         save_pipelines_to_file(&pipelines_file_path(&out_dir), &[pipeline]).expect("save pipeline");
 
-        let first = reconcile_pipelines_with_jobs(&out_dir, &state, &jobs_path, None).expect("reconcile first");
+        let first = reconcile_pipelines_with_jobs(&out_dir, &state, &jobs_path, None)
+            .expect("reconcile first");
         let first_job_id = first[0].steps[0].job_id.clone().expect("step1 job id");
         let mut jobs = load_jobs_from_file(&jobs_path).expect("load jobs after first reconcile");
         assert_eq!(jobs.len(), 1);
@@ -10610,8 +11199,9 @@ mod tests {
         jobs[0].run_id = Some("run_success_step1".to_string());
         save_jobs_to_file(&jobs_path, &jobs).expect("save succeeded job");
 
-        let second = reconcile_pipelines_with_jobs(&out_dir, &state, &jobs_path, Some(&first_job_id))
-            .expect("reconcile second");
+        let second =
+            reconcile_pipelines_with_jobs(&out_dir, &state, &jobs_path, Some(&first_job_id))
+                .expect("reconcile second");
         assert_eq!(second[0].steps[0].status, PipelineStepStatus::Succeeded);
         assert_eq!(second[0].current_step_index, 1);
         assert_eq!(second[0].steps[1].status, PipelineStepStatus::Running);
@@ -10724,11 +11314,13 @@ mod tests {
         };
         save_pipelines_to_file(&pipelines_file_path(&out_dir), &[pipeline]).expect("save pipeline");
 
-        let _ = reconcile_pipelines_with_jobs(&out_dir, &state, &jobs_path, None).expect("first resume");
+        let _ = reconcile_pipelines_with_jobs(&out_dir, &state, &jobs_path, None)
+            .expect("first resume");
         let jobs_first = load_jobs_from_file(&jobs_path).expect("load jobs after first");
         assert_eq!(jobs_first.len(), 1);
 
-        let _ = reconcile_pipelines_with_jobs(&out_dir, &state, &jobs_path, None).expect("second resume");
+        let _ = reconcile_pipelines_with_jobs(&out_dir, &state, &jobs_path, None)
+            .expect("second resume");
         let jobs_second = load_jobs_from_file(&jobs_path).expect("load jobs after second");
         assert_eq!(jobs_second.len(), 1);
 
@@ -10804,10 +11396,18 @@ mod tests {
         assert!(!is_needs_attention_job_status(&JobStatus::Canceled));
 
         assert!(is_needs_attention_pipeline_status(&PipelineStatus::Failed));
-        assert!(is_needs_attention_pipeline_status(&PipelineStatus::NeedsRetry));
-        assert!(!is_needs_attention_pipeline_status(&PipelineStatus::Running));
-        assert!(!is_needs_attention_pipeline_status(&PipelineStatus::Succeeded));
-        assert!(!is_needs_attention_pipeline_status(&PipelineStatus::Canceled));
+        assert!(is_needs_attention_pipeline_status(
+            &PipelineStatus::NeedsRetry
+        ));
+        assert!(!is_needs_attention_pipeline_status(
+            &PipelineStatus::Running
+        ));
+        assert!(!is_needs_attention_pipeline_status(
+            &PipelineStatus::Succeeded
+        ));
+        assert!(!is_needs_attention_pipeline_status(
+            &PipelineStatus::Canceled
+        ));
     }
 
     #[test]
@@ -11001,12 +11601,18 @@ mod tests {
 
         let run_dir = out_dir.join("run_1");
         let _ = fs::create_dir_all(run_dir.join("paper_graph").join("tree"));
-        fs::write(run_dir.join("input.json"), r#"{"desktop":{"canonical_id":"arxiv:1706.03762"}}"#)
-            .expect("write input");
+        fs::write(
+            run_dir.join("input.json"),
+            r#"{"desktop":{"canonical_id":"arxiv:1706.03762"}}"#,
+        )
+        .expect("write input");
         fs::write(run_dir.join("result.json"), r#"{"status":"needs_retry"}"#)
             .expect("write result");
-        fs::write(run_dir.join("paper_graph").join("tree").join("tree.md"), "# tree")
-            .expect("write tree");
+        fs::write(
+            run_dir.join("paper_graph").join("tree").join("tree.md"),
+            "# tree",
+        )
+        .expect("write tree");
         fs::write(
             run_dir.join("stdout.log"),
             "X".repeat((DIAG_MAX_FILE_BYTES + 1024) as usize),
@@ -11024,8 +11630,12 @@ mod tests {
             s2_backoff_base_sec: None,
         };
 
-        let result = collect_diagnostics_internal(&repo_root, &runtime, DiagnosticsCollectOptions::default())
-            .expect("collect diagnostics");
+        let result = collect_diagnostics_internal(
+            &repo_root,
+            &runtime,
+            DiagnosticsCollectOptions::default(),
+        )
+        .expect("collect diagnostics");
         let diag_dir = PathBuf::from(&result.diag_dir);
         assert!(diag_dir.exists());
         assert!(diag_dir.join("diag_report.md").exists());
@@ -11036,19 +11646,19 @@ mod tests {
         let zip_path = PathBuf::from(result.zip_path.clone().unwrap_or_default());
         assert!(zip_path.exists());
 
-        let summary_raw = fs::read_to_string(diag_dir.join("diag_summary.json")).expect("read summary");
+        let summary_raw =
+            fs::read_to_string(diag_dir.join("diag_summary.json")).expect("read summary");
         let summary: DiagnosticSummary = serde_json::from_str(&summary_raw).expect("parse summary");
         assert!(!summary.jobs.is_empty());
         assert!(!summary.pipelines.is_empty());
         assert!(summary.zip_path.is_some());
 
-        let manifest_raw = fs::read_to_string(diag_dir.join("manifest.json")).expect("read manifest");
-        let manifest: DiagnosticManifest = serde_json::from_str(&manifest_raw).expect("parse manifest");
+        let manifest_raw =
+            fs::read_to_string(diag_dir.join("manifest.json")).expect("read manifest");
+        let manifest: DiagnosticManifest =
+            serde_json::from_str(&manifest_raw).expect("parse manifest");
         assert!(!manifest.included.is_empty());
-        assert!(manifest
-            .skipped
-            .iter()
-            .any(|s| s.reason == "too_large"));
+        assert!(manifest.skipped.iter().any(|s| s.reason == "too_large"));
         let sorted_paths = manifest
             .included
             .iter()
@@ -11084,7 +11694,9 @@ mod tests {
             .last_modified_time(fixed_ts)
             .unix_permissions(0o644);
         for (name, content) in entries {
-            writer.start_file((*name).to_string(), options).expect("start entry");
+            writer
+                .start_file((*name).to_string(), options)
+                .expect("start entry");
             writer.write_all(content).expect("write entry");
         }
         writer.finish().expect("finish zip");
@@ -11135,9 +11747,13 @@ mod tests {
 
         save_settings(&runtime.out_base_dir, &DesktopSettings::default()).expect("save settings");
         save_jobs_to_file(&jobs_file_path(&runtime.out_base_dir), &[]).expect("save jobs");
-        save_pipelines_to_file(&pipelines_file_path(&runtime.out_base_dir), &[]).expect("save pipelines");
-        fs::write(audit_jsonl_path(&runtime.out_base_dir), "authorization: Bearer verylongtoken12345678901234567890\n")
-            .expect("write audit");
+        save_pipelines_to_file(&pipelines_file_path(&runtime.out_base_dir), &[])
+            .expect("save pipelines");
+        fs::write(
+            audit_jsonl_path(&runtime.out_base_dir),
+            "authorization: Bearer verylongtoken12345678901234567890\n",
+        )
+        .expect("write audit");
 
         let res = export_workspace_internal(
             &repo_root,
@@ -11156,9 +11772,13 @@ mod tests {
         assert!(PathBuf::from(&res.manifest_path).exists());
 
         let manifest_raw = fs::read_to_string(&res.manifest_path).expect("read manifest");
-        let manifest: WorkspaceExportManifest = serde_json::from_str(&manifest_raw).expect("parse manifest");
+        let manifest: WorkspaceExportManifest =
+            serde_json::from_str(&manifest_raw).expect("parse manifest");
         assert!(!manifest.included.is_empty());
-        assert!(manifest.included.iter().any(|x| x.path == "state/config.json"));
+        assert!(manifest
+            .included
+            .iter()
+            .any(|x| x.path == "state/config.json"));
         let sorted = manifest
             .included
             .iter()
@@ -11237,7 +11857,10 @@ mod tests {
             },
         )
         .expect("import with allowlist ignore");
-        assert!(res.warnings.iter().any(|w| w.contains("ignored disallowed entry")));
+        assert!(res
+            .warnings
+            .iter()
+            .any(|w| w.contains("ignored disallowed entry")));
 
         let zip_large = base.join("large.zip");
         let huge = vec![b'X'; (DIAG_MAX_FILE_BYTES as usize) + 1024];
@@ -11270,7 +11893,10 @@ mod tests {
         let zip_path = base.join("schema.zip");
         write_test_zip(
             &zip_path,
-            &[(".jarvis-desktop/jobs.json", br#"{"schema_version":99,"jobs":[]}"#)],
+            &[(
+                ".jarvis-desktop/jobs.json",
+                br#"{"schema_version":99,"jobs":[]}"#,
+            )],
         );
 
         let err = match import_workspace_internal(
@@ -11297,12 +11923,14 @@ mod tests {
         let runtime = build_test_runtime(&base);
         let imported_pipeline = base.join("pipeline_imported");
         let _ = fs::create_dir_all(imported_pipeline.join("jarvis_core"));
-        fs::write(imported_pipeline.join("pyproject.toml"), "[tool.poetry]").expect("write pyproject");
+        fs::write(imported_pipeline.join("pyproject.toml"), "[tool.poetry]")
+            .expect("write pyproject");
         fs::write(imported_pipeline.join("jarvis_cli.py"), "print('ok')").expect("write cli");
 
         let imported_cfg = format!(
             "{{\"JARVIS_PIPELINE_ROOT\":{},\"JARVIS_PIPELINE_OUT_DIR\":\"imported_runs\"}}",
-            serde_json::to_string(&imported_pipeline.to_string_lossy().to_string()).expect("serialize root")
+            serde_json::to_string(&imported_pipeline.to_string_lossy().to_string())
+                .expect("serialize root")
         );
         let zip_path = base.join("config.zip");
         write_test_zip(&zip_path, &[("state/config.json", imported_cfg.as_bytes())]);
@@ -11340,8 +11968,12 @@ mod tests {
             imported_pipeline.to_string_lossy()
         );
 
-        let resolved = resolve_runtime_config_with_config_path(&base, &config_path).expect("resolve runtime");
-        assert_eq!(resolved.pipeline_root, canonical_or_self(&imported_pipeline));
+        let resolved =
+            resolve_runtime_config_with_config_path(&base, &config_path).expect("resolve runtime");
+        assert_eq!(
+            resolved.pipeline_root,
+            canonical_or_self(&imported_pipeline)
+        );
         assert_eq!(
             resolved.out_base_dir,
             canonical_or_self(&imported_pipeline.join("imported_runs"))
@@ -11358,7 +11990,8 @@ mod tests {
     #[test]
     fn workspace_import_settings_replace_uses_imported_values() {
         let _guard = config_file_test_guard();
-        let base = std::env::temp_dir().join(format!("jarvis_ws_settings_replace_{}", now_epoch_ms()));
+        let base =
+            std::env::temp_dir().join(format!("jarvis_ws_settings_replace_{}", now_epoch_ms()));
         let runtime = build_test_runtime(&base);
         let mut current = DesktopSettings::default();
         current.auto_retry_max_per_job = 9;
@@ -11384,7 +12017,10 @@ mod tests {
         )
         .expect("replace import");
         assert!(res.applied);
-        assert!(res.warnings.iter().any(|w| w.contains("mode applied: replace")));
+        assert!(res
+            .warnings
+            .iter()
+            .any(|w| w.contains("mode applied: replace")));
 
         let loaded = load_settings(&runtime.out_base_dir).expect("load replaced settings");
         assert_eq!(loaded.auto_retry_max_per_job, 2);
@@ -11400,10 +12036,14 @@ mod tests {
         let imported_pipeline = base.join("pipeline_imported");
         let _ = fs::create_dir_all(current_pipeline.join("jarvis_core"));
         let _ = fs::create_dir_all(imported_pipeline.join("jarvis_core"));
-        fs::write(current_pipeline.join("pyproject.toml"), "[tool.poetry]").expect("write current pyproject");
-        fs::write(current_pipeline.join("jarvis_cli.py"), "print('ok')").expect("write current cli");
-        fs::write(imported_pipeline.join("pyproject.toml"), "[tool.poetry]").expect("write imported pyproject");
-        fs::write(imported_pipeline.join("jarvis_cli.py"), "print('ok')").expect("write imported cli");
+        fs::write(current_pipeline.join("pyproject.toml"), "[tool.poetry]")
+            .expect("write current pyproject");
+        fs::write(current_pipeline.join("jarvis_cli.py"), "print('ok')")
+            .expect("write current cli");
+        fs::write(imported_pipeline.join("pyproject.toml"), "[tool.poetry]")
+            .expect("write imported pyproject");
+        fs::write(imported_pipeline.join("jarvis_cli.py"), "print('ok')")
+            .expect("write imported cli");
 
         let config_path = config_file_path();
         let backup = if config_path.exists() {
@@ -11416,13 +12056,15 @@ mod tests {
         }
         let current_config_text = format!(
             "{{\"JARVIS_PIPELINE_ROOT\":{},\"JARVIS_PIPELINE_OUT_DIR\":\"current_runs\"}}",
-            serde_json::to_string(&current_pipeline.to_string_lossy().to_string()).expect("serialize current root")
+            serde_json::to_string(&current_pipeline.to_string_lossy().to_string())
+                .expect("serialize current root")
         );
         fs::write(&config_path, current_config_text).expect("write current config");
 
         let imported_config_text = format!(
             "{{\"JARVIS_PIPELINE_ROOT\":{},\"JARVIS_PIPELINE_OUT_DIR\":\"imported_runs\"}}",
-            serde_json::to_string(&imported_pipeline.to_string_lossy().to_string()).expect("serialize imported root")
+            serde_json::to_string(&imported_pipeline.to_string_lossy().to_string())
+                .expect("serialize imported root")
         );
         let zip_path = base.join("config_modes.zip");
         write_test_zip(
@@ -11446,7 +12088,10 @@ mod tests {
             .expect("read config after keep")
             .expect("config object");
         assert_eq!(
-            after_keep.get("JARVIS_PIPELINE_ROOT").and_then(|v| v.as_str()).unwrap_or_default(),
+            after_keep
+                .get("JARVIS_PIPELINE_ROOT")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default(),
             current_pipeline.to_string_lossy()
         );
 
@@ -11466,7 +12111,10 @@ mod tests {
             .expect("read config after replace")
             .expect("config object");
         assert_eq!(
-            after_replace.get("JARVIS_PIPELINE_ROOT").and_then(|v| v.as_str()).unwrap_or_default(),
+            after_replace
+                .get("JARVIS_PIPELINE_ROOT")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default(),
             imported_pipeline.to_string_lossy()
         );
 
@@ -11515,7 +12163,10 @@ mod tests {
         let mut w2 = Vec::new();
         let m1 = merge_jobs_keep_newest(&current_jobs, &imported_jobs, &mut w1);
         let m2 = merge_jobs_keep_newest(&current_jobs, &imported_jobs, &mut w2);
-        assert_eq!(serde_json::to_string(&m1).ok(), serde_json::to_string(&m2).ok());
+        assert_eq!(
+            serde_json::to_string(&m1).ok(),
+            serde_json::to_string(&m2).ok()
+        );
 
         let current_pipelines = vec![PipelineRecord {
             pipeline_id: "pipe_1".to_string(),
@@ -11545,12 +12196,16 @@ mod tests {
         let mut pw2 = Vec::new();
         let p1 = merge_pipelines_keep_newest(&current_pipelines, &imported_pipelines, &mut pw1);
         let p2 = merge_pipelines_keep_newest(&current_pipelines, &imported_pipelines, &mut pw2);
-        assert_eq!(serde_json::to_string(&p1).ok(), serde_json::to_string(&p2).ok());
+        assert_eq!(
+            serde_json::to_string(&p1).ok(),
+            serde_json::to_string(&p2).ok()
+        );
     }
 
     #[test]
     fn schema_version_missing_defaults_to_v1_for_jobs() {
-        let out_dir = std::env::temp_dir().join(format!("jarvis_schema_missing_{}", now_epoch_ms()));
+        let out_dir =
+            std::env::temp_dir().join(format!("jarvis_schema_missing_{}", now_epoch_ms()));
         let _ = fs::create_dir_all(out_dir.join(".jarvis-desktop"));
         let path = jobs_file_path(&out_dir);
         fs::write(
@@ -11579,7 +12234,8 @@ mod tests {
         };
         assert!(load_err.contains("unsupported schema_version"));
 
-        let write_err = save_pipelines_to_file(&path, &[]).expect_err("must fail on high schema write");
+        let write_err =
+            save_pipelines_to_file(&path, &[]).expect_err("must fail on high schema write");
         assert!(write_err.contains("refusing to modify"));
 
         let _ = fs::remove_dir_all(&out_dir);
@@ -11587,7 +12243,8 @@ mod tests {
 
     #[test]
     fn atomic_write_keeps_no_tmp_file_for_settings() {
-        let out_dir = std::env::temp_dir().join(format!("jarvis_atomic_settings_{}", now_epoch_ms()));
+        let out_dir =
+            std::env::temp_dir().join(format!("jarvis_atomic_settings_{}", now_epoch_ms()));
         let _ = fs::create_dir_all(out_dir.join(".jarvis-desktop"));
         save_settings(&out_dir, &DesktopSettings::default()).expect("save settings");
         let path = settings_file_path(&out_dir);
@@ -11607,16 +12264,30 @@ mod tests {
         let run = base.join("run_1");
         let _ = fs::create_dir_all(&run);
 
-        assert_eq!(parse_paper_id_from_input(&run.join("input.json")), "unknown");
-        assert_eq!(parse_status_from_result(&run.join("result.json")), "unknown");
+        assert_eq!(
+            parse_paper_id_from_input(&run.join("input.json")),
+            "unknown"
+        );
+        assert_eq!(
+            parse_status_from_result(&run.join("result.json")),
+            "unknown"
+        );
 
-        fs::write(run.join("input.json"), r#"{"desktop":{"canonical_id":"doi:10.1/abc"}}"#)
-            .expect("write input");
-        fs::write(run.join("result.json"), r#"{"status":"succeeded"}"#)
-            .expect("write result");
+        fs::write(
+            run.join("input.json"),
+            r#"{"desktop":{"canonical_id":"doi:10.1/abc"}}"#,
+        )
+        .expect("write input");
+        fs::write(run.join("result.json"), r#"{"status":"succeeded"}"#).expect("write result");
 
-        assert_eq!(parse_paper_id_from_input(&run.join("input.json")), "doi:10.1/abc");
-        assert_eq!(parse_status_from_result(&run.join("result.json")), "succeeded");
+        assert_eq!(
+            parse_paper_id_from_input(&run.join("input.json")),
+            "doi:10.1/abc"
+        );
+        assert_eq!(
+            parse_status_from_result(&run.join("result.json")),
+            "succeeded"
+        );
 
         let _ = fs::remove_dir_all(&base);
     }
