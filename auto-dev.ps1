@@ -320,7 +320,7 @@ Output a structured research report as research-$cycle.md covering:
 
     $researchFile = Join-Path $LogDir "research-$cycle.md"
     try {
-        $researchPrompt | codex exec --full-auto - 2>$null
+        $ErrorActionPreference = "Continue"; $researchPrompt | codex exec --full-auto - 2>&1; $ErrorActionPreference = "Stop"
         if (Test-Path "research-$cycle.md") {
             Move-Item "research-$cycle.md" $researchFile -Force
         } else {
@@ -368,7 +368,7 @@ Save output as plan.md
 
     $planOutFile = Join-Path $LogDir "plan-$cycle.md"
     try {
-        $planPrompt | codex exec --full-auto - 2>$null
+        $ErrorActionPreference = "Continue"; $planPrompt | codex exec --full-auto - 2>&1; $ErrorActionPreference = "Stop"
         if (Test-Path "plan.md") {
             Copy-Item "plan.md" $planOutFile -Force
             $planOut = Get-Content "plan.md" -Raw
@@ -407,7 +407,7 @@ Save annotated plan as plan-annotated.md
 "@
 
     try {
-        $annotPrompt | codex exec --full-auto - 2>$null
+        $ErrorActionPreference = "Continue"; $annotPrompt | codex exec --full-auto - 2>&1; $ErrorActionPreference = "Stop"
         if (Test-Path "plan-annotated.md") {
             $planOut = Get-Content "plan-annotated.md" -Raw
             Copy-Item "plan-annotated.md" (Join-Path $LogDir "plan-annotated-$cycle.md") -Force
@@ -445,7 +445,7 @@ $constraints
 "@
 
     try {
-        $implPrompt | codex exec --full-auto - 2>$null
+        $ErrorActionPreference = "Continue"; $implPrompt | codex exec --full-auto - 2>&1; $ErrorActionPreference = "Stop"
     } catch {
         Write-Host "  [B] Codex implementation error: $_" -ForegroundColor Yellow
     }
@@ -512,7 +512,7 @@ $testResult
 $constraints
 "@
             try {
-                $fixPrompt | codex exec --full-auto - 2>$null
+                $ErrorActionPreference = "Continue"; $fixPrompt | codex exec --full-auto - 2>&1; $ErrorActionPreference = "Stop"
                 git add -A; git commit --amend --no-edit 2>$null
             } catch {}
         } else {
@@ -558,7 +558,7 @@ If no issues, save review-clean.md with "No issues found."
 "@
 
     try {
-        $reviewPrompt | codex exec --full-auto - 2>$null
+        $ErrorActionPreference = "Continue"; $reviewPrompt | codex exec --full-auto - 2>&1; $ErrorActionPreference = "Stop"
         if (Test-Path "review-fixes.md") {
             $reviewFixCount = (git diff --name-only 2>$null | Measure-Object).Count
             git add -A; git commit --amend --no-edit 2>$null
@@ -605,7 +605,7 @@ $(Get-Content $evidencePath -Raw -ErrorAction SilentlyContinue)
 
     $prBody = ""
     try {
-        $summaryPrompt | codex exec --full-auto - 2>$null
+        $ErrorActionPreference = "Continue"; $summaryPrompt | codex exec --full-auto - 2>&1; $ErrorActionPreference = "Stop"
         if (Test-Path "pr-summary.md") {
             $prBody = Get-Content "pr-summary.md" -Raw
             Copy-Item "pr-summary.md" (Join-Path $LogDir "summary-$cycle.md") -Force
@@ -778,6 +778,7 @@ Write-Host @"
  Report    : $(Join-Path $LogDir "nightly-$RunId.md")
 ========================================
 "@ -ForegroundColor Green
+
 
 
 
