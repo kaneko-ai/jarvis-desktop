@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     auto-dev v3 – Codex 自動開発ループ（worktree分離・日本語Discord通知・ETA表示）
 .DESCRIPTION
@@ -277,6 +277,18 @@ for ($cycle = 1; $cycle -le $MaxPRs; $cycle++) {
         }
     } catch {}
 
+
+    # ═══ Clean stale worktrees ═══
+    $wtRoot = Join-Path $RepoRoot ".wt"
+    if (Test-Path $wtRoot) {
+      Get-ChildItem -Path $wtRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+        Write-Host "  [cleanup] Removing stale worktree: $($_.Name)" -ForegroundColor Gray
+        try { git worktree remove $_.FullName --force 2>$null } catch {}
+        if (Test-Path $_.FullName) { Remove-Item -Recurse -Force $_.FullName -ErrorAction SilentlyContinue }
+      }
+    }
+    try { git worktree prune 2>$null } catch {}
+
     # worktree 作成
     $wtName = "wt-$RunId-$cycle"
     $wtPath = Join-Path $RepoRoot ".wt\$wtName"
@@ -289,6 +301,23 @@ for ($cycle = 1; $cycle -le $MaxPRs; $cycle++) {
 
     Push-Location -LiteralPath $wtPath
     try {
+
+    # ═══ Install frontend dependencies in worktree ═══
+    Write-Host "  [setup] Installing npm dependencies in worktree..." -ForegroundColor Gray
+    try {
+      $ErrorActionPreference = "Continue"
+      $npmOut = npm ci 2>&1
+      if ($LASTEXITCODE -ne 0) {
+        Write-Host "  [setup] npm ci failed, trying npm install..." -ForegroundColor Yellow
+        $npmOut = npm install 2>&1
+        if ($LASTEXITCODE -ne 0) { Write-Host "  [setup] npm install also failed" -ForegroundColor Red }
+      }
+      $ErrorActionPreference = "Stop"
+      Write-Host "  [setup] npm dependencies ready." -ForegroundColor Gray
+    } catch {
+      $ErrorActionPreference = "Stop"
+      Write-Host "  [setup] npm install error: $_" -ForegroundColor Yellow
+    }
 
     # ============================================================
     #  STEP A0 – Deep Research (Boris Cherny 方式)
@@ -778,7 +807,6 @@ Write-Host @"
  Report    : $(Join-Path $LogDir "nightly-$RunId.md")
 ========================================
 "@ -ForegroundColor Green
-
 
 
 
