@@ -4966,8 +4966,96 @@ fn resolve_run_dir_from_id(runtime: &RuntimeConfig, run_id: &str) -> Result<Path
     Ok(canonical)
 }
 
-fn pipeline_runs_dir(runtime: &RuntimeConfig) -> PathBuf {
+fn pipeline_runs_legacy_dir(runtime: &RuntimeConfig) -> PathBuf {
     runtime.pipeline_root.join("logs").join("runs")
+}
+
+#[derive(Clone)]
+struct PipelineRunDirEntry {
+    run_id: String,
+    run_dir: PathBuf,
+    modified_epoch_ms: u64,
+}
+
+fn resolve_pipeline_run_roots(runtime: &RuntimeConfig) -> Result<Vec<PathBuf>, String> {
+    let mut roots = Vec::new();
+    let mut seen = HashSet::new();
+    for candidate in [
+        runtime.out_base_dir.clone(),
+        pipeline_runs_legacy_dir(runtime),
+    ] {
+        if !candidate.exists() {
+            continue;
+        }
+        if !candidate.is_dir() {
+            return Err(format!(
+                "runs path is not a directory: {}",
+                candidate.display()
+            ));
+        }
+        let canonical = candidate.canonicalize().map_err(|e| {
+            format!(
+                "failed to canonicalize runs directory {}: {e}",
+                candidate.display()
+            )
+        })?;
+        if seen.insert(canonical.clone()) {
+            roots.push(canonical);
+        }
+    }
+    Ok(roots)
+}
+
+fn collect_pipeline_run_dirs(runtime: &RuntimeConfig) -> Result<Vec<PipelineRunDirEntry>, String> {
+    let roots = resolve_pipeline_run_roots(runtime)?;
+    if roots.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut runs = Vec::new();
+    let mut seen_run_ids = HashSet::new();
+    for root in roots {
+        for entry in fs::read_dir(&root)
+            .map_err(|e| format!("failed to read runs directory {}: {e}", root.display()))?
+        {
+            let entry = match entry {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let run_id = entry.file_name().to_string_lossy().to_string();
+            if validate_pipeline_run_id_component(&run_id).is_err() {
+                continue;
+            }
+            if seen_run_ids.contains(&run_id) {
+                continue;
+            }
+            let canonical = match path.canonicalize() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if !canonical.starts_with(&root) {
+                continue;
+            }
+            let modified_epoch_ms = modified_epoch_ms(&canonical);
+            seen_run_ids.insert(run_id.clone());
+            runs.push(PipelineRunDirEntry {
+                run_id,
+                run_dir: canonical,
+                modified_epoch_ms,
+            });
+        }
+    }
+
+    runs.sort_by(|a, b| {
+        b.modified_epoch_ms
+            .cmp(&a.modified_epoch_ms)
+            .then_with(|| a.run_id.cmp(&b.run_id))
+    });
+    Ok(runs)
 }
 
 fn resolve_pipeline_run_dir_from_id(
@@ -4975,52 +5063,37 @@ fn resolve_pipeline_run_dir_from_id(
     run_id: &str,
 ) -> Result<PathBuf, String> {
     let run_component = validate_pipeline_run_id_component(run_id)?;
-    let runs_dir = pipeline_runs_dir(runtime);
-    if !runs_dir.exists() {
-        return Err(format!(
-            "runs directory does not exist: {}",
-            runs_dir.display()
-        ));
-    }
-    if !runs_dir.is_dir() {
-        return Err(format!(
-            "runs path is not a directory: {}",
-            runs_dir.display()
-        ));
-    }
-    let runs_dir_canonical = runs_dir.canonicalize().map_err(|e| {
-        format!(
-            "failed to canonicalize runs directory {}: {e}",
-            runs_dir.display()
-        )
-    })?;
+    let roots = resolve_pipeline_run_roots(runtime)?;
 
-    let candidate = runs_dir.join(&run_component);
-    if !candidate.exists() {
-        return Err(format!(
-            "run directory does not exist: {}",
-            candidate.display()
-        ));
+    for root in roots {
+        let candidate = root.join(&run_component);
+        if !candidate.exists() {
+            continue;
+        }
+        if !candidate.is_dir() {
+            return Err(format!(
+                "run path is not a directory: {}",
+                candidate.display()
+            ));
+        }
+        let canonical = candidate.canonicalize().map_err(|e| {
+            format!(
+                "failed to canonicalize run directory {}: {e}",
+                candidate.display()
+            )
+        })?;
+        if !canonical.starts_with(&root) {
+            return Err(format!(
+                "run directory is outside runs directory: {}",
+                canonical.display()
+            ));
+        }
+        return Ok(canonical);
     }
-    if !candidate.is_dir() {
-        return Err(format!(
-            "run path is not a directory: {}",
-            candidate.display()
-        ));
-    }
-    let canonical = candidate.canonicalize().map_err(|e| {
-        format!(
-            "failed to canonicalize run directory {}: {e}",
-            candidate.display()
-        )
-    })?;
-    if !canonical.starts_with(&runs_dir_canonical) {
-        return Err(format!(
-            "run directory is outside runs directory: {}",
-            canonical.display()
-        ));
-    }
-    Ok(canonical)
+
+    Err(format!(
+        "run directory does not exist in configured runs roots: {run_component}"
+    ))
 }
 
 fn run_text_rel_path(kind: &str) -> Result<PathBuf, String> {
@@ -5067,78 +5140,31 @@ fn list_pipeline_runs_internal(
     runtime: &RuntimeConfig,
     limit: Option<u32>,
 ) -> Result<Vec<RunSummary>, String> {
-    let runs_dir = pipeline_runs_dir(runtime);
-    if !runs_dir.exists() {
-        return Ok(Vec::new());
-    }
-    if !runs_dir.is_dir() {
-        return Err(format!(
-            "runs path is not a directory: {}",
-            runs_dir.display()
-        ));
-    }
-    let runs_dir_canonical = runs_dir.canonicalize().map_err(|e| {
-        format!(
-            "failed to canonicalize runs directory {}: {e}",
-            runs_dir.display()
-        )
-    })?;
-
     let max_rows = usize::try_from(limit.unwrap_or(200).clamp(1, 2000)).unwrap_or(200);
-    let mut rows: Vec<(RunSummary, u64)> = Vec::new();
-    for entry in fs::read_dir(&runs_dir_canonical).map_err(|e| {
-        format!(
-            "failed to read runs directory {}: {e}",
-            runs_dir_canonical.display()
-        )
-    })? {
-        let entry = match entry {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let run_id = entry.file_name().to_string_lossy().to_string();
-        if validate_pipeline_run_id_component(&run_id).is_err() {
-            continue;
-        }
-        let canonical = match path.canonicalize() {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if !canonical.starts_with(&runs_dir_canonical) {
-            continue;
-        }
-        let modified = fs::metadata(&canonical).and_then(|m| m.modified()).ok();
-        let created_at = modified
-            .map(to_iso_from_system_time)
-            .unwrap_or_else(|| "".to_string());
-        let ts = modified_epoch_ms(&canonical);
-        let (canonical_id, template_id) =
-            parse_pipeline_run_metadata(&canonical.join("input.json"));
-        rows.push((
+    let mut rows: Vec<RunSummary> = collect_pipeline_run_dirs(runtime)?
+        .into_iter()
+        .map(|entry| {
+            let modified = fs::metadata(&entry.run_dir).and_then(|m| m.modified()).ok();
+            let created_at = modified
+                .map(to_iso_from_system_time)
+                .unwrap_or_else(|| "".to_string());
+            let (canonical_id, template_id) =
+                parse_pipeline_run_metadata(&entry.run_dir.join("input.json"));
             RunSummary {
-                run_id,
+                run_id: entry.run_id,
                 created_at,
-                status: parse_pipeline_run_status(&canonical.join("result.json")),
-                run_dir: canonical.to_string_lossy().to_string(),
+                status: parse_pipeline_run_status(&entry.run_dir.join("result.json")),
+                run_dir: entry.run_dir.to_string_lossy().to_string(),
                 canonical_id,
                 template_id,
-            },
-            ts,
-        ));
+            }
+        })
+        .collect();
+    if rows.len() > max_rows {
+        rows.truncate(max_rows);
     }
-
-    rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.run_id.cmp(&b.0.run_id)));
-    let mut out = rows.into_iter().map(|(row, _)| row).collect::<Vec<_>>();
-    if out.len() > max_rows {
-        out.truncate(max_rows);
-    }
-    Ok(out)
+    Ok(rows)
 }
-
 fn valid_duration_seconds(value: f64) -> Option<f64> {
     if value.is_finite() && value >= 0.0 {
         Some(value)
@@ -5175,60 +5201,8 @@ fn collect_run_dashboard_stats_internal(
     runtime: &RuntimeConfig,
     limit: Option<u32>,
 ) -> Result<RunDashboardStats, String> {
-    let runs_dir = pipeline_runs_dir(runtime);
-    if !runs_dir.exists() {
-        return Ok(RunDashboardStats {
-            total_runs: 0,
-            success_runs: 0,
-            success_rate_pct: 0.0,
-            avg_duration_sec: None,
-            duration_sample_count: 0,
-        });
-    }
-    if !runs_dir.is_dir() {
-        return Err(format!(
-            "runs path is not a directory: {}",
-            runs_dir.display()
-        ));
-    }
-    let runs_dir_canonical = runs_dir.canonicalize().map_err(|e| {
-        format!(
-            "failed to canonicalize runs directory {}: {e}",
-            runs_dir.display()
-        )
-    })?;
-
     let max_rows = usize::try_from(limit.unwrap_or(500).clamp(1, 2000)).unwrap_or(500);
-    let mut runs: Vec<(PathBuf, String, u64)> = Vec::new();
-    for entry in fs::read_dir(&runs_dir_canonical).map_err(|e| {
-        format!(
-            "failed to read runs directory {}: {e}",
-            runs_dir_canonical.display()
-        )
-    })? {
-        let entry = match entry {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let run_id = entry.file_name().to_string_lossy().to_string();
-        if validate_pipeline_run_id_component(&run_id).is_err() {
-            continue;
-        }
-        let canonical = match path.canonicalize() {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if !canonical.starts_with(&runs_dir_canonical) {
-            continue;
-        }
-        runs.push((canonical.clone(), run_id, modified_epoch_ms(&canonical)));
-    }
-
-    runs.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1)));
+    let mut runs = collect_pipeline_run_dirs(runtime)?;
     if runs.len() > max_rows {
         runs.truncate(max_rows);
     }
@@ -5236,8 +5210,8 @@ fn collect_run_dashboard_stats_internal(
     let mut success_runs: u32 = 0;
     let mut duration_sum_sec = 0.0_f64;
     let mut duration_sample_count: u32 = 0;
-    for (run_dir, _, _) in &runs {
-        let result_path = run_dir.join("result.json");
+    for run in &runs {
+        let result_path = run.run_dir.join("result.json");
         if parse_pipeline_run_status(&result_path) == "success" {
             success_runs = success_runs.saturating_add(1);
         }
@@ -5267,7 +5241,6 @@ fn collect_run_dashboard_stats_internal(
         duration_sample_count,
     })
 }
-
 fn read_run_text_internal(
     runtime: &RuntimeConfig,
     run_id: &str,
@@ -10743,7 +10716,7 @@ mod tests {
         let base = std::env::temp_dir().join(format!("jarvis_run_text_kind_{}", now_epoch_ms()));
         let runtime = build_test_runtime(&base);
         let run_id = "20260218_120000_deadbeef";
-        let run_dir = runtime.pipeline_root.join("logs").join("runs").join(run_id);
+        let run_dir = runtime.out_base_dir.join(run_id);
         let _ = fs::create_dir_all(&run_dir);
         fs::write(run_dir.join("input.json"), r#"{"ok":true}"#).expect("write input");
 
@@ -10821,7 +10794,7 @@ mod tests {
         let base = std::env::temp_dir().join(format!("jarvis_run_explorer_{}", now_epoch_ms()));
         let runtime = build_test_runtime(&base);
         let run_id = "20260218_121500_deadbeef";
-        let run_dir = runtime.pipeline_root.join("logs").join("runs").join(run_id);
+        let run_dir = runtime.out_base_dir.join(run_id);
         let _ = fs::create_dir_all(run_dir.join("paper_graph").join("tree"));
         fs::write(
             run_dir.join("input.json"),
@@ -10850,6 +10823,81 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
+    #[test]
+    fn pipeline_runs_fallback_to_legacy_root_when_primary_missing() {
+        let base =
+            std::env::temp_dir().join(format!("jarvis_run_legacy_fallback_{}", now_epoch_ms()));
+        let runtime = build_test_runtime(&base);
+        let _ = fs::remove_dir_all(&runtime.out_base_dir);
+        let run_id = "20260218_142500_deadbeef";
+        let run_dir = runtime.pipeline_root.join("logs").join("runs").join(run_id);
+        let _ = fs::create_dir_all(&run_dir);
+        fs::write(
+            run_dir.join("input.json"),
+            r#"{"desktop":{"canonical_id":"fallback"}}"#,
+        )
+        .expect("write input");
+        fs::write(run_dir.join("result.json"), r#"{"status":"failed"}"#).expect("write result");
+
+        let rows = list_pipeline_runs_internal(&runtime, Some(50)).expect("list pipeline runs");
+        assert!(rows.iter().any(|r| r.run_id == run_id));
+        let stats =
+            collect_run_dashboard_stats_internal(&runtime, Some(50)).expect("collect stats");
+        assert_eq!(stats.total_runs, 1);
+        assert_eq!(stats.success_runs, 0);
+        assert!(resolve_pipeline_run_dir_from_id(&runtime, run_id)
+            .expect("resolve run")
+            .ends_with(run_id));
+        assert!(read_run_text_internal(&runtime, run_id, "input")
+            .expect("read input")
+            .contains("fallback"));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pipeline_runs_overlap_dedup_prefers_primary_root() {
+        let base = std::env::temp_dir().join(format!("jarvis_run_overlap_{}", now_epoch_ms()));
+        let runtime = build_test_runtime(&base);
+        let run_id = "20260218_143500_deadbeef";
+
+        let out_run = runtime.out_base_dir.join(run_id);
+        let _ = fs::create_dir_all(&out_run);
+        fs::write(
+            out_run.join("input.json"),
+            r#"{"desktop":{"canonical_id":"primary"}}"#,
+        )
+        .expect("write out input");
+        fs::write(out_run.join("result.json"), r#"{"status":"succeeded"}"#)
+            .expect("write out result");
+
+        let legacy_run = runtime.pipeline_root.join("logs").join("runs").join(run_id);
+        let _ = fs::create_dir_all(&legacy_run);
+        fs::write(
+            legacy_run.join("input.json"),
+            r#"{"desktop":{"canonical_id":"legacy"}}"#,
+        )
+        .expect("write legacy input");
+        fs::write(legacy_run.join("result.json"), r#"{"status":"failed"}"#)
+            .expect("write legacy result");
+
+        let rows = list_pipeline_runs_internal(&runtime, Some(50)).expect("list pipeline runs");
+        assert_eq!(rows.iter().filter(|r| r.run_id == run_id).count(), 1);
+        let row = rows.iter().find(|r| r.run_id == run_id).expect("run row");
+        let out_root = runtime
+            .out_base_dir
+            .canonicalize()
+            .unwrap_or_else(|_| runtime.out_base_dir.clone());
+        assert!(PathBuf::from(&row.run_dir).starts_with(&out_root));
+        assert!(resolve_pipeline_run_dir_from_id(&runtime, run_id)
+            .expect("resolve run")
+            .starts_with(&out_root));
+        assert!(read_run_text_internal(&runtime, run_id, "input")
+            .expect("read input")
+            .contains("primary"));
+
+        let _ = fs::remove_dir_all(&base);
+    }
     #[test]
     fn pipeline_run_status_extraction_covers_expected_states() {
         let base = std::env::temp_dir().join(format!("jarvis_run_status_{}", now_epoch_ms()));
