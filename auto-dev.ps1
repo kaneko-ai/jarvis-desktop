@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     auto-dev v3 – Codex 自動開発ループ（worktree分離・日本語Discord通知・ETA表示）
 .DESCRIPTION
