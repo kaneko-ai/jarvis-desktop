@@ -86,7 +86,7 @@ function Write-FileSafe {
 # ── .git/info/exclude 更新 ──
 function Update-GitExclude {
     $exFile = Join-Path $RepoRoot ".git\info\exclude"
-    $lines  = @(".codex-logs/", "worktrees/")
+    $lines  = @(".codex-logs/", ".wt/")
     if (Test-Path $exFile) {
         $existing = Get-Content $exFile -ErrorAction SilentlyContinue
         foreach ($l in $lines) {
@@ -279,7 +279,7 @@ for ($cycle = 1; $cycle -le $MaxPRs; $cycle++) {
 
     # worktree 作成
     $wtName = "wt-$RunId-$cycle"
-    $wtPath = Join-Path $RepoRoot "worktrees\$wtName"
+    $wtPath = Join-Path $RepoRoot ".wt\$wtName"
     try {
         git worktree add $wtPath main --detach 2>$null
     } catch {
@@ -717,7 +717,7 @@ $(Get-Content $evidencePath -Raw -ErrorAction SilentlyContinue)
 
     # ── worktree cleanup ──
     try {
-        git worktree remove $wtPath --force 2>$null
+        $ErrorActionPreference = "Continue"; git worktree remove $wtPath --force 2>&1 | Out-Null; $ErrorActionPreference = "Stop"
         Write-Host "  [cleanup] worktree removed: $wtName" -ForegroundColor DarkGray
     } catch {}
 
@@ -745,7 +745,7 @@ $(Get-Content $evidencePath -Raw -ErrorAction SilentlyContinue)
 #  終了処理
 # ══════════════════════════════════════════
 $totalElapsed = (Get-Date) - $StartTime
-$totalStr     = "{0:hh\時間mm\分ss\秒}" -f $totalElapsed
+$totalStr     = $totalElapsed.ToString("hh\:mm\:ss")
 
 $nightlyReport = @"
 # Nightly Report – $RunId
@@ -778,6 +778,8 @@ Write-Host @"
  Report    : $(Join-Path $LogDir "nightly-$RunId.md")
 ========================================
 "@ -ForegroundColor Green
+
+
 
 
 
