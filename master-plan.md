@@ -1,4 +1,4 @@
-﻿# master-plan.md
+# master-plan.md
 # Jarvis Desktop Master Plan (2026-02-24)
 
 ## 0. North Star
@@ -22,7 +22,6 @@ Port jarvis-ml-pipeline features into jarvis-desktop as a stable desktop app.
 - PR65: log viewer filtering and search
 - PR66: settings export/import functionality
 - PR67: E2E test suite expansion (Playwright)
-- PR68: run path consistency (out_dir + legacy fallback alignment for explorer/stats/read)
+- PR68: performance optimization (startup time, large run lists)
 - PR69: error recovery and retry mechanisms
 - PR70: user preferences persistence
-
